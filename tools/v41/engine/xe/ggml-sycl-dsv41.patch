@@ -1,0 +1,180 @@
+diff --git a/ggml/src/ggml-sycl/dsv41-fused.cpp b/ggml/src/ggml-sycl/dsv41-fused.cpp
+new file mode 100644
+index 000000000..7afcd37ef
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dsv41-fused.cpp
+@@ -0,0 +1,121 @@
++// ggml-sycl/dsv41-fused.cpp - larry (Strata-DS4 on Intel): the two fused DeepSeek-V4.1 ops of Xolotl's ggml patch
++// (GGML_OP_DSV41_FAKE_QUANT, GGML_OP_DSV41_HC_MIXES) for the SYCL backend.  The CUDA versions (ggml-cuda/dsv4-hc.cu)
++// reproduce the stock-op composites of tools/v41/engine with float tricks (x + 1.5*2^23 - 1.5*2^23 for round-half-even,
++// Veltkamp splitting for powers of two); icpx compiles with fast-math reassociation by default, which may fold those,
++// so these use rint() and exponent-bit arithmetic instead - the same values for every finite input the ops see.
++#include "dsv41-fused.hpp"
++
++#include <cmath>
++#include <cstdint>
++
++// exact IEEE arithmetic in the rounding helpers and kernels (icpx defaults to fast-math)
++#pragma float_control(precise, on, push)
++
++namespace {
++
++inline float fq_bits_f(uint32_t u) { return sycl::bit_cast<float>(u); }
++inline uint32_t fq_f_bits(float f) { return sycl::bit_cast<uint32_t>(f); }
++
++// smallest power of two >= a (a >= 0; 0 -> 0; subnormals flush to 0 like the CUDA composite's .ftz)
++inline float fq_pow2_ceil(float a) {
++    const uint32_t u = fq_f_bits(a);
++    const uint32_t e = (u >> 23) & 0xffu;
++    if (e == 0) return 0.0f;
++    if (e == 0xffu) return a;
++    const uint32_t m = u & 0x7fffffu;
++    return m == 0 ? fq_bits_f(e << 23) : fq_bits_f((e + 1) << 23);
++}
++
++// largest power of two <= a (a >= 0)
++inline float fq_pow2_floor(float a) {
++    const uint32_t u = fq_f_bits(a);
++    const uint32_t e = (u >> 23) & 0xffu;
++    if (e == 0) return 0.0f;
++    if (e == 0xffu) return a;
++    return fq_bits_f(e << 23);
++}
++
++// v rounded to a float format with `mbits` mantissa bits and smallest normal `min_normal` (round half to even)
++inline float fq_round_fmt(float v, int mbits, float min_normal) {
++    const float p = sycl::fmax(fq_pow2_floor(sycl::fabs(v)), min_normal);
++    const float k = (float) (1 << mbits);
++    const float r = sycl::rint(v / p * k) + 0.0f;   // + 0: -0 -> +0, as the composite's (y + C) - C rounding gives
++    return r / k * p;
++}
++
++template <int BS>
++void fake_quant_blocks(const float * x, float * y, int64_t nblocks, int mode, float maxv, float floor_, sycl::queue * q) {
++    const size_t wg = 64;
++    const size_t g = (size_t) ((nblocks + (int64_t) wg - 1) / (int64_t) wg) * wg;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g), sycl::range<1>(wg)), [=](sycl::nd_item<1> it) {
++        const int64_t b = (int64_t) it.get_global_id(0);
++        if (b >= nblocks) return;
++        const float * xb = x + b * BS;
++        float * yb = y + b * BS;
++        float a = 0.0f;
++#pragma unroll
++        for (int i = 0; i < BS; ++i) a = sycl::fmax(a, sycl::fabs(xb[i]));
++        const float t = sycl::fmax(a, floor_) / maxv;
++        const float s = mode == 1 ? fq_round_fmt(t, 3, 0x1p-6f) : fq_pow2_ceil(t);
++#pragma unroll
++        for (int i = 0; i < BS; ++i) {
++            const float v = sycl::fmin(sycl::fmax(xb[i] / s, -maxv), maxv);
++            const float qv = mode == 0 ? fq_round_fmt(v, 3, 0x1p-6f) : fq_round_fmt(v, 1, 1.0f);
++            yb[i] = qv * s;
++        }
++    });
++}
++
++}  // namespace
++
++void ggml_sycl_op_dsv41_fake_quant(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
++    const ggml_tensor * src0 = dst->src[0];
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
++    const int mode = ggml_get_op_params_i32(dst, 0);
++    const int64_t n = ggml_nelements(src0);
++    const float maxv = mode == 0 ? 448.0f : 6.0f;
++    const float floor_ = mode == 0 ? 1e-4f : mode == 1 ? 6.0f / 512.0f : 6.0f * 0x1p-126f;
++    queue_ptr stream = ctx.stream();
++    if (mode == 1) {
++        GGML_ASSERT(n % 16 == 0);
++        fake_quant_blocks<16>((const float *) src0->data, (float *) dst->data, n / 16, mode, maxv, floor_, stream);
++    } else {
++        GGML_ASSERT(n % 32 == 0);
++        fake_quant_blocks<32>((const float *) src0->data, (float *) dst->data, n / 32, mode, maxv, floor_, stream);
++    }
++}
++
++void ggml_sycl_op_dsv41_hc_mixes(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
++    const ggml_tensor * mixes = dst->src[0];
++    const ggml_tensor * scale = dst->src[1];
++    const ggml_tensor * base  = dst->src[2];
++    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
++    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
++    GGML_ASSERT(base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->ne[1] % 2 == 0 && mixes->ne[0] >= dst->ne[0] * 2);
++    const int64_t hc = base->ne[0] / 2;
++    const int64_t nt = dst->ne[1] / 2;
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const int64_t n = 2 * hc * nt;
++    const int64_t nrow = mixes->ne[0];
++    const float * pm = (const float *) mixes->data;
++    const float * ps = (const float *) scale->data;
++    const float * pb = (const float *) base->data;
++    float * pd = (float *) dst->data;
++    queue_ptr stream = ctx.stream();
++    stream->parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
++        const int64_t i = (int64_t) id[0];
++        const int64_t h = i % hc;
++        const int64_t col = i / hc;
++        const bool post = col >= nt;
++        const int64_t t = post ? col - nt : col;
++        const int64_t r = post ? hc + h : h;
++        const float v = pm[r + nrow * t] * ps[post ? 1 : 0] + pb[r];
++        const float s = 1.0f / (1.0f + sycl::exp(-v));
++        pd[i] = post ? 2.0f * s : s + eps;
++    });
++}
++
++#pragma float_control(pop)
+diff --git a/ggml/src/ggml-sycl/dsv41-fused.hpp b/ggml/src/ggml-sycl/dsv41-fused.hpp
+new file mode 100644
+index 000000000..f27284400
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dsv41-fused.hpp
+@@ -0,0 +1,10 @@
++#ifndef GGML_SYCL_DSV41_FUSED_HPP
++#define GGML_SYCL_DSV41_FUSED_HPP
++
++#include "common.hpp"
++
++// larry: Xolotl's fused DeepSeek-V4.1 ops (ggml.h GGML_OP_DSV41_FAKE_QUANT / GGML_OP_DSV41_HC_MIXES) on SYCL
++void ggml_sycl_op_dsv41_fake_quant(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++void ggml_sycl_op_dsv41_hc_mixes(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++
++#endif  // GGML_SYCL_DSV41_FUSED_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index b24664a0b..6663558fb 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -70,6 +70,7 @@
+ #include "ggml-sycl/set_rows.hpp"
+ #include "ggml-sycl/set.hpp"
+ #include "ggml-sycl/dsv4-hc.hpp"
++#include "ggml-sycl/dsv41-fused.hpp"   // larry: Xolotl's fused DeepSeek-V4.1 ops
+ #include "ggml-sycl/lightning-indexer.hpp"
+ #include "ggml-sycl/conv2d.hpp"
+ #include "ggml-sycl/conv2d-dw.hpp"
+@@ -5434,6 +5435,12 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
+         case GGML_OP_LIGHTNING_INDEXER:
+             ggml_sycl_op_lightning_indexer(ctx, dst);
+             break;
++        case GGML_OP_DSV41_FAKE_QUANT:
++            ggml_sycl_op_dsv41_fake_quant(ctx, dst);
++            break;
++        case GGML_OP_DSV41_HC_MIXES:
++            ggml_sycl_op_dsv41_hc_mixes(ctx, dst);
++            break;
+         case GGML_OP_DUP:
+             ggml_sycl_dup(ctx, dst);
+             break;
+@@ -6469,6 +6476,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_DSV41_FAKE_QUANT:
++            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
++        case GGML_OP_DSV41_HC_MIXES:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+         case GGML_OP_LIGHTNING_INDEXER:
+             return op->src[0]->type == GGML_TYPE_F32 &&
+                 (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
