@@ -136,3 +136,4 @@ if(TARGET ggml AND TARGET ggml-base)
     add_executable(v41_sidecar_requant ${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/v41_sidecar_requant.cpp)
     target_link_libraries(v41_sidecar_requant PRIVATE ggml ggml-base)
 endif()
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/xe/xe.cmake OPTIONAL)   # larry: the Intel Arc tier

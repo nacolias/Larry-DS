@@ -24,6 +24,9 @@
 // Load the real model only through tools/ds4/memguard.sh (RAM cap + the shared GPU lock).
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
+#if defined(DS41_XE)
+#include "ds41_xe_tier.hpp"   // larry: the multi-card Intel Arc (SYCL) expert tier
+#endif
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
 #endif
@@ -53,6 +56,11 @@
 
 using namespace strata;
 using namespace strata::v41;
+#if defined(DS41_XE)
+using Ds41Tier = Ds41XeTier;
+#else
+using Ds41Tier = Ds41MoeTier;
+#endif
 
 namespace {
 
@@ -354,7 +362,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "VRAM: %.2f GiB free after the dense half -> %.2f GiB of expert slots (margin %.2f)\n",
                      fr / 1073741824.0, slot_gib, a.vram_margin_gib);
     }
-    Ds41MoeTier tier;
+    Ds41Tier tier;
     Ds41MoeConfig mc;
     mc.cpu_only = a.experts == "cpu" || ggml_backend_is_cpu(be);
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
@@ -392,7 +400,11 @@ int main(int argc, char ** argv) {
                      a.prune_penalty > 0 ? ("penalised -" + std::to_string(a.prune_penalty)).c_str() : "masked out of routing", a.prune.c_str());
         mc.exclude = pruned;
     }
+#if defined(DS41_XE)
+    if (!tier.init(TG, &src, mc, mc.cpu_only ? nullptr : dense.routed_dev(), err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+#else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+#endif
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
@@ -642,7 +654,7 @@ int main(int argc, char ** argv) {
         // wall (nsys: ~100 expert DMAs per verify pass, 1.4 s of a 4.2 s decode), so a wrong guess costs a full blob:
         // docs prompt, same text: slots 0/1/2/3/6 -> verify 104.4/101.7/104.5/111.1/124.1 ms (precision 40% at 1).
         static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
-        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= Ds41MoeTier::kMaxMulti;
+        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= Ds41Tier::kMaxMulti;
         for (int l = 0; l < n_layer; ++l) {
             if (pf_now) {
                 pv_pred.resize((size_t) m * 16);
@@ -668,7 +680,7 @@ int main(int argc, char ** argv) {
             // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
             static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
             static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
-            if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer) {
+            if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41Tier::kMaxMulti && l + d3_spec_ahead < n_layer) {
                 pv_pred.resize((size_t) m * 16);
                 if (dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
                     pv_score.clear();
@@ -690,8 +702,8 @@ int main(int argc, char ** argv) {
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
-                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
-                constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                // once), not m run_to_dev calls.  Split at Ds41Tier::kMaxMulti (8: a depth-4 pass is one call).
+                constexpr int kMM = Ds41Tier::kMaxMulti;
                 for (int off = 0; off < m; off += kMM) {
                     const int chunk = std::min(kMM, m - off);
                     if (!tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
@@ -1249,12 +1261,12 @@ int main(int argc, char ** argv) {
             // s6 A/B: it never engages with the default --vram-lru (the LRU reorders slots, so "the tail" is not the
             // coldest experts and a batch-time admission could duplicate a saved one) - it needs --no-vram-lru for now.
             bool kept = false;
-            if (Ds41MoeTier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
+            if (Ds41Tier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
                 std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
                              (int) cache_open);
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
-                if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
+                if (Ds41Tier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
                     const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
                                         a.vram_margin_gib * 1073741824.0;
                     std::string kerr;
@@ -1756,7 +1768,7 @@ int main(int argc, char ** argv) {
     tier.reset_stats();
     // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
     static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
-    if (prof_decode) Ds41MoeTier::profiler(true);
+    if (prof_decode) Ds41Tier::profiler(true);
     const double td0 = now_ms();
     std::vector<float> lg = last_logits;
     int pos = (int) prompt.size(), gen = 0;
@@ -1890,7 +1902,7 @@ int main(int argc, char ** argv) {
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
-    if (prof_decode) Ds41MoeTier::profiler(false);
+    if (prof_decode) Ds41Tier::profiler(false);
     const Ds41MoeStats st = tier.stats();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
                  "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "
