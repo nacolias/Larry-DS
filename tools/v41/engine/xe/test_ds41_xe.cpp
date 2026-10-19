@@ -15,6 +15,7 @@
 #include "strata/kernels/cpu/ptq1_0.hpp"
 
 #include <sycl/sycl.hpp>
+#include <oneapi/mkl/blas.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -79,12 +80,14 @@ int main(int argc, char** argv) {
     std::string gguf = argv[1];
     std::vector<int> layers = {0, 20, 39};
     int per_class = 2, bench = 200, device = 0;
+    bool gemm_bench = false;
     for (int i = 2; i < argc; ++i) {
         std::string k = argv[i];
         if (k == "--layers" && i + 1 < argc) layers = csv(argv[++i]);
         else if (k == "--per-class" && i + 1 < argc) per_class = std::atoi(argv[++i]);
         else if (k == "--bench" && i + 1 < argc) bench = std::atoi(argv[++i]);
         else if (k == "--device" && i + 1 < argc) device = std::atoi(argv[++i]);
+        else if (k == "--gemm-bench") gemm_bench = true;
     }
     Ds41FileBlobs src(gguf);
     std::string err;
@@ -219,6 +222,76 @@ int main(int argc, char** argv) {
         us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / bench;
         std::printf("bench verify (8 tokens per expert): %.1f us/call = %.0f GB/s\n", us, bytes / us / 1e3);
         for (uint8_t* p : bufs) sycl::free(p, q);
+    }
+    if (gemm_bench) {   // the prompt path's GEMM form for one expert: dequant, gather, gate|up GEMM, SwiGLU, down GEMM
+        namespace mkl = oneapi::mkl;
+        const int l = layers.empty() ? 20 : layers[0];
+        int shown = 0;
+        for (int c = 0; c < (int) g.n_classes() && shown < 3; ++c) {
+            int e = -1;
+            for (int k = 0; k < g.n_experts; ++k) if (g.cls(l, k) == c) { e = k; break; }
+            if (e < 0) continue;
+            ++shown;
+            const cpu::NativeFmt& f = fl[(size_t) c];
+            std::vector<uint8_t> blob(f.bytes);
+            src.read(l, e, blob.data());
+            uint8_t* db = sycl::malloc_device<uint8_t>(f.bytes, q);
+            q.memcpy(db, blob.data(), f.bytes).wait();
+            const int MM = 1024;
+            sycl::half* Xg = sycl::malloc_device<sycl::half>((size_t) MM * E, q);
+            sycl::half* Wgu = sycl::malloc_device<sycl::half>((size_t) 2 * F * E, q);
+            sycl::half* Wd = sycl::malloc_device<sycl::half>((size_t) E * F, q);
+            float* G = sycl::malloc_device<float>((size_t) MM * 2 * F, q);
+            sycl::half* Hh = sycl::malloc_device<sycl::half>((size_t) MM * F, q);
+            float* Y = sycl::malloc_device<float>((size_t) MM * E, q);
+            float* Xs = sycl::malloc_device<float>((size_t) MM * E, q);
+            int32_t* tok = sycl::malloc_device<int32_t>(MM, q);
+            std::vector<int32_t> ht(MM);
+            for (int i = 0; i < MM; ++i) ht[(size_t) i] = i;
+            q.memcpy(tok, ht.data(), MM * 4).wait();
+            q.memset(Xs, 0, (size_t) MM * E * 4).wait();
+            auto tm = [&](auto fn, int it) {
+                fn(); q.wait();
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i) fn();
+                q.wait();
+                return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+            };
+            const double tdq = tm([&] {
+                xe::xe_dequant_rows_f16(q, f.gu_type, db, (int) F, (int) f.gu_row, (int) E, Wgu);
+                xe::xe_dequant_rows_f16(q, f.gu_type, db + f.up_off, (int) F, (int) f.gu_row, (int) E, Wgu + (size_t) F * E);
+                xe::xe_dequant_rows_f16(q, f.d_type, db + f.down_off, (int) E, (int) f.d_row, (int) F, Wd);
+            }, 20);
+            {   // the fp16 dequantisation against the CPU dequantiser (fp16 rounding only)
+                std::vector<sycl::half> hg((size_t) 2 * F * E), hd((size_t) E * F);
+                q.memcpy(hg.data(), Wgu, hg.size() * 2);
+                q.memcpy(hd.data(), Wd, hd.size() * 2).wait();
+                std::vector<float> ref((size_t) std::max(E, F));
+                double worst = 0;
+                for (int64_t rr = 0; rr < 2 * F; rr += 97) {
+                    const uint8_t* src = blob.data() + (rr < F ? (size_t) rr * f.gu_row : f.up_off + (size_t) (rr - F) * f.gu_row);
+                    dequant(f.gu_type, src, ref.data(), E);
+                    for (int64_t i = 0; i < E; ++i) worst = std::max(worst, std::fabs((double) (float) hg[(size_t) (rr * E + i)] - ref[(size_t) i]) / (std::fabs(ref[(size_t) i]) + 1e-3));
+                }
+                for (int64_t rr = 0; rr < E; rr += 97) {
+                    dequant(f.d_type, blob.data() + f.down_off + (size_t) rr * f.d_row, ref.data(), F);
+                    for (int64_t i = 0; i < F; ++i) worst = std::max(worst, std::fabs((double) (float) hd[(size_t) (rr * F + i)] - ref[(size_t) i]) / (std::fabs(ref[(size_t) i]) + 1e-3));
+                }
+                std::printf("class %d: fp16 dequant vs CPU, worst relative error %.2e %s\n", c, worst, worst < 2e-3 ? "ok" : "FAIL");
+                if (worst >= 2e-3) ++fails;
+            }
+            std::printf("class %d (gu %d / d %d): dequant gate+up+down %.0f us\n", c, f.gu_type, f.d_type, tdq);
+            for (int m : {8, 16, 32, 64, 128, 256, 1024}) {
+                const double tg = tm([&] { xe::xe_gather_rows_f16(q, Xs, tok, m, (int) E, Xg); }, 20);
+                const double t1 = tm([&] { mkl::blas::row_major::gemm(q, mkl::transpose::nontrans, mkl::transpose::trans, m, 2 * F, E, 1.0f, Xg, E, Wgu, E, 0.0f, G, 2 * F); }, 20);
+                const double ts = tm([&] { xe::xe_swiglu_f16(q, G, m, (int) F, L, Hh); }, 20);
+                const double t2 = tm([&] { mkl::blas::row_major::gemm(q, mkl::transpose::nontrans, mkl::transpose::trans, m, E, F, 1.0f, Hh, F, Wd, F, 0.0f, Y, E); }, 20);
+                const double fl = 2.0 * m * (2.0 * F * E + (double) E * F);
+                std::printf("  m %4d: gather %.0f us, gemm1 %.0f us, swiglu %.0f us, gemm2 %.0f us -> %.1f TFLOPS on the GEMMs\n", m, tg, t1, ts, t2,
+                            fl / (t1 + t2) / 1e6);
+            }
+            for (void* ptr : {(void*) db, (void*) Xg, (void*) Wgu, (void*) Wd, (void*) G, (void*) Hh, (void*) Y, (void*) Xs, (void*) tok}) sycl::free(ptr, q);
+        }
     }
     return fails ? 1 : 0;
 }

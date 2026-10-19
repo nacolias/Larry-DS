@@ -62,4 +62,13 @@ sycl::event xe_sum_parts(sycl::queue& q, const float* parts, int nparts, int n, 
 /// Dequantise `nrows` rows of `type` (n weights each, `row_bytes` apart) into F32 (the parity test).
 sycl::event xe_dequant_rows(sycl::queue& q, int type, const uint8_t* rows, int nrows, int row_bytes, int n, float* y);
 
+// ---- the prompt path's GEMM form (an expert with many tokens): fp16 operands for oneMKL's XMX GEMMs ----
+
+/// The same dequantisation into fp16 (row-major [nrows][n]).
+sycl::event xe_dequant_rows_f16(sycl::queue& q, int type, const uint8_t* rows, int nrows, int row_bytes, int n, sycl::half* y);
+/// Xg[i][c] = X[tok[i]][c] in fp16, i < m (X: [*][n] f32).
+sycl::event xe_gather_rows_f16(sycl::queue& q, const float* X, const int32_t* tok, int m, int n, sycl::half* Xg);
+/// Hh[i][r] = silu(min(G[i][r], L)) * clamp(G[i][F + r], -L, L) in fp16 (G: [m][2F] f32 = gate | up).
+sycl::event xe_swiglu_f16(sycl::queue& q, const float* G, int m, int F, float L, sycl::half* Hh);
+
 }  // namespace strata::v41::xe

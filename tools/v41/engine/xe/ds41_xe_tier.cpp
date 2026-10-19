@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <sycl/sycl.hpp>
+#include <oneapi/mkl/blas.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -83,6 +84,9 @@ struct XeCard {
     int32_t* cS = nullptr; float* cW = nullptr; size_t cS_cap = 0;   ///< entries
     XeJob* cjobs = nullptr; float* cH = nullptr; float* cY = nullptr; int cjobs_cap = 0;
     uint8_t* stream = nullptr; size_t stream_bytes = 0;   ///< streamed (arena / file) experts of one chunk round
+    uint8_t* gscratch = nullptr; size_t gscratch_cap = 0;  ///< the GEMM path's operands (bytes)
+    float* cX2 = nullptr; size_t cX2_cap = 0;              ///< the dense card's copy of the other cards' sum
+    uint8_t* bounce = nullptr; size_t bounce_cap = 0;      ///< pinned staging for streamed experts in pageable memory
 
     uint8_t* alloc_expert(size_t bytes) {
         if (slabs.empty() || slab_used + bytes > kSlab) {
@@ -128,6 +132,7 @@ struct Ds41XeImpl {
     std::vector<uint8_t*> aptr;        ///< host address in the arena, null = not in the arena (file tier)
     std::vector<uint8_t*> achunks;     ///< the arena's allocations (SYCL host USM, pinned; or pageable)
     bool arena_usm = false;
+    int64_t arena_pinned = 0;
     int64_t arena_bytes = 0, arena_n = 0, file_n = 0;
     bool placed = false;
     bool cache_enabled = true;
@@ -404,7 +409,7 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     }
     // ---- the arena: the rest, in ranked order, up to the RAM budget, in pinned chunks (no blob straddles one)
     const char* aenv = std::getenv("STRATA_XE_ARENA_GIB");
-    const double arena_cap_gib = aenv && *aenv ? std::atof(aenv) : (im.cfg.arena_gib > 0 ? im.cfg.arena_gib : 1e9);
+    const double arena_cap_gib = aenv && *aenv ? std::atof(aenv) : 1e9;   // default: every expert not on a card
     const int64_t avail = mem_available_bytes();
     const double floor_gib = env_d("STRATA_XE_MEM_FLOOR_GIB", 12.0);
     int64_t cap = (int64_t) (arena_cap_gib * kGiB);
@@ -427,21 +432,30 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     }
     im.arena_bytes = abytes;
     im.arena_n = (int64_t) in_arena.size();
-    im.arena_usm = true;
+    // pinned (SYCL host USM) only up to STRATA_XE_PINNED_GIB: GPU-driver host memory is capped by TTM (larry: ~60.7 GiB
+    // for the whole box) and a pinned arena past that makes Level Zero refuse kernels (and can livelock the host).
+    // The hottest arena experts (ranked first) get the pinned chunks; the rest is ordinary pageable memory.
+    const int64_t pin_cap = (int64_t) (env_d("STRATA_XE_PINNED_GIB", 16.0) * kGiB);
+    int64_t pinned = 0;
     for (size_t c = 0; c < nchunks; ++c) {
-        uint8_t* p = sycl::malloc_host<uint8_t>(chunk_size[c], im.ctx);
+        uint8_t* p = nullptr;
+        if (pinned + (int64_t) chunk_size[c] <= pin_cap) {
+            p = sycl::malloc_host<uint8_t>(chunk_size[c], im.ctx);
+            if (p) pinned += (int64_t) chunk_size[c];
+        }
         if (!p) {
-            im.arena_usm = false;
             void* q = nullptr;
-            if (posix_memalign(&q, 4096, chunk_size[c]) != 0 || !q) { err = "xe tier: arena allocation failed"; return false; }
+            if (posix_memalign(&q, 2u << 20, chunk_size[c]) != 0 || !q) { err = "xe tier: arena allocation failed"; return false; }
             p = (uint8_t*) q;
         }
         im.achunks.push_back(p);
     }
+    im.arena_usm = pinned > 0;
+    im.arena_pinned = pinned;
     for (size_t i = 0; i < in_arena.size(); ++i)
         im.aptr[(size_t) im.key(in_arena[i].first, in_arena[i].second)] = im.achunks[where[i] >> 40] + (where[i] & (((size_t) 1 << 40) - 1));
-    std::fprintf(stderr, "xe tier: arena %.2f GiB in %zu chunks (%s), %lld experts; file tier %lld\n", abytes / kGiB, nchunks,
-                 im.arena_usm ? "SYCL host USM, pinned" : "some pageable", (long long) im.arena_n, (long long) im.file_n);
+    std::fprintf(stderr, "xe tier: arena %.2f GiB in %zu chunks (%.2f GiB pinned), %lld experts; file tier %lld\n", abytes / kGiB,
+                 nchunks, pinned / kGiB, (long long) im.arena_n, (long long) im.file_n);
     // ---- load: the cards' experts (device copies out of pinned reader buffers), then the arena
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
@@ -479,16 +493,31 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
     if (!im.placed && !build_arena_ranked(ranked, err)) return false;
     if (im.dense < 0 || !im.cache_enabled || !im.dense_set.empty()) return true;
     XeCard& c = *im.cards[(size_t) im.dense];
-    const double cap = env_d("STRATA_XE_DENSE_GIB", -1.0);
+    // the dense card's share stays small: ggml-sycl's pools are virtual (VMM) and commit while decode runs, so "free
+    // VRAM" right after a prompt overstates what is left, and the xe driver does not refuse an over-commit - it
+    // spills buffers into host RAM (2026-10-19: card 0 at 98 % with 15 GiB of experts, 12 GiB spilled)
+    const double cap = env_d("STRATA_XE_DENSE_GIB", 10.0);
     double gib = im.slot_gib;
     if (cap >= 0) gib = std::min(gib, cap);
     // whatever the engine measured, leave the dense half's graphs a reserve of what is free NOW
     const int64_t fr = c.free_vram();
-    if (fr > 0) gib = std::min(gib, fr / kGiB - env_d("STRATA_XE_DENSE_RESERVE_GIB", 4.0));
+    if (fr > 0) gib = std::min(gib, fr / kGiB - env_d("STRATA_XE_DENSE_RESERVE_GIB", 8.0));
     if (gib < 0.5) return true;
     c.budget = (int64_t) (gib * kGiB);
     const double t0 = now_ms();
-    // the next experts in ranked order that live in the arena only
+    // the next experts in ranked order that live in the arena only.  Pageable arena experts go through a pinned
+    // bounce: a DMA straight from pageable memory makes the driver pin the source pages, and 15 GiB queued at once
+    // pushed larry's driver-held RAM past the watchdog (58 GiB, 2026-10-19; TTM's cap for all of it is ~60.7 GiB).
+    const size_t half = std::max<size_t>((size_t) im.blob_max, (size_t) 64 << 20);
+    if (c.bounce_cap < 2 * half) {
+        if (c.bounce) sycl::free(c.bounce, c.q);
+        c.bounce = sycl::malloc_host<uint8_t>(2 * half, c.q);
+        c.bounce_cap = c.bounce ? 2 * half : 0;
+        if (!c.bounce) { err = "xe tier: bounce allocation failed"; return false; }
+    }
+    sycl::event hev[2];
+    int hcur = 0;
+    size_t hused = 0;
     for (const auto& le : ranked) {
         if (le.first < 0 || le.first >= im.g.n_layers || le.second < 0 || le.second >= im.g.n_experts) continue;
         const size_t key = (size_t) im.key(le.first, le.second);
@@ -497,7 +526,14 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         if (c.used + (int64_t) b > c.budget) continue;
         uint8_t* p = c.alloc_expert(b);
         if (!p) break;
-        c.q.memcpy(p, im.aptr[key], b);
+        if (sycl::get_pointer_type(im.aptr[key], im.ctx) == sycl::usm::alloc::host) {
+            c.q.memcpy(p, im.aptr[key], b);
+        } else {
+            if (hused + b > half) { hcur ^= 1; hused = 0; hev[hcur].wait(); }
+            std::memcpy(c.bounce + (size_t) hcur * half + hused, im.aptr[key], b);
+            hev[hcur] = c.q.memcpy(p, c.bounce + (size_t) hcur * half + hused, b);
+            hused += (b + 255) & ~(size_t) 255;
+        }
         im.card_of[key] = (int8_t) c.idx;
         im.dptr[key] = p;
         im.dense_set.push_back(le);
@@ -639,7 +675,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         for (int64_t i = 0; i < (int64_t) nt * H; ++i) hs[i] += c.part_host[i];
     }
     if (out_dev) {
-        if (!dc) return false;
+        if (!dc) { std::fprintf(stderr, "xe tier: device output without a dense card\n"); return false; }
         const size_t n = (size_t) nt * H;
         if (dc->busy) {   // the dense card's own sum + the host's: OUT[0..n) + OUT[n..2n)
             dc->q.memcpy(dc->OUT + n, hs, n * 4);
@@ -658,10 +694,20 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
 }  // namespace
 
 bool Ds41XeTier::run(int64_t l, const int32_t* ids6, const float* w6, const float* x, float* out) {
-    return run_small(*im_, l, 1, ids6, w6, x, out, nullptr);
+    try {
+        return run_small(*im_, l, 1, ids6, w6, x, out, nullptr);
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "xe tier: run: %s\n", e.what());
+        return false;
+    }
 }
 bool Ds41XeTier::run_to_dev(int64_t l, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
-    return run_small(*im_, l, 1, ids6, w6, x, nullptr, out_dev);
+    try {
+        return run_small(*im_, l, 1, ids6, w6, x, nullptr, out_dev);
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "xe tier: run_to_dev: %s\n", e.what());
+        return false;
+    }
 }
 bool Ds41XeTier::run_multi(int64_t l, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
     for (int t0 = 0; t0 < nt; t0 += kMaxJobTok) {
@@ -701,67 +747,93 @@ bool grow_host(T*& p, size_t& cap, size_t need, sycl::queue& q) {
     return p != nullptr;
 }
 
+/// The Level Zero driver (NEO 26.35) deadlocks when several host threads enqueue to different devices at once while
+/// one of them copies from PAGEABLE host memory (seen 2026-10-19: three appendUSMMemcpy and one appendKernelLaunch
+/// blocked on two driver mutexes).  So the card threads take this lock around every enqueue (never around a wait),
+/// and pageable sources go through a pinned bounce buffer.
+std::mutex g_submit;
+
+/// STRATA_XE_PROF=1: run_big's phases (wall ms of the whole call / per-card busy ms summed over the cards), printed
+/// every 40 calls.
+struct BigProf {
+    double prep = 0, cards = 0, combine = 0, total = 0;
+    std::atomic<int64_t> stream_us{0}, gemm_us{0}, small_us{0};
+    std::atomic<int64_t> streamed{0}, gemm_e{0}, small_j{0};
+    int64_t calls = 0;
+};
+BigProf g_bp;
+bool xe_prof() { static const bool on = env_i("STRATA_XE_PROF", 0) != 0; return on; }
+
 /// n tokens of one layer, expert-major.  out_host (n x n_embd) or out_dev (the dense card).
+///
+/// Per expert the call routes to: an expert with >= STRATA_XE_GEMM_MIN (8) tokens runs as two fp16 GEMMs on oneMKL
+/// (gather its tokens, dequantise it once, gate|up GEMM, SwiGLU, down GEMM: XMX, each weight read once); a smaller one
+/// as mat-vec jobs of <= 8 tokens.  Experts a card does not hold (arena / file tier) are streamed onto the card with
+/// the fewest streamed bytes, in rounds that fit its stream buffer.  Every card runs its part on its own host thread;
+/// each writes its experts' rows of its Y, a deterministic gather sums them into the card's part, and the parts are
+/// copied card-to-card (P2P) onto the dense card and added there.
 bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* w, const float* x, float* out_host,
              void* out_dev) {
+    namespace mkl = oneapi::mkl;
     const int64_t H = im.g.n_embd, F = im.g.n_ff;
     const int K = (int) im.g.top_k;
     const double t0 = now_ms();
-    std::vector<Ent> ents;
-    std::vector<int32_t> first;
-    group(ids, w, n, K, im.g.n_experts, ents, first);
     const size_t NC = im.cards.size();
-    // streamed experts (arena / file tier) go to the card with the least streamed bytes so far
-    struct Stream { int32_t e; int card; size_t off; };
-    std::vector<int64_t> sbytes(NC, 0);
-    std::vector<int32_t> scard((size_t) im.g.n_experts, -1);
-    std::vector<int64_t> soff((size_t) im.g.n_experts, -1);
-    std::vector<std::vector<int32_t>> card_ents(NC);   // indices into ents
-    std::vector<std::vector<int32_t>> streamed(NC);     // experts each card streams
-    const size_t stream_cap = (size_t) (env_d("STRATA_XE_STREAM_GIB", 1.0) * kGiB);
-    for (size_t i = 0; i < ents.size(); ++i) {
-        const int32_t e = ents[i].e;
-        const size_t key = (size_t) im.key(l, e);
-        int c = im.card_of[key];
-        if (c < 0) {
-            if (scard[(size_t) e] < 0) {
-                int best = 0;
-                for (size_t k = 1; k < NC; ++k) if (sbytes[k] < sbytes[(size_t) best]) best = (int) k;
-                scard[(size_t) e] = best;
-                soff[(size_t) e] = sbytes[(size_t) best];
-                sbytes[(size_t) best] += (int64_t) ((im.bbytes(l, e) + 255) & ~(size_t) 255);
-                streamed[(size_t) best].push_back(e);
-            }
-            c = scard[(size_t) e];
+    const int64_t E = im.g.n_experts;
+    const int gemm_min = env_i("STRATA_XE_GEMM_MIN", 8);
+    const bool prof = xe_prof();
+    // per expert: its (token, slot) entries in routing order
+    std::vector<std::vector<int32_t>> by_e((size_t) E);   // slot index t*K + k
+    for (int t = 0; t < n; ++t)
+        for (int k = 0; k < K; ++k) {
+            const int32_t e = ids[(size_t) t * K + k];
+            if (e >= 0 && e < E) by_e[(size_t) e].push_back(t * K + k);
         }
-        card_ents[(size_t) c].push_back((int32_t) i);
+    // which card computes each expert; streamed experts go to the card with the fewest streamed bytes
+    std::vector<int64_t> sbytes(NC, 0);
+    std::vector<std::vector<int32_t>> cl(NC);   // experts per card, resident first then streamed
+    std::vector<std::vector<int32_t>> streamed(NC);
+    for (int64_t e = 0; e < E; ++e) {
+        if (by_e[(size_t) e].empty()) continue;
+        const int c = im.card_of[(size_t) im.key(l, e)];
+        if (c >= 0) cl[(size_t) c].push_back((int32_t) e);
     }
-    // one card at a time would serialise; every card runs its part concurrently (its own queue)
-    std::vector<uint8_t> ftmp;
-    for (auto& cp : im.cards) {
-        XeCard& c = *cp;
-        c.busy = false;
-        const auto& ce = card_ents[(size_t) c.idx];
-        if (ce.empty()) continue;
-        c.busy = true;
-        // stream buffer: this card's streamed experts (one round when they fit the cap; else several, below)
-        if (!grow_dev(c.stream, c.stream_bytes, std::min<size_t>(stream_cap, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1)), c.q))
-            return false;
-        if (!grow_dev(c.cX, c.cX_cap, (size_t) n * H, c.q) || !grow_dev(c.cOUT, c.cOUT_cap, (size_t) n * H, c.q)) return false;
-        if (!grow_host(c.cOUT_host, c.cOUT_host_cap, (size_t) n * H, c.q)) return false;
-        size_t scap = c.cS_cap;
-        if (!grow_dev(c.cS, scap, (size_t) n * K, c.q)) return false;
-        size_t wcap = c.cS_cap;
-        if (!grow_dev(c.cW, wcap, (size_t) n * K, c.q)) return false;
-        c.cS_cap = std::min(scap, wcap);
-        c.q.memcpy(c.cX, x, (size_t) n * H * 4);
-        c.q.memcpy(c.cW, w, (size_t) n * K * 4);
+    for (int64_t e = 0; e < E; ++e) {
+        if (by_e[(size_t) e].empty() || im.card_of[(size_t) im.key(l, e)] >= 0) continue;
+        size_t best = 0;
+        for (size_t k = 1; k < NC; ++k) if (sbytes[k] < sbytes[best]) best = k;
+        sbytes[best] += (int64_t) ((im.bbytes(l, e) + 255) & ~(size_t) 255);
+        streamed[best].push_back((int32_t) e);
+        cl[best].push_back((int32_t) e);
     }
+    const size_t stream_cap = (size_t) (env_d("STRATA_XE_STREAM_GIB", 1.0) * kGiB);
     const int BJ = env_i("STRATA_XE_CHUNK_JOBS", 512);
+    // ---- per card: buffers, X / W upload
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
+        c.busy = !cl[(size_t) c.idx].empty();
         if (!c.busy) continue;
-        size_t jcap = (size_t) c.cjobs_cap;
+        if (!grow_dev(c.stream, c.stream_bytes, std::min<size_t>(stream_cap, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1)), c.q)) {
+            std::fprintf(stderr, "xe tier: card %d: stream buffer allocation failed (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
+            return false;
+        }
+        if (!grow_dev(c.cX, c.cX_cap, (size_t) n * H, c.q) || !grow_dev(c.cOUT, c.cOUT_cap, (size_t) n * H, c.q)) {
+            std::fprintf(stderr, "xe tier: card %d: chunk X/OUT allocation failed (n %d, %.2f GiB free)\n", c.idx, n, c.free_vram() / kGiB);
+            return false;
+        }
+        if (!out_dev && !grow_host(c.cOUT_host, c.cOUT_host_cap, (size_t) n * H, c.q)) {
+            std::fprintf(stderr, "xe tier: card %d: chunk host buffer allocation failed (n %d)\n", c.idx, n);
+            return false;
+        }
+        if (c.cS_cap < (size_t) n * K) {
+            size_t scap = 0, wcap = 0;
+            if (c.cS) { c.q.wait(); sycl::free(c.cS, c.q); sycl::free(c.cW, c.q); c.cS = nullptr; c.cW = nullptr; }
+            if (!grow_dev(c.cS, scap, (size_t) n * K, c.q) || !grow_dev(c.cW, wcap, (size_t) n * K, c.q)) {
+                std::fprintf(stderr, "xe tier: card %d: chunk map allocation failed\n", c.idx);
+                return false;
+            }
+            c.cS_cap = (size_t) n * K;
+        }
         if (c.cjobs_cap < BJ) {
             c.q.wait();
             if (c.cjobs) sycl::free(c.cjobs, c.q);
@@ -770,114 +842,267 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             c.cjobs = sycl::malloc_shared<XeJob>((size_t) BJ, c.q);
             c.cH = sycl::malloc_device<float>((size_t) BJ * kMaxJobTok * F, c.q);
             c.cY = sycl::malloc_device<float>((size_t) BJ * kMaxJobTok * H, c.q);
-            if (!c.cjobs || !c.cH || !c.cY) return false;
+            if (!c.cjobs || !c.cH || !c.cY) {
+                std::fprintf(stderr, "xe tier: card %d: chunk job buffers allocation failed (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
+                return false;
+            }
             c.cjobs_cap = BJ;
         }
-        (void) jcap;
+        c.q.memcpy(c.cX, x, (size_t) n * H * 4);
+        c.q.memcpy(c.cW, w, (size_t) n * K * 4);
+        c.q.memset(c.cOUT, 0, (size_t) n * H * 4);
     }
-    // per card: rounds over its streamed experts (each round fills the stream buffer), each round's jobs in batches
-    // of BJ; batch slot map S: -1 except the (token, k) entries the batch serves
-    std::vector<int32_t> S((size_t) n * K);
-    bool first_out[16] = {};
-    for (auto& cp : im.cards) first_out[cp->idx] = true;
-    std::vector<XeJob> jb;
-    // the jobs that do not need streaming, then the streamed ones by round
-    for (auto& cp : im.cards) {
-        XeCard& c = *cp;
-        if (!c.busy) continue;
-        const auto& ce = card_ents[(size_t) c.idx];
-        // split ce into rounds: resident first (round 0 includes them), streamed by stream capacity
-        std::vector<std::vector<int32_t>> rounds(1);
-        size_t used = 0;
-        std::vector<int32_t> round_of_e((size_t) im.g.n_experts, -1);
+    const double t_prep = now_ms();
+    // ---- every card's part on its own host thread
+    std::vector<char> ok(NC, 1);
+    std::atomic<int64_t> hits{0}, pcie{0};
+    auto card_work = [&](XeCard& c) -> bool {
+        std::vector<int32_t> S((size_t) n * K);
+        std::vector<int64_t> soff((size_t) E, -1);
+        std::vector<int32_t> round_of((size_t) E, 0);
+        std::vector<int32_t> ptok;
+        std::vector<uint8_t> ftmp;
+        double tp = now_ms();
+        auto lap = [&](std::atomic<int64_t>& acc) {
+            if (!prof) return;
+            c.q.wait();
+            const double t = now_ms();
+            acc += (int64_t) ((t - tp) * 1000.0);
+            tp = t;
+        };
         int nr = 1;
+        size_t used = 0;
         for (int32_t e : streamed[(size_t) c.idx]) {
             const size_t b = (im.bbytes(l, e) + 255) & ~(size_t) 255;
             if (used + b > c.stream_bytes && used > 0) { ++nr; used = 0; }
-            round_of_e[(size_t) e] = nr - 1;
+            round_of[(size_t) e] = nr - 1;
             soff[(size_t) e] = (int64_t) used;
             used += b;
         }
-        rounds.resize((size_t) nr);
-        for (int32_t i : ce) {
-            const int32_t e = ents[(size_t) i].e;
-            const int r = im.card_of[(size_t) im.key(l, e)] >= 0 ? 0 : round_of_e[(size_t) e];
-            rounds[(size_t) r].push_back(i);
-        }
         for (int r = 0; r < nr; ++r) {
-            // stream this round's experts
             if (!streamed[(size_t) c.idx].empty()) {
-                c.q.wait();
-                for (int32_t e : streamed[(size_t) c.idx]) {
-                    if (round_of_e[(size_t) e] != r) continue;
-                    const uint8_t* hb = host_blob(im, l, e, ftmp);
-                    c.q.memcpy(c.stream + soff[(size_t) e], hb, im.bbytes(l, e));
-                    if (hb == ftmp.data()) c.q.wait();   // the file-tier buffer is reused
-                    ++im.st.pcie;
+                if (r > 0) c.q.wait();   // the previous round's kernels read the stream buffer
+                // pageable sources: copied (CPU) into one half of the pinned bounce, DMA'd from there; the other half
+                // fills meanwhile.  Pinned (host USM) arena chunks DMA directly.
+                const size_t half = std::max<size_t>((size_t) im.blob_max, (size_t) 64 << 20);
+                if (c.bounce_cap < 2 * half) {
+                    if (c.bounce) sycl::free(c.bounce, c.q);
+                    c.bounce = sycl::malloc_host<uint8_t>(2 * half, c.q);
+                    c.bounce_cap = c.bounce ? 2 * half : 0;
+                    if (!c.bounce) { std::fprintf(stderr, "xe tier: card %d: bounce allocation failed\n", c.idx); return false; }
                 }
+                sycl::event hev[2];
+                int hcur = 0;
+                size_t hused = 0;
+                struct Pend { size_t dst, src, bytes; };
+                std::vector<Pend> pend;
+                auto flush = [&]() {
+                    if (pend.empty()) return;
+                    std::lock_guard<std::mutex> lk(g_submit);
+                    for (const Pend& pd : pend) hev[hcur] = c.q.memcpy(c.stream + pd.dst, c.bounce + pd.src, pd.bytes);
+                    pend.clear();
+                    hcur ^= 1;
+                    hused = 0;
+                };
+                for (int32_t e : streamed[(size_t) c.idx]) {
+                    if (round_of[(size_t) e] != r) continue;
+                    const size_t bytes = im.bbytes(l, e);
+                    const uint8_t* hb = host_blob(im, l, e, ftmp);
+                    const bool pinned = hb != ftmp.data() && sycl::get_pointer_type(hb, im.ctx) == sycl::usm::alloc::host;
+                    if (pinned) {
+                        std::lock_guard<std::mutex> lk(g_submit);
+                        c.q.memcpy(c.stream + soff[(size_t) e], hb, bytes);
+                    } else {
+                        if (hused + bytes > half) flush();
+                        if (hused == 0) hev[hcur].wait();   // this half's previous DMAs are done
+                        std::memcpy(c.bounce + (size_t) hcur * half + hused, hb, bytes);
+                        pend.push_back({(size_t) soff[(size_t) e], (size_t) hcur * half + hused, bytes});
+                        hused += (bytes + 255) & ~(size_t) 255;
+                    }
+                    ++pcie;
+                    ++g_bp.streamed;
+                }
+                flush();
+                lap(g_bp.stream_us);
             }
-            const auto& rl = rounds[(size_t) r];
-            for (size_t b0 = 0; b0 < rl.size(); b0 += (size_t) BJ) {
-                const size_t nb = std::min<size_t>((size_t) BJ, rl.size() - b0);
-                c.q.wait();   // cjobs is shared memory the previous batch's kernels read
+            auto dptr_of = [&](int32_t e) -> const uint8_t* {
+                const size_t key = (size_t) im.key(l, e);
+                return im.card_of[key] >= 0 ? im.dptr[key] : c.stream + soff[(size_t) e];
+            };
+            auto in_round = [&](int32_t e) { return im.card_of[(size_t) im.key(l, e)] >= 0 ? r == 0 : round_of[(size_t) e] == r; };
+            // ---- the GEMM experts of this round
+            std::vector<int32_t> ge;
+            int64_t gm_max = 0, gp = 0;
+            for (int32_t e : cl[(size_t) c.idx])
+                if (in_round(e) && (int) by_e[(size_t) e].size() >= gemm_min) {
+                    ge.push_back(e);
+                    gm_max = std::max<int64_t>(gm_max, (int64_t) by_e[(size_t) e].size());
+                    gp += (int64_t) by_e[(size_t) e].size();
+                }
+            if (!ge.empty()) {
+                const size_t need = (size_t) gm_max * H * 2 + (size_t) 2 * F * H * 2 + (size_t) H * F * 2 +
+                                    (size_t) gm_max * 2 * F * 4 + (size_t) gm_max * F * 2 + (size_t) gp * H * 4 + (size_t) gp * 4 + 8192;
+                if (c.gscratch_cap < need) c.q.wait();
+                bool grown;
+                {
+                    std::lock_guard<std::mutex> lk(g_submit);
+                    grown = grow_dev(c.gscratch, c.gscratch_cap, need, c.q);
+                }
+                if (!grown) {
+                    std::fprintf(stderr, "xe tier: card %d: GEMM scratch allocation failed (%.2f GiB, %.2f GiB free)\n", c.idx,
+                                 need / kGiB, c.free_vram() / kGiB);
+                    return false;
+                }
+                uint8_t* p = c.gscratch;
+                auto take = [&](size_t bytes) { uint8_t* r0 = p; p += (bytes + 255) & ~(size_t) 255; return r0; };
+                sycl::half* Xg = (sycl::half*) take((size_t) gm_max * H * 2);
+                sycl::half* Wgu = (sycl::half*) take((size_t) 2 * F * H * 2);
+                sycl::half* Wd = (sycl::half*) take((size_t) H * F * 2);
+                float* G = (float*) take((size_t) gm_max * 2 * F * 4);
+                sycl::half* Hh = (sycl::half*) take((size_t) gm_max * F * 2);
+                float* Yg = (float*) take((size_t) gp * H * 4);
+                int32_t* dtok = (int32_t*) take((size_t) gp * 4);
+                ptok.clear();
+                std::fill(S.begin(), S.end(), -1);
+                for (int32_t e : ge)
+                    for (int32_t sk : by_e[(size_t) e]) { S[(size_t) sk] = (int32_t) ptok.size(); ptok.push_back(sk / K); }
+                {
+                    std::lock_guard<std::mutex> lk(g_submit);
+                    c.q.memcpy(dtok, ptok.data(), ptok.size() * 4);
+                    c.q.memcpy(c.cS, S.data(), S.size() * 4);
+                }
+                c.q.wait();   // S and ptok are reused below
+                int64_t base = 0;
+                for (int32_t e : ge) {
+                    std::lock_guard<std::mutex> lk(g_submit);
+                    const int64_t m = (int64_t) by_e[(size_t) e].size();
+                    const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
+                    const uint8_t* blob = dptr_of(e);
+                    xe::xe_gather_rows_f16(c.q, c.cX, dtok + base, (int) m, (int) H, Xg);
+                    xe::xe_dequant_rows_f16(c.q, f.gu_type, blob, (int) F, (int) f.gu_row, (int) H, Wgu);
+                    xe::xe_dequant_rows_f16(c.q, f.gu_type, blob + f.up_off, (int) F, (int) f.gu_row, (int) H, Wgu + (size_t) F * H);
+                    mkl::blas::row_major::gemm(c.q, mkl::transpose::nontrans, mkl::transpose::trans, m, 2 * F, H, 1.0f, Xg, H,
+                                               Wgu, H, 0.0f, G, 2 * F);
+                    xe::xe_swiglu_f16(c.q, G, (int) m, (int) F, im.L, Hh);
+                    xe::xe_dequant_rows_f16(c.q, f.d_type, blob + f.down_off, (int) H, (int) f.d_row, (int) F, Wd);
+                    mkl::blas::row_major::gemm(c.q, mkl::transpose::nontrans, mkl::transpose::trans, m, H, F, 1.0f, Hh, F,
+                                               Wd, F, 0.0f, Yg + (size_t) base * H, H);
+                    base += m;
+                    if (im.card_of[(size_t) im.key(l, e)] >= 0) ++hits;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(g_submit);
+                    xe::xe_gather(c.q, Yg, c.cS, c.cW, n, K, (int) H, c.cOUT, true);
+                }
+                g_bp.gemm_e += (int64_t) ge.size();
+                lap(g_bp.gemm_us);
+            }
+            // ---- the small experts of this round: mat-vec jobs of <= 8 tokens, in batches of BJ
+            std::vector<XeJob> jobs;
+            std::vector<std::vector<int32_t>> jslots;
+            for (int32_t e : cl[(size_t) c.idx]) {
+                if (!in_round(e) || (int) by_e[(size_t) e].size() >= gemm_min) continue;
+                const auto& v = by_e[(size_t) e];
+                for (size_t i0 = 0; i0 < v.size(); i0 += kMaxJobTok) {
+                    XeJob j = make_job(im, l, e, dptr_of(e));
+                    j.nt = (uint8_t) std::min<size_t>(kMaxJobTok, v.size() - i0);
+                    std::vector<int32_t> sl;
+                    for (int s = 0; s < j.nt; ++s) { j.tok[s] = v[i0 + s] / K; j.w[s] = 1.0f; sl.push_back(v[i0 + s]); }
+                    jobs.push_back(j);
+                    jslots.push_back(sl);
+                }
+                if (im.card_of[(size_t) im.key(l, e)] >= 0) ++hits;
+            }
+            for (size_t b0 = 0; b0 < jobs.size(); b0 += (size_t) BJ) {
+                const size_t nb = std::min<size_t>((size_t) BJ, jobs.size() - b0);
+                c.q.wait();   // cjobs (shared memory) and cS are read by the previous batch / the GEMM gather
                 std::fill(S.begin(), S.end(), -1);
                 for (size_t q = 0; q < nb; ++q) {
-                    const Ent& en = ents[(size_t) rl[b0 + q]];
-                    const size_t key = (size_t) im.key(l, en.e);
-                    const uint8_t* dp = im.card_of[key] >= 0 ? im.dptr[key] : c.stream + soff[(size_t) en.e];
-                    XeJob j = make_job(im, l, en.e, dp);
-                    j.nt = (uint8_t) en.nt;
-                    for (int s = 0; s < en.nt; ++s) {
-                        j.tok[s] = en.tok[s];
-                        j.w[s] = en.w[s];
-                        S[(size_t) en.k[s]] = (int32_t) (q * kMaxJobTok + (size_t) s);
-                    }
-                    c.cjobs[q] = j;
-                    if (im.card_of[key] >= 0) ++im.st.hits;
+                    c.cjobs[q] = jobs[b0 + q];
+                    const auto& sl = jslots[b0 + q];
+                    for (size_t s = 0; s < sl.size(); ++s) S[(size_t) sl[s]] = (int32_t) (q * kMaxJobTok + s);
                 }
-                c.q.memcpy(c.cS, S.data(), S.size() * 4).wait();   // S is reused by the next batch
+                {
+                    std::lock_guard<std::mutex> lk(g_submit);
+                    c.q.memcpy(c.cS, S.data(), S.size() * 4);
+                }
+                c.q.wait();
+                std::lock_guard<std::mutex> lk(g_submit);
                 xe::xe_experts_y(c.q, c.cjobs, (int) nb, c.cX, c.cH, c.cY, (int) H, (int) F, im.L);
-                xe::xe_gather(c.q, c.cY, c.cS, c.cW, n, K, (int) H, c.cOUT, !first_out[c.idx]);
-                first_out[c.idx] = false;
+                xe::xe_gather(c.q, c.cY, c.cS, c.cW, n, K, (int) H, c.cOUT, true);
             }
+            g_bp.small_j += (int64_t) jobs.size();
+            if (!jobs.empty()) lap(g_bp.small_us);
         }
-        if (!(c.dense && out_dev)) c.q.memcpy(c.cOUT_host, c.cOUT, (size_t) n * H * 4);
-    }
-    // sum the cards' parts
-    XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
-    std::vector<float> hs;
-    bool have_host = false;
-    for (auto& cp : im.cards) {
-        XeCard& c = *cp;
-        if (!c.busy || (c.dense && out_dev)) continue;
+        if (!out_dev) {
+            std::lock_guard<std::mutex> lk(g_submit);
+            c.q.memcpy(c.cOUT_host, c.cOUT, (size_t) n * H * 4);
+        }
         c.q.wait();
-        if (!have_host) { hs.assign(c.cOUT_host, c.cOUT_host + (size_t) n * H); have_host = true; }
-        else for (size_t i = 0; i < (size_t) n * H; ++i) hs[i] += c.cOUT_host[i];
+        return true;
+    };
+    {
+        std::vector<std::thread> th;
+        for (auto& cp : im.cards) {
+            XeCard* c = cp.get();
+            if (!c->busy) continue;
+            th.emplace_back([&, c]() {
+                try {
+                    ok[(size_t) c->idx] = card_work(*c) ? 1 : 0;
+                } catch (const sycl::exception& e) {
+                    std::fprintf(stderr, "xe tier: card %d chunk: %s\n", c->idx, e.what());
+                    ok[(size_t) c->idx] = 0;
+                }
+            });
+        }
+        for (auto& t : th) t.join();
     }
+    for (size_t k = 0; k < NC; ++k) if (!ok[k]) return false;
+    im.st.hits += hits;
+    im.st.pcie += pcie;
+    const double t_cards = now_ms();
+    // ---- combine: the other cards' parts copied card-to-card onto the dense card and added there
+    XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
     const size_t NE = (size_t) n * H;
     if (out_dev) {
-        if (!dc) return false;
-        if (dc->busy) {
-            if (have_host) {
-                float* tmp = nullptr;
-                size_t cap = 0;
-                if (!grow_dev(tmp, cap, NE, dc->q)) return false;
-                dc->q.memcpy(tmp, hs.data(), NE * 4);
-                // out = dense part + host part
-                float* a = dc->cOUT;
-                dc->q.parallel_for(sycl::range<1>(NE), [=](sycl::id<1> i) { a[i] += tmp[i]; });
-                dc->q.memcpy(out_dev, a, NE * 4).wait();
-                sycl::free(tmp, dc->q);
-            } else {
-                dc->q.memcpy(out_dev, dc->cOUT, NE * 4).wait();
-            }
-        } else {
-            if (!have_host) hs.assign(NE, 0.f);
-            dc->q.memcpy(out_dev, hs.data(), NE * 4).wait();
+        if (!dc) { std::fprintf(stderr, "xe tier: device output without a dense card\n"); return false; }
+        std::vector<const XeCard*> others;
+        for (auto& cp : im.cards) if (cp->busy && !cp->dense) others.push_back(cp.get());
+        if (!others.empty() && !grow_dev(dc->cX2, dc->cX2_cap, NE * others.size(), dc->q)) {
+            std::fprintf(stderr, "xe tier: dense card: combine buffer allocation failed\n");
+            return false;
         }
+        for (size_t k = 0; k < others.size(); ++k) dc->q.memcpy(dc->cX2 + k * NE, others[k]->cOUT, NE * 4);
+        const int np = (int) others.size();
+        const float* parts = dc->cX2;
+        const float* own = dc->busy ? dc->cOUT : nullptr;
+        float* o = (float*) out_dev;
+        dc->q.parallel_for(sycl::range<1>(NE), [=](sycl::id<1> i) {
+            float s = own ? own[i] : 0.0f;
+            for (int k = 0; k < np; ++k) s += parts[(size_t) k * NE + i];
+            o[i] = s;
+        }).wait();
     } else {
-        if (!have_host) hs.assign(NE, 0.f);
-        std::memcpy(out_host, hs.data(), NE * 4);
+        bool first = true;
+        for (auto& cp : im.cards) {
+            const XeCard& c = *cp;
+            if (!c.busy) continue;
+            if (first) { std::memcpy(out_host, c.cOUT_host, NE * 4); first = false; }
+            else for (size_t i = 0; i < NE; ++i) out_host[i] += c.cOUT_host[i];
+        }
+        if (first) std::memset(out_host, 0, NE * 4);
+    }
+    if (prof) {
+        g_bp.prep += t_prep - t0;
+        g_bp.cards += t_cards - t_prep;
+        g_bp.combine += now_ms() - t_cards;
+        g_bp.total += now_ms() - t0;
+        if (++g_bp.calls % 40 == 0)
+            std::fprintf(stderr, "xe prof (%lld chunk calls, last n %d): wall %.0f ms = prep %.0f + cards %.0f + combine %.0f; "
+                         "card-busy sums: stream %.0f (%lld experts), gemm %.0f (%lld experts), small %.0f (%lld jobs)\n",
+                         (long long) g_bp.calls, n, g_bp.total, g_bp.prep, g_bp.cards, g_bp.combine, g_bp.stream_us / 1000.0,
+                         (long long) g_bp.streamed.load(), g_bp.gemm_us / 1000.0, (long long) g_bp.gemm_e.load(),
+                         g_bp.small_us / 1000.0, (long long) g_bp.small_j.load());
     }
     im.st.wall_ms += now_ms() - t0;
     return true;
@@ -886,12 +1111,22 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
 }  // namespace
 
 bool Ds41XeTier::run_chunk(int64_t l, int n, const int32_t* ids, const float* w, const float* x, float* out) {
-    if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, out, nullptr);
-    return run_big(*im_, l, n, ids, w, x, out, nullptr);
+    try {
+        if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, out, nullptr);
+        return run_big(*im_, l, n, ids, w, x, out, nullptr);
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "xe tier: run_chunk (layer %lld, %d tokens): %s\n", (long long) l, n, e.what());
+        return false;
+    }
 }
 bool Ds41XeTier::run_chunk_dev(int64_t l, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
-    if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, nullptr, out_dev);
-    return run_big(*im_, l, n, ids, w, x, nullptr, out_dev);
+    try {
+        if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, nullptr, out_dev);
+        return run_big(*im_, l, n, ids, w, x, nullptr, out_dev);
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "xe tier: run_chunk_dev (layer %lld, %d tokens): %s\n", (long long) l, n, e.what());
+        return false;
+    }
 }
 
 // ================================ the rest ================================
@@ -905,6 +1140,7 @@ void Ds41XeTier::close() {
         auto fr = [&](void* p) { if (p) sycl::free(p, c.q); };
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cH); fr(c.cY); fr(c.stream);
+        fr(c.gscratch); fr(c.cX2); fr(c.bounce);
     }
     im.cards.clear();
     for (uint8_t* p : im.achunks) {

@@ -68,6 +68,8 @@ int main(int argc, char ** argv) {
     ggml_backend_t be = nullptr;
 #if defined(GGML_USE_CUDA)
     if (cuda) be = ggml_backend_cuda_init(0);
+#else
+    if (cuda) be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);   // larry: any GPU backend (SYCL)
 #endif
     if (!be) { be = ggml_backend_cpu_init(); cuda = false; }
 
