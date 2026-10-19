@@ -119,6 +119,7 @@ struct Ds41Dense::Impl {
     int64_t nl = 0;
     ggml_backend_t backend = nullptr;
     bool own_backend = false, cpu = true;
+    bool sycl = false;   // larry: the backend is ggml-sycl (its DSV4 prompt flash attention needs no 256-padding)
     WStore w;
     Ds41Engram engram;
     std::string err;
@@ -640,7 +641,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, n]
     ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, n]
     int64_t M = Kall->ne[1];
-    if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
+    // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256; ggml-sycl's DSV4 prompt path (>= 8
+    // queries, fattn-dsv4.cpp in larry's ggml-sycl patch) takes any multiple of 16 - padding there only moves bytes
+    const char * mqa_env = std::getenv("GGML_SYCL_DSV4_MQA");
+    const bool sycl_mqa = im.sycl && n >= 8 && M % 16 == 0 && !(mqa_env && mqa_env[0] == '0');
+    if (!im.cpu && !sycl_mqa && M % 256) {
         const int64_t pad = 256 - M % 256;
         Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
         Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
@@ -1047,6 +1052,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         im.own_backend = true;
     }
     im.cpu = ggml_backend_is_cpu(im.backend);
+    im.sycl = !im.cpu && std::strstr(ggml_backend_name(im.backend), "SYCL") != nullptr;
     if (!load_weights(im, err)) return false;
     if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
 

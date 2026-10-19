@@ -141,6 +141,174 @@ index 000000000..f27284400
 +void ggml_sycl_op_dsv41_hc_mixes(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +
 +#endif  // GGML_SYCL_DSV41_FUSED_HPP
+diff --git a/ggml/src/ggml-sycl/fattn-dsv4.cpp b/ggml/src/ggml-sycl/fattn-dsv4.cpp
+new file mode 100644
+index 000000000..e6522a680
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-dsv4.cpp
+@@ -0,0 +1,121 @@
++// ggml-sycl/fattn-dsv4.cpp - larry (Strata-DS4 on Intel): flash attention for DeepSeek-V4.1's prompt shape on XMX.
++//
++// The DS4 engines (Xolotl tools/v41/engine/ds41_dense.cpp) attend with the QUERY as the batch: every query has its
++// own key set (its 128-token window + its top-k compressed rows, padded to a multiple of 256), so one
++// GGML_OP_FLASH_ATTN_EXT has Q [D, 1, NH, n] f32 (64 heads, MQA), K = V [D, M, 1, n] f16, a mask [M, 1, 1, n] f16 and
++// attention sinks [NH] f32.  The TILE kernel does that at ~3.5 TFLOPS (18.6 ms for 512 queries at D 512, M 768); the
++// MKL and oneDNN paths refuse it (one query row per batch, sinks).  Here it is two strided batched oneMKL GEMMs in
++// fp16 with f32 results (XMX) around one softmax kernel:
++//   S_b = (scale * Q_b) . K_b^T     [NH x M] per query b
++//   P_b = softmax(S_b + mask_b) with the head's sink as one more logit (no value row), in fp16
++//   O_b = P_b . V_b                  [NH x D], written straight into dst ([D, NH, 1, n] contiguous)
++// Used for n >= GGML_SYCL_DSV4_MQA_MIN (8) queries; decode keeps the TILE/VEC kernels.  GGML_SYCL_DSV4_MQA=0 = off.
++#include "fattn-dsv4.hpp"
++
++#include <oneapi/mkl.hpp>
++
++#include <cmath>
++#include <cstdlib>
++
++namespace {
++
++int env_int(const char * k, int def) {
++    const char * v = std::getenv(k);
++    return v && *v ? std::atoi(v) : def;
++}
++
++}  // namespace
++
++bool ggml_sycl_fattn_dsv4_mqa_ok(const ggml_tensor * dst) {
++    static const int on = env_int("GGML_SYCL_DSV4_MQA", 1);
++    static const int min_n = env_int("GGML_SYCL_DSV4_MQA_MIN", 8);
++    if (!on) return false;
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    if (!Q || !K || !V || !mask) return false;
++    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
++        dst->type != GGML_TYPE_F32) return false;
++    if (sinks && sinks->type != GGML_TYPE_F32) return false;
++    const int64_t D = Q->ne[0], NH = Q->ne[2], n = Q->ne[3], M = K->ne[1];
++    if (Q->ne[1] != 1 || n < min_n) return false;                          // one query per batch, enough of them
++    if (K->ne[0] != D || V->ne[0] != D || V->ne[1] != M) return false;
++    if (K->ne[2] != 1 || V->ne[2] != 1 || K->ne[3] != n || V->ne[3] != n) return false;   // MQA, keys per query
++    if (D % 16 || M % 16) return false;
++    // K / V contiguous per query: [D] rows, M of them, then the next query
++    for (const ggml_tensor * t : {K, V})
++        if (t->nb[0] != 2 || t->nb[1] != (size_t) D * 2 || t->nb[3] != (size_t) M * D * 2) return false;
++    // mask: one row of M per query
++    if (mask->ne[0] < M || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != n || mask->nb[0] != 2) return false;
++    // dst [D, NH, 1, n] contiguous
++    if (dst->ne[0] != D || dst->ne[1] != NH || dst->ne[2] != 1 || dst->ne[3] != n || !ggml_is_contiguous(dst)) return false;
++    float max_bias = 0.0f, logit_softcap = 0.0f;
++    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    return max_bias == 0.0f && logit_softcap == 0.0f;
++}
++
++void ggml_sycl_flash_attn_ext_dsv4_mqa(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    namespace mkl = oneapi::mkl;
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    const int64_t D = Q->ne[0], NH = Q->ne[2], n = Q->ne[3], M = K->ne[1];
++    float scale = 1.0f;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++    dpct::queue_ptr stream = ctx.stream();
++    ggml_sycl_pool & pool = ctx.pool();
++    ggml_sycl_pool_alloc<sycl::half> Qh(pool, (size_t) n * NH * D);
++    ggml_sycl_pool_alloc<float> S(pool, (size_t) n * NH * M);
++    ggml_sycl_pool_alloc<sycl::half> P(pool, (size_t) n * NH * M);
++    sycl::half * qh = Qh.get();
++    float * s = S.get();
++    sycl::half * p = P.get();
++    // 1. Q (any strides) -> Qh[b][h][d] = half(scale * Q)
++    {
++        const char * qd = (const char *) Q->data;
++        const size_t nb0 = Q->nb[0], nb2 = Q->nb[2], nb3 = Q->nb[3];
++        const size_t total = (size_t) n * NH * D;
++        stream->parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
++            const size_t i = id[0];
++            const int64_t d = (int64_t) (i % D), h = (int64_t) ((i / D) % NH), b = (int64_t) (i / (D * NH));
++            const float v = *(const float *) (qd + d * nb0 + h * nb2 + b * nb3);
++            qh[i] = (sycl::half) (v * scale);
++        });
++    }
++    // 2. S_b = Qh_b [NH x D] . K_b^T  (K_b row-major [M x D])
++    mkl::blas::row_major::gemm_batch(*stream, mkl::transpose::nontrans, mkl::transpose::trans, NH, M, D, 1.0f, qh, D,
++                                     NH * D, (const sycl::half *) K->data, D, M * D, 0.0f, s, M, NH * M, n);
++    // 3. softmax over M with the mask row of the query and the head's sink; P in fp16
++    {
++        const sycl::half * mk = (const sycl::half *) mask->data;
++        const size_t mstride = mask->nb[3] / 2;
++        const float * sk = sinks ? (const float *) sinks->data : nullptr;
++        const int WG = 256;
++        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) n * NH * WG), sycl::range<1>(WG)),
++                             [=](sycl::nd_item<1> it) {
++            const int64_t row = (int64_t) it.get_group(0);       // b * NH + h
++            const int64_t b = row / NH, h = row % NH;
++            const int lid = (int) it.get_local_id(0);
++            const float * sr = s + row * M;
++            const sycl::half * mr = mk + b * mstride;
++            float mx = sk ? sk[h] : -1e30f;   // not -inf: icpx assumes finite math; a fully masked row then gives 0
++            for (int64_t m = lid; m < M; m += WG) mx = sycl::fmax(mx, sr[m] + (float) mr[m]);
++            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
++            float sum = 0.0f;
++            for (int64_t m = lid; m < M; m += WG) sum += sycl::exp(sr[m] + (float) mr[m] - mx);
++            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
++            if (sk) sum += sycl::exp(sk[h] - mx);
++            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
++            sycl::half * pr = p + row * M;
++            for (int64_t m = lid; m < M; m += WG) pr[m] = (sycl::half) (sycl::exp(sr[m] + (float) mr[m] - mx) * inv);
++        });
++    }
++    // 4. O_b = P_b [NH x M] . V_b [M x D] -> dst[b] = [NH][D] (dst is [D, NH, 1, n] contiguous)
++    mkl::blas::row_major::gemm_batch(*stream, mkl::transpose::nontrans, mkl::transpose::nontrans, NH, D, M, 1.0f, p, M,
++                                     NH * M, (const sycl::half *) V->data, D, M * D, 0.0f, (float *) dst->data, D, NH * D, n);
++}
+diff --git a/ggml/src/ggml-sycl/fattn-dsv4.hpp b/ggml/src/ggml-sycl/fattn-dsv4.hpp
+new file mode 100644
+index 000000000..75227ff34
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-dsv4.hpp
+@@ -0,0 +1,11 @@
++#ifndef GGML_SYCL_FATTN_DSV4_HPP
++#define GGML_SYCL_FATTN_DSV4_HPP
++
++#include "common.hpp"
++
++// larry: flash attention for DeepSeek-V4.1's prompt shape (one query per batch, MQA, per-query keys, sinks) as two
++// strided batched oneMKL fp16 GEMMs around a softmax kernel (fattn-dsv4.cpp).
++bool ggml_sycl_fattn_dsv4_mqa_ok(const ggml_tensor * dst);
++void ggml_sycl_flash_attn_ext_dsv4_mqa(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++
++#endif  // GGML_SYCL_FATTN_DSV4_HPP
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 394cda593..b535b627c 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -18,6 +18,7 @@
+ #include "fattn-tile.hpp"
+ #include "fattn-vec.hpp"
+ #include "fattn.hpp"
++#include "fattn-dsv4.hpp"   // larry: DeepSeek-V4.1 prompt attention on XMX
+ #include "fattn-onednn.hpp"
+ 
+ 
+@@ -307,6 +308,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+                 (long long)V_dbg->ne[1]);
+     }
+ 
++    // larry: DeepSeek-V4.1's prompt shape (one query per batch, MQA, per-query keys, sinks) as batched XMX GEMMs
++    if (ggml_sycl_fattn_dsv4_mqa_ok(dst)) {
++        ggml_sycl_flash_attn_ext_dsv4_mqa(ctx, dst);
++        return;
++    }
+     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+     switch (fk) {
+         case BEST_FATTN_KERNEL_NONE:
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 index b24664a0b..6663558fb 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
@@ -178,3 +346,94 @@ index b24664a0b..6663558fb 100644
          case GGML_OP_LIGHTNING_INDEXER:
              return op->src[0]->type == GGML_TYPE_F32 &&
                  (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
+diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/lightning-indexer.cpp
+index 823b713ca..117b624e3 100644
+--- a/ggml/src/ggml-sycl/lightning-indexer.cpp
++++ b/ggml/src/ggml-sycl/lightning-indexer.cpp
+@@ -144,7 +144,86 @@ static void lightning_indexer_f32_sycl(
+         });
+ }
+ 
++
++// ---- larry (DeepSeek-V4.1 prompts): the indexer as ONE fp16 GEMM on XMX + a head-reduction kernel.
++// scores[j, b] = sum_h w[h, b] * relu(q[:, h, b] . k[:, j]) + mask[j, b].  Every query of the batch scores the same
++// keys, so S = Q [n_batch*n_head x n_embd] . K [n_kv x n_embd]^T is one GEMM (the per-row kernel above runs at
++// ~0.35 TFLOPS for 512 queries x 2K keys: 24.5 ms).  Keys are taken in chunks so S stays <= ~256 MiB at any context.
++// Used for n_batch >= GGML_SYCL_LI_GEMM_MIN (32), one stream, F16 / BF16 / F32 keys; GGML_SYCL_LI_GEMM=0 = off.
++#include <oneapi/mkl.hpp>
++#include <cstdlib>
++
++static bool li_gemm_ok(const ggml_tensor * dst) {
++    static const int on = [] { const char * v = std::getenv("GGML_SYCL_LI_GEMM"); return v && *v ? std::atoi(v) : 1; }();
++    static const int min_b = [] { const char * v = std::getenv("GGML_SYCL_LI_GEMM_MIN"); return v && *v ? std::atoi(v) : 32; }();
++    if (!on) return false;
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    if (q->ne[3] != 1 || k->ne[3] != 1 || q->ne[2] < min_b) return false;
++    return k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F32;
++}
++
++static void li_gemm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    namespace mkl = oneapi::mkl;
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * w = dst->src[2];
++    const ggml_tensor * m = dst->src[3];
++    const int64_t E = q->ne[0], H = q->ne[1], B = q->ne[2], NKV = k->ne[2];
++    const size_t nbq1 = q->nb[1], nbq2 = q->nb[2], nbk2 = k->nb[2], nbw1 = w->nb[1], nbm1 = m->nb[1], nb1 = dst->nb[1];
++    const ggml_type kt = k->type;
++    queue_ptr stream = ctx.stream();
++    ggml_sycl_pool & pool = ctx.pool();
++    ggml_sycl_pool_alloc<sycl::half> Qh(pool, (size_t) B * H * E);
++    ggml_sycl_pool_alloc<sycl::half> Kh(pool, (size_t) NKV * E);
++    sycl::half * qh = Qh.get();
++    sycl::half * kh = Kh.get();
++    const char * qd = (const char *) q->data;
++    const char * kd = (const char *) k->data;
++    stream->parallel_for(sycl::range<1>((size_t) B * H * E), [=](sycl::id<1> id) {
++        const size_t i = id[0];
++        const int64_t e = (int64_t) (i % E), h = (int64_t) ((i / E) % H), b = (int64_t) (i / (E * H));
++        qh[i] = (sycl::half) *(const float *) (qd + b * nbq2 + h * nbq1 + e * sizeof(float));
++    });
++    stream->parallel_for(sycl::range<1>((size_t) NKV * E), [=](sycl::id<1> id) {
++        const size_t i = id[0];
++        const int64_t e = (int64_t) (i % E), j = (int64_t) (i / E);
++        const char * row = kd + j * nbk2;
++        float v;
++        if (kt == GGML_TYPE_F16) v = (float) ((const sycl::half *) row)[e];
++        else if (kt == GGML_TYPE_BF16) v = (float) ((const sycl::ext::oneapi::bfloat16 *) row)[e];
++        else v = ((const float *) row)[e];
++        kh[i] = (sycl::half) v;
++    });
++    const int64_t MR = B * H;
++    int64_t CH = (int64_t) ((256ull << 20) / ((size_t) MR * sizeof(float)));
++    CH = std::max<int64_t>(256, std::min<int64_t>(CH, NKV)) / 16 * 16;
++    if (CH <= 0) CH = 16;
++    ggml_sycl_pool_alloc<float> S(pool, (size_t) MR * CH);
++    float * s = S.get();
++    const char * wd = (const char *) w->data;
++    const char * md = (const char *) m->data;
++    float * od = (float *) dst->data;
++    for (int64_t j0 = 0; j0 < NKV; j0 += CH) {
++        const int64_t nc = std::min<int64_t>(CH, NKV - j0);
++        mkl::blas::row_major::gemm(*stream, mkl::transpose::nontrans, mkl::transpose::trans, MR, nc, E, 1.0f, qh, E,
++                                   kh + j0 * E, E, 0.0f, s, nc);
++        stream->parallel_for(sycl::range<2>((size_t) B, (size_t) nc), [=](sycl::id<2> id) {
++            const int64_t b = (int64_t) id[0], jj = (int64_t) id[1];
++            const float * wb = (const float *) (wd + b * nbw1);
++            float acc = 0.0f;
++            for (int64_t h = 0; h < H; ++h) acc += sycl::fmax(s[(b * H + h) * nc + jj], 0.0f) * wb[h];
++            const sycl::half * mb = (const sycl::half *) (md + b * nbm1);
++            od[(j0 + jj) + b * (int64_t) (nb1 / sizeof(float))] = acc + (float) mb[j0 + jj];
++        });
++    }
++}
++
+ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    if (li_gemm_ok(dst)) {   // larry: prompt batches as one XMX GEMM
++        li_gemm(ctx, dst);
++        return;
++    }
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+     const ggml_tensor * q = dst->src[0];
+     const ggml_tensor * k = dst->src[1];
