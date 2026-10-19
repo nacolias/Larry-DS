@@ -76,6 +76,7 @@ struct XeCard {
     float* H = nullptr;             ///< [kMaxDecodeJobs][8][n_ff]
     float* OUT = nullptr;           ///< [2][8][n_embd]: the kernels' sum, then (dense card) the host's
     float* part_host = nullptr;     ///< [8][n_embd]
+    float* dslots = nullptr;        ///< dense card only: [cards + 1][8][n_embd], every card's decode part (+ the CPU's)
     bool busy = false;              ///< this call enqueued work on it
     // prompt-chunk scratch (grown on demand)
     float* cX = nullptr; size_t cX_cap = 0;          ///< floats
@@ -305,6 +306,10 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
         c.OUT = sycl::malloc_device<float>((size_t) 2 * kMaxJobTok * H, c.q);
         c.part_host = sycl::malloc_host<float>((size_t) kMaxJobTok * H, c.q);
         if (!c.stage_dev || !c.stage_host || !c.H || !c.OUT || !c.part_host) { err = "xe tier: scratch allocation failed"; return false; }
+        if (c.dense) {
+            c.dslots = sycl::malloc_device<float>((im.cards.size() + 1) * kMaxJobTok * H, c.q);
+            if (!c.dslots) { err = "xe tier: slot allocation failed"; return false; }
+        }
     }
     const size_t NK = (size_t) geom.n_layers * geom.n_experts;
     im.card_of.assign(NK, -1);
@@ -651,42 +656,81 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         im.st.hits += 1;
     }
     const size_t xoff = (kMaxDecodeJobs * sizeof(XeJob) + kStageAlign - 1) / kStageAlign * kStageAlign;
+    const size_t n_out = (size_t) nt * H;
+    XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
+    if (out_dev && dc) {
+        // DEVICE OUTPUT (every decode / verify step): each card's part goes straight into the dense card's slot
+        // (card-to-card copy), the CPU pool's part into the last slot, and one sum kernel on the dense card - which
+        // waits for the other cards' copies through their events, so the host waits once per layer, not per card.
+        float* slots = dc->dslots;   // [NC + 1][8][H] on the dense card
+        std::vector<sycl::event> deps;
+        std::vector<int> used;
+        for (auto& cp : im.cards) {
+            XeCard& c = *cp;
+            const int n = nj[(size_t) c.idx];
+            if (n == 0) continue;
+            c.busy = true;
+            std::memcpy(c.stage_host + xoff, x, n_out * 4);
+            c.q.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);   // jobs and X in one copy
+            float* dst = c.dense ? slots + (size_t) c.idx * kMaxJobTok * H : c.OUT;
+            sycl::event ev = xe::xe_experts(c.q, (const XeJob*) c.stage_dev, n, nt, (const float*) (c.stage_dev + xoff),
+                                            c.H, dst, (int) H, (int) F, im.L, false);
+            if (!c.dense) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
+            deps.push_back(ev);
+            used.push_back(c.idx);
+        }
+        if (!cpu_list.empty()) {
+            float* hs = im.hsum.data();
+            std::memset(hs, 0, n_out * 4);
+            cpu_ents(im, l, cpu_list, x, hs);
+            deps.push_back(dc->q.memcpy(slots + NC * kMaxJobTok * H, hs, n_out * 4));
+            used.push_back((int) NC);
+        }
+        float* o = (float*) out_dev;
+        if (used.empty()) {
+            dc->q.memset(o, 0, n_out * 4).wait();
+        } else {
+            int sl[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            const int ns = (int) used.size();
+            for (int k = 0; k < ns && k < 8; ++k) sl[k] = used[(size_t) k];
+            const size_t stride = (size_t) kMaxJobTok * H;
+            dc->q.submit([&](sycl::handler& h) {
+                h.depends_on(deps);
+                h.parallel_for(sycl::range<1>(n_out), [=](sycl::id<1> i) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < ns; ++k) sum += slots[(size_t) sl[k] * stride + i];
+                    o[i] = sum;
+                });
+            }).wait();
+        }
+        im.st.wall_ms += now_ms() - t0;
+        return true;
+    }
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
         const int n = nj[(size_t) c.idx];
         if (n == 0) continue;
         c.busy = true;
-        std::memcpy(c.stage_host + xoff, x, (size_t) nt * H * 4);
-        // jobs [0, n) and X in two copies (the job block is small; X follows at xoff)
-        c.q.memcpy(c.stage_dev, c.stage_host, (size_t) n * sizeof(XeJob));
-        c.q.memcpy(c.stage_dev + xoff, c.stage_host + xoff, (size_t) nt * H * 4);
+        std::memcpy(c.stage_host + xoff, x, n_out * 4);
+        c.q.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);
         xe::xe_experts(c.q, (const XeJob*) c.stage_dev, n, nt, (const float*) (c.stage_dev + xoff), c.H, c.OUT,
                        (int) H, (int) F, im.L, false);
-        if (!(c.dense && out_dev)) c.q.memcpy(c.part_host, c.OUT, (size_t) nt * H * 4);
+        c.q.memcpy(c.part_host, c.OUT, n_out * 4);
     }
     float* hs = im.hsum.data();
-    std::memset(hs, 0, (size_t) nt * H * 4);
+    std::memset(hs, 0, n_out * 4);
     cpu_ents(im, l, cpu_list, x, hs);
-    XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
-        if (!c.busy || (c.dense && out_dev)) continue;
+        if (!c.busy) continue;
         c.q.wait();
-        for (int64_t i = 0; i < (int64_t) nt * H; ++i) hs[i] += c.part_host[i];
+        for (size_t i = 0; i < n_out; ++i) hs[i] += c.part_host[i];
     }
-    if (out_dev) {
-        if (!dc) { std::fprintf(stderr, "xe tier: device output without a dense card\n"); return false; }
-        const size_t n = (size_t) nt * H;
-        if (dc->busy) {   // the dense card's own sum + the host's: OUT[0..n) + OUT[n..2n)
-            dc->q.memcpy(dc->OUT + n, hs, n * 4);
-            xe::xe_sum_parts(dc->q, dc->OUT, 2, (int) n, (float*) out_dev, false);
-        } else {
-            dc->q.memcpy(out_dev, hs, n * 4);
-        }
-        dc->q.wait();
-    } else {
-        std::memcpy(out_host, hs, (size_t) nt * H * 4);
+    if (out_dev) {   // no dense card known: through the host
+        std::fprintf(stderr, "xe tier: device output without a dense card\n");
+        return false;
     }
+    std::memcpy(out_host, hs, n_out * 4);
     im.st.wall_ms += now_ms() - t0;
     return true;
 }
@@ -1140,7 +1184,7 @@ void Ds41XeTier::close() {
         auto fr = [&](void* p) { if (p) sycl::free(p, c.q); };
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cH); fr(c.cY); fr(c.stream);
-        fr(c.gscratch); fr(c.cX2); fr(c.bounce);
+        fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots);
     }
     im.cards.clear();
     for (uint8_t* p : im.achunks) {
