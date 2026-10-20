@@ -965,7 +965,9 @@ int main(int argc, char ** argv) {
                     if (pf_last >= 0 && !mc.cpu_only) tier.prefetch_begin(0, pf_last, pipe ? part_max : B);
                 }
                 if (pipe) {
-                    dense.set_submit_lock(&Ds41XeTier::submit_mutex(), &Ds41XeTier::submit_priority());
+                    // STRATA_SUBMIT_PRIO (default 1): the dense half's lock waits hold the tier's threads off
+                    static const bool sub_prio = !(std::getenv("STRATA_SUBMIT_PRIO") && std::getenv("STRATA_SUBMIT_PRIO")[0] == '0');
+                    dense.set_submit_lock(&Ds41XeTier::submit_mutex(), sub_prio ? &Ds41XeTier::submit_priority() : nullptr);
                     static const bool xp2p = !(std::getenv("STRATA_XE_XP2P") && std::getenv("STRATA_XE_XP2P")[0] == '0');
                     const float * fn_dev = xp2p ? dense.batch_fn_dev() : nullptr;
                     if (fn_dev) dense.set_fn_host(false);

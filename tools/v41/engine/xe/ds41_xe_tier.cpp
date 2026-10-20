@@ -100,6 +100,7 @@ struct XeCard {
     uint8_t* bounce = nullptr; size_t bounce_cap = 0;      ///< pinned staging for streamed experts in pageable memory
     // prompt prefetch (Ds41XeTier::prefetch_begin): a copy queue and two layer buffers (ping-pong by layer parity)
     sycl::queue pq;
+    sycl::queue oq;                 ///< prompt calls: the overflow experts' DMAs (STRATA_XE_OVERLAP)
     uint8_t* pbuf[2] = {nullptr, nullptr};
     size_t pbuf_cap = 0;
     sycl::event pev[2];             ///< the last prefetch copy into pbuf[s]
@@ -406,6 +407,7 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
         c->dev = devs[(size_t) i];
         c->q = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
         c->pq = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
+        c->oq = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
         c->name = c->dev.get_info<sycl::info::device::name>();
         if (dense_dev && c->dev == ddev) {
             c->dense = true;
@@ -1566,17 +1568,61 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             acc += (int64_t) ((t - tp) * 1000.0);
             tp = t;
         };
+        // larry, STRATA_XE_OVERLAP: round 0's streamed experts arrive while this thread computes the resident and
+        // prefetched ones (round -1); a round's pageable bytes then also fit the bounce, so the helper never waits on it
+        static const int ovl_on = env_i("STRATA_XE_OVERLAP", 0);   // measured neutral (8.5K 12.5-13.2 vs 12.8 s)
+        const size_t bhalf = std::max<size_t>((size_t) im.blob_max, (size_t) 64 << 20);
+        bool overlap = ovl_on && !streamed[(size_t) c.idx].empty();
+        for (int32_t e : streamed[(size_t) c.idx]) if (!im.aptr[(size_t) im.key(l, e)]) overlap = false;   // file tier: old path
         int nr = 1;
-        size_t used = 0;
+        size_t used = 0, pused = 0;
         for (int32_t e : streamed[(size_t) c.idx]) {
             const size_t b = (im.bbytes(l, e) + 255) & ~(size_t) 255;
-            if (used + b > c.stream_bytes && used > 0) { ++nr; used = 0; }
+            const size_t pg = im.apin[(size_t) im.key(l, e)] ? 0 : b;
+            if ((used + b > c.stream_bytes || (overlap && pused + pg > 2 * bhalf)) && used > 0) { ++nr; used = 0; pused = 0; }
             round_of[(size_t) e] = nr - 1;
             soff[(size_t) e] = (int64_t) used;
             used += b;
+            pused += pg;
         }
-        for (int r = 0; r < nr; ++r) {
-            if (!streamed[(size_t) c.idx].empty()) {
+        std::thread ohelp;
+        struct Joiner { std::thread& t; ~Joiner() { if (t.joinable()) t.join(); } } ojoin{ohelp};
+        sycl::event oev;
+        if (overlap) {
+            bool okb = true;
+            if (c.bounce_cap < 2 * bhalf) {
+                std::lock_guard<PrioMutex> lk(g_submit);
+                if (c.bounce) { c.q.wait(); sycl::free(c.bounce, c.q); }
+                c.bounce = sycl::malloc_host<uint8_t>(2 * bhalf, c.q);
+                c.bounce_cap = c.bounce ? 2 * bhalf : 0;
+                okb = c.bounce != nullptr;
+            }
+            if (!okb) { std::fprintf(stderr, "xe tier: card %d: bounce allocation failed\n", c.idx); return false; }
+            ohelp = std::thread([&]() {   // CPU copies, then the DMAs (under the submit lock like every enqueue)
+                size_t bo = 0;
+                for (int32_t e : streamed[(size_t) c.idx]) {
+                    if (round_of[(size_t) e] != 0) continue;
+                    const size_t key = (size_t) im.key(l, e);
+                    const size_t bytes = im.bbytes(l, e);
+                    const uint8_t* src = im.aptr[key];
+                    if (!im.apin[key]) {
+                        std::memcpy(c.bounce + bo, src, bytes);
+                        src = c.bounce + bo;
+                        bo += (bytes + 255) & ~(size_t) 255;
+                    }
+                    std::lock_guard<PrioMutex> lk(g_submit);
+                    oev = c.oq.memcpy(c.stream + soff[(size_t) e], src, bytes);
+                    ++pcie;
+                    ++g_bp.streamed;
+                }
+            });
+        }
+        for (int r = overlap ? -1 : 0; r < nr; ++r) {
+            if (overlap && r == 0) {   // round 0 came in on the overflow queue
+                ohelp.join();
+                std::lock_guard<PrioMutex> lk(g_submit);
+                c.q.ext_oneapi_submit_barrier({oev});
+            } else if (r >= 0 && !streamed[(size_t) c.idx].empty()) {
                 if (r > 0) c.q.wait();   // the previous round's kernels read the stream buffer
                 // pageable sources: copied (CPU) into one half of the pinned bounce, DMA'd from there; the other half
                 // fills meanwhile.  Pinned (host USM) arena chunks DMA directly.
@@ -1628,7 +1674,8 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 return c.stream + soff[(size_t) e];
             };
             auto in_round = [&](int32_t e) {
-                return im.card_of[(size_t) im.key(l, e)] >= 0 || (ps && ps->card[(size_t) e] >= 0) ? r == 0 : round_of[(size_t) e] == r;
+                return im.card_of[(size_t) im.key(l, e)] >= 0 || (ps && ps->card[(size_t) e] >= 0) ? r == (overlap ? -1 : 0)
+                                                                                               : round_of[(size_t) e] == r;
             };
             // resident experts are stored planar (int8 kernels); streamed ones arrive in the file layout (F32 kernels)
             auto is_planar = [&](int32_t e) { return im.planar && im.card_of[(size_t) im.key(l, e)] >= 0; };
