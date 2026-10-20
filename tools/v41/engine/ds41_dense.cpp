@@ -262,6 +262,7 @@ struct Ds41Dense::Impl {
     ~Impl() {
         if (backend) ggml_backend_synchronize(backend);   // async decode graphs may still be queued
         if (rb_ev) ggml_backend_event_free(rb_ev);
+        if (up_ev) ggml_backend_event_free(up_ev);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -280,6 +281,13 @@ struct Ds41Dense::Impl {
     }
     bool compute(ggml_cgraph * gf, bool cached, bool async = false);
     ggml_backend_event_t rb_ev = nullptr;   // larry: the router readbacks' event (async decode / verify layers)
+    // larry: a decode / verify pass's inputs go up through a pinned staging buffer with async copies (each
+    // ggml_backend_tensor_set is a device-wide wait plus a staged pageable copy: ~70 us, a dozen per pass)
+    HostRows<uint8_t> up_stage;
+    size_t up_off = 0;
+    bool up_async = false;                    // this pass stages (set by upload_inputs)
+    ggml_backend_event_t up_ev = nullptr;     // after the last staged copy: the buffer's reuse waits for it
+    void up_set(ggml_tensor * t, const void * data, size_t size);
     bool upload_inputs(const int * tids, int n, int pos0);
 };
 
@@ -1294,10 +1302,26 @@ static bool engram_ready(Ds41Dense::Impl & im) {
     return true;
 }
 
+void Ds41Dense::Impl::up_set(ggml_tensor * t, const void * data, size_t size) {
+    const size_t a = (up_off + 63) & ~(size_t) 63;
+    if (!up_async || a + size > up_stage.size()) { ggml_backend_tensor_set(t, data, 0, size); return; }
+    std::memcpy(up_stage.data() + a, data, size);
+    ggml_backend_tensor_set_async(backend, t, up_stage.data() + a, 0, size);
+    up_off = a + size;
+}
+
 // Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     Impl & im = *this;
+    im.up_async = im.sycl && n <= 8 && dense_async_on();
+    if (im.up_async) {
+        if (im.up_stage.empty()) im.up_stage.resize((size_t) 4 << 20, im.backend);
+        if (!im.up_ev) im.up_ev = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+        else ggml_backend_event_synchronize(im.up_ev);   // the previous pass's staged copies have run
+        im.up_off = 0;
+        im.up_async = im.up_ev && !im.up_stage.empty();
+    }
     im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
     // embeddings (F16 rows on the mmap)
@@ -1307,10 +1331,10 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
         for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
     }
-    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+    im.up_set(im.i_emb, im.host_emb.data(), im.host_emb.size() * 4);
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
-    ggml_backend_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);
+    im.up_set(im.i_pos, pos.data(), (size_t) n * 4);
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
     std::vector<float> wm((size_t) (SWA * n));
@@ -1327,13 +1351,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             wm[(size_t) (t * SWA + j)] = m;
         }
     }
-    ggml_backend_tensor_set(im.i_widx, widx.data(), 0, widx.size() * 4);
-    ggml_backend_tensor_set(im.i_wmask, wm.data(), 0, wm.size() * 4);
+    im.up_set(im.i_widx, widx.data(), widx.size() * 4);
+    im.up_set(im.i_wmask, wm.data(), wm.size() * 4);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
         for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pos0 + n - k + j) % RAW);
-        ggml_backend_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
+        im.up_set(im.i_wslot, ws.data(), ws.size() * 4);
     }
     // compressed rows per ratio
     for (int r = 1; r <= 2; ++r) {
@@ -1346,13 +1370,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             cs[t] = (int32_t) (done ? p / r : im.cmax[r]);   // an open group writes the spare row
             cp[t] = (int32_t) ((p / r) * r);
         }
-        ggml_backend_tensor_set(im.i_nvis[r], nv.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cslot[r], cs.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cpos[r], cp.data(), 0, (size_t) n * 4);
+        im.up_set(im.i_nvis[r], nv.data(), (size_t) n * 4);
+        im.up_set(im.i_cslot[r], cs.data(), (size_t) n * 4);
+        im.up_set(im.i_cpos[r], cp.data(), (size_t) n * 4);
         if (r == 1) {
             std::vector<float> lb(n);
             for (int t = 0; t < n; ++t) lb[t] = (float) ((nv[t] - 1) >= 0 ? (int64_t) (nv[t] - 1) / im.CBS : -1);
-            ggml_backend_tensor_set(im.i_lastblk, lb.data(), 0, (size_t) n * 4);
+            im.up_set(im.i_lastblk, lb.data(), (size_t) n * 4);
         }
     }
     {   // ratio-2 state: rows of [ring (2) | pass states] for each token's group (2g, 2g+1); open groups repeat 2g
@@ -1365,8 +1389,8 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         }
         const int64_t k = std::min<int64_t>(n, 2);
         for (int64_t j = 0; j < k; ++j) ss.push_back((int32_t) ((pos0 + n - k + j) % 2));
-        ggml_backend_tensor_set(im.i_sidx, si.data(), 0, si.size() * 4);
-        ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
+        im.up_set(im.i_sidx, si.data(), si.size() * 4);
+        im.up_set(im.i_sslot, ss.data(), ss.size() * 4);
     }
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
     // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
@@ -1384,12 +1408,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
                 if (++eng_n % 64 == 0) std::fprintf(stderr, "engram decode reads: %.3f ms/call over %ld calls\n", eng_ms / eng_n, eng_n);
             }
             for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
-                ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+                im.up_set(im.i_eng[e], im.eng_rows[e].data(), im.eng_rows[e].size() * 4);
         } else {
             im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
             if (!im.eng_batch) return false;
         }
     }
+    if (im.up_async) ggml_backend_event_record(im.up_ev, im.backend);   // the staging buffer's reuse waits for it
     return true;
 }
 
