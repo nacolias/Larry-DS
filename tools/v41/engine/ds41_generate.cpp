@@ -1035,6 +1035,7 @@ int main(int argc, char ** argv) {
                     bool okp = true;
                     int plo = -1, pmid = -2;
                     for (int l = 0; okp && l < n_layer; ++l) {
+                        if (l < 4 || l == n_layer - 1) vram_log("pipelined batch layer", l);
                         int lo, mid;
                         split_of(l, lo, mid);
                         if (mid < 0 || lo != plo || mid != pmid || (cut > 0 && l == CL)) okp = PJ();
@@ -1503,8 +1504,12 @@ int main(int argc, char ** argv) {
                 // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
                 // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
                 // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
-                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
-                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                // larry: the two constants from the environment (the Xe tier's batch keeps its chunk buffers on the
+                // expert cards: ~0.32 MiB of state a column on the dense card, measured with STRATA_VRAM_TRACE)
+                static const double fit_fixed = std::getenv("STRATA_SERVE_BATCH_FIXED_GIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_FIXED_GIB")) : 4.3;
+                static const double fit_col = std::getenv("STRATA_SERVE_BATCH_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_COL_MIB")) : 0.95;
+                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - fit_fixed * 1073741824.0;
+                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (fit_col * 1048576.0)));
                 pb_cap = std::min(PB, std::max(SB, fit));
                 if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
                                              frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
