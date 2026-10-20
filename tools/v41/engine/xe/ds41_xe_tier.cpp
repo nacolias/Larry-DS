@@ -19,6 +19,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -172,6 +173,15 @@ struct Ds41XeImpl {
     int64_t resident_n = 0;
     // CPU pool for the arena experts of a decode / verify call
     std::unique_ptr<cpu::ExpertPool> pool;
+    // STRATA_XE_CPU_ASYNC (default 1): a decode / verify call's CPU-pool experts run on a helper thread (it drives
+    // the pool) while the main thread dispatches the cards - they used to start only after every card's submission
+    struct CpuTask { int64_t l; const void* ents; const float* x; float* hs; size_t n_out; };   ///< ents: std::vector<const Ent*>
+    bool cpu_async = true;
+    std::thread cpu_thr;
+    std::mutex cpu_mu;
+    std::condition_variable cpu_cv;
+    std::atomic<int> cpu_state{0};     ///< 0 idle, 1 posted, 2 done, 3 stop
+    CpuTask cpu_task{};
     std::vector<cpu::ExpertJobMulti> cjobs;
     std::vector<cpu::ActQ> actq;           ///< per token
     std::vector<uint8_t> nact;             ///< [token][format slot][kNativeActBytes]
@@ -290,6 +300,7 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
     im.planar = env_i("STRATA_XE_PLANAR", 1) != 0;
     im.tier_graphs = env_i("STRATA_XE_GRAPH", 1) != 0;
     im.x_direct = env_i("STRATA_XE_XDIRECT", 1) != 0;
+    im.cpu_async = env_i("STRATA_XE_CPU_ASYNC", 1) != 0;
     im.tier_graphs_multi = env_i("STRATA_XE_GRAPH_MULTI", 0) != 0;   // measured: no gain (the cards' dispatch is not submit-bound)
     const int64_t NCL = geom.n_classes();
     im.fl.assign((size_t) NCL, cpu::NativeFmt());
@@ -801,6 +812,49 @@ void cpu_ents(Ds41XeImpl& im, int64_t l, const std::vector<const Ent*>& ents, co
     im.st.cpu_ms += now_ms() - t0;
 }
 
+// the CPU-pool helper (STRATA_XE_CPU_ASYNC): spins ~100 us for a task, then sleeps on the condition variable
+void cpu_worker(Ds41XeImpl& im) {
+    for (;;) {
+        int st = im.cpu_state.load(std::memory_order_acquire);
+        for (int i = 0; st == 0 && i < 20000; ++i) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+            st = im.cpu_state.load(std::memory_order_acquire);
+        }
+        if (st == 0) {
+            std::unique_lock<std::mutex> lk(im.cpu_mu);
+            im.cpu_cv.wait(lk, [&] { return im.cpu_state.load(std::memory_order_acquire) != 0; });
+            st = im.cpu_state.load(std::memory_order_acquire);
+        }
+        if (st == 3) return;
+        if (st != 1) continue;
+        const Ds41XeImpl::CpuTask t = im.cpu_task;
+        std::memset(t.hs, 0, t.n_out * 4);
+        cpu_ents(im, t.l, *static_cast<const std::vector<const Ent*>*>(t.ents), t.x, t.hs);
+        im.cpu_state.store(2, std::memory_order_release);
+    }
+}
+
+void cpu_post(Ds41XeImpl& im, const Ds41XeImpl::CpuTask& t) {
+    if (!im.cpu_thr.joinable()) im.cpu_thr = std::thread(cpu_worker, std::ref(im));
+    im.cpu_task = t;
+    {
+        std::lock_guard<std::mutex> lk(im.cpu_mu);
+        im.cpu_state.store(1, std::memory_order_release);
+    }
+    im.cpu_cv.notify_one();
+}
+
+void cpu_join(Ds41XeImpl& im) {
+    while (im.cpu_state.load(std::memory_order_acquire) != 2) {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+    im.cpu_state.store(0, std::memory_order_release);
+}
+
 /// A card's share of a decode / verify call: its n jobs (staged in c.stage_dev, X at xoff) into dst [nt][n_embd].
 sycl::event card_experts(Ds41XeImpl& im, XeCard& c, int n, int nt, int max_nt, size_t xoff, float* dst, const float* xsrc = nullptr) {
     const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
@@ -856,6 +910,11 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         // (card-to-card copy), the CPU pool's part into the last slot, and one sum kernel on the dense card - which
         // waits for the other cards' copies through their events, so the host waits once per layer, not per card.
         float* slots = dc->dslots;   // [NC + 1][8][H] on the dense card
+        const bool cpu_bg = im.cpu_async && !cpu_list.empty();
+        if (cpu_bg) {   // the CPU part starts now, under the cards' submissions
+            im.hsum_ev.wait();   // the previous call's copy of hsum has been made
+            cpu_post(im, Ds41XeImpl::CpuTask{l, &cpu_list, x, im.hsum, n_out});
+        }
         // direct X: the call's rows are pinned host memory (the dense half's readback mirror) - no staging copy
         static const float* xd_last = nullptr;
         static bool xd_ok = false;
@@ -936,9 +995,13 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         sycl::queue& qd = im.dense_q ? *im.dense_q : dc->q;
         if (!cpu_list.empty()) {
             float* hs = im.hsum;
-            im.hsum_ev.wait();   // the previous call's copy of hsum has been made
-            std::memset(hs, 0, n_out * 4);
-            cpu_ents(im, l, cpu_list, x, hs);
+            if (cpu_bg) {
+                cpu_join(im);
+            } else {
+                im.hsum_ev.wait();   // the previous call's copy of hsum has been made
+                std::memset(hs, 0, n_out * 4);
+                cpu_ents(im, l, cpu_list, x, hs);
+            }
             im.hsum_ev = qd.memcpy(slots + NC * kMaxJobTok * H, hs, n_out * 4);
             deps.push_back(im.hsum_ev);
             used.push_back((int) NC);
@@ -1525,6 +1588,11 @@ void Ds41XeTier::close() {
     }
     im.achunks.clear();
     if (im.hsum) { im.hsum_ev.wait(); sycl::free(im.hsum, im.ctx); im.hsum = nullptr; }
+    if (im.cpu_thr.joinable()) {
+        { std::lock_guard<std::mutex> lk(im.cpu_mu); im.cpu_state.store(3, std::memory_order_release); }
+        im.cpu_cv.notify_one();
+        im.cpu_thr.join();
+    }
     if (im.tl_tokens % 64) tl_print(im);
     if (im.tl_mon.joinable()) { im.tl_stop = true; im.tl_mon.join(); }
     for (auto& rp : im.tl_rings) sycl::free((void*) rp->flag, im.ctx);

@@ -1100,7 +1100,9 @@ bool Ds41Dense::set_columns(int nc) {
         ++al->epoch;
     }
     if (im.gctx) ggml_free(im.gctx);
-    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    // larry: 4x upstream's - DSpark's verify widths (2..8) x the pass caps x 40 layers filled the old one every few
+    // minutes in --serve (each reset rebuilds every kept graph); metadata only, its pages are touched as graphs land
+    ggml_init_params gp = { ggml_tensor_overhead() * 800000 + ggml_graph_overhead_custom(8192, false) * 1600, nullptr, true };
     im.gctx = ggml_init(gp);
     return alloc_cols(im, want, im.err);
 }
@@ -1225,7 +1227,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
         ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
     }
-    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    // larry: 4x upstream's - DSpark's verify widths (2..8) x the pass caps x 40 layers filled the old one every few
+    // minutes in --serve (each reset rebuilds every kept graph); metadata only, its pages are touched as graphs land
+    ggml_init_params gp = { ggml_tensor_overhead() * 800000 + ggml_graph_overhead_custom(8192, false) * 1600, nullptr, true };
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
