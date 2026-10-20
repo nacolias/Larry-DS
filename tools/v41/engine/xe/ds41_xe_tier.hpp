@@ -50,6 +50,10 @@ public:
     bool build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
     bool seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
     void set_slot_gib(double gib);
+    /// larry: the dense half's own in-order queue (ggml_backend_sycl_get_queue).  When set, a decode / verify call's
+    /// final sum runs on it and the call returns without waiting: the dense half's next graph (on that queue) orders
+    /// after it, and the host goes on submitting while the cards compute.
+    void set_dense_queue(void* q);
     void set_cache_enabled(bool on);
     void release_cache();
     int64_t shrink_cache_for(int64_t need_bytes, std::string& err);

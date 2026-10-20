@@ -1,9 +1,245 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -587,6 +587,7 @@
+         GGML_OP_DSV4_HC_POST,
+         GGML_OP_DSV41_FAKE_QUANT,
+         GGML_OP_DSV41_HC_MIXES,
++        GGML_OP_DSV41_ROUTER,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2751,6 +2752,19 @@
+             struct ggml_tensor  * base,
+             float                 eps);
+ 
++    // larry: DeepSeek-V4.1's Gate after the router matmul in one op.  logits F32 [ne, n] contiguous, bias / sel_bias
++    // F32 [ne]: sc = sqrt(softplus(logits)); the k largest of sc + bias + sel_bias (ties: lower index); weights = sc
++    // there, divided by their sum (+ 1e-20) when norm, times scale.  Result F32 [2k, n]: the k ids (as floats), then
++    // the k weights.
++    GGML_API struct ggml_tensor * ggml_dsv41_router(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * sel_bias,
++            int                   k,
++            bool                  norm,
++            float                 scale);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
+--- a/ggml/include/ggml-sycl.h
++++ b/ggml/include/ggml-sycl.h
+@@ -21,6 +21,9 @@
+ 
+ GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
+ 
++// larry: the backend's compute queue (a sycl::queue *, in order), so other SYCL code can order work against it
++GGML_BACKEND_API void * ggml_backend_sycl_get_queue(ggml_backend_t backend);
++
+ // devide buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1086,6 +1086,7 @@
+     "DSV4_HC_POST",
+     "DSV41_FAKE_QUANT",
+     "DSV41_HC_MIXES",
++    "DSV41_ROUTER",
+ 
+     "UNARY",
+ 
+@@ -1103,7 +1104,7 @@
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1203,6 +1204,7 @@
+     "dsv4_hc_post(x, residual, post, comb)",
+     "dsv41_fake_quant(x)",
+     "dsv41_hc_mixes(mixes, scale, base)",
++    "dsv41_router(logits, bias, sel_bias)",
+ 
+     "unary(x)",
+ 
+@@ -1220,7 +1222,7 @@
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6588,6 +6590,30 @@
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_dsv41_router(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * logits,
++        struct ggml_tensor  * bias,
++        struct ggml_tensor  * sel_bias,
++        int                   k,
++        bool                  norm,
++        float                 scale) {
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
++    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == logits->ne[0] && ggml_is_contiguous(bias));
++    GGML_ASSERT(sel_bias->type == GGML_TYPE_F32 && ggml_nelements(sel_bias) == logits->ne[0] && ggml_is_contiguous(sel_bias));
++    GGML_ASSERT(k >= 1 && k <= 8 && k <= logits->ne[0] && logits->ne[0] <= 1024);   // ggml-sycl: k <= 8, ne <= 1024
++    const int64_t nt = logits->ne[1] * logits->ne[2] * logits->ne[3];
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * k, nt);
++    ggml_set_op_params_i32(result, 0, k);
++    ggml_set_op_params_i32(result, 1, norm ? 1 : 0);
++    ggml_set_op_params_f32(result, 2, scale);
++    result->op     = GGML_OP_DSV41_ROUTER;
++    result->src[0] = logits;
++    result->src[1] = bias;
++    result->src[2] = sel_bias;
++    return result;
++}
++
+ struct ggml_tensor * ggml_dsv4_hc_pre(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * x,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2117,6 +2117,10 @@
+             {
+                 ggml_compute_forward_dsv41_hc_mixes(params, tensor);
+             } break;
++        case GGML_OP_DSV41_ROUTER:
++            {
++                ggml_compute_forward_dsv41_router(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2305,6 +2309,10 @@
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_DSV41_ROUTER:
++            {
++                n_tasks = 1;
++            } break;
+         case GGML_OP_REPEAT:
+         case GGML_OP_REPEAT_BACK:
+         case GGML_OP_LEAKY_RELU:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12293,3 +12293,36 @@
+         y[i] = post ? s * 2.0f : s + eps;
+     }
+ }
++
++// ggml_compute_forward_dsv41_router (larry): the reference of ggml-sycl's fused DeepSeek-V4.1 Gate (one thread)
++void ggml_compute_forward_dsv41_router(const ggml_compute_params * params, ggml_tensor * dst) {
++    if (params->ith != 0) return;
++    const ggml_tensor * lg = dst->src[0];
++    const float * bias = (const float *) dst->src[1]->data;
++    const float * sb = (const float *) dst->src[2]->data;
++    const int k = ggml_get_op_params_i32(dst, 0);
++    const bool norm = ggml_get_op_params_i32(dst, 1) != 0;
++    const float scale = ggml_get_op_params_f32(dst, 2);
++    const int64_t ne = lg->ne[0], nt = dst->ne[1];
++    std::vector<float> sc((size_t) ne), sel((size_t) ne);
++    for (int64_t t = 0; t < nt; ++t) {
++        const float * x = (const float *) lg->data + t * ne;
++        for (int64_t i = 0; i < ne; ++i) {
++            const float ax = std::fabs(x[i]);
++            sc[(size_t) i] = std::sqrt(std::max(x[i], 0.0f) + std::log1p(std::exp(-ax)));
++            sel[(size_t) i] = sc[(size_t) i] + bias[i] + sb[i];
++        }
++        float * o = (float *) ((char *) dst->data + t * dst->nb[1]);
++        float sum = 0.0f;
++        for (int r = 0; r < k; ++r) {
++            int64_t best = -1;
++            for (int64_t i = 0; i < ne; ++i)
++                if (sel[(size_t) i] > -INFINITY && (best < 0 || sel[(size_t) i] > sel[(size_t) best])) best = i;
++            o[r] = (float) best;
++            o[k + r] = sc[(size_t) best];
++            sum += sc[(size_t) best];
++            sel[(size_t) best] = -INFINITY;
++        }
++        for (int r = 0; r < k; ++r) o[k + r] = (norm ? o[k + r] / (sum + 1e-20f) : o[k + r]) * scale;
++    }
++}
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -110,6 +110,7 @@
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv41_fake_quant(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv41_hc_mixes(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_router(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -442,6 +442,14 @@
+ 
+ #ifdef GGML_SYCL_GRAPH
+     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
++    // larry: the recorded SYCL graph of every kept ggml graph (ggml_backend_sycl_graph_compute, GGML_SYCL_GRAPH_CACHE)
++    struct larry_graph {
++        uint64_t uid = 0;   // the ggml graph's uid when recorded (its allocator gives it a new one on re-allocation)
++        int runs = 0;
++        bool bad = false;   // not recordable (an op waited on the host): eager for good
++        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec;
++    };
++    std::unordered_map<const ggml_cgraph *, larry_graph> larry_graphs;
+ #endif
+ 
+     ggml_sycl_pool & host_pool(int device) {
+diff --git a/ggml/src/ggml-sycl/dpct/helper.hpp b/ggml/src/ggml-sycl/dpct/helper.hpp
+--- a/ggml/src/ggml-sycl/dpct/helper.hpp
++++ b/ggml/src/ggml-sycl/dpct/helper.hpp
+@@ -1855,8 +1855,27 @@
+           .template convert<T>();
+     }
+ 
++#if defined(__SYCL_DEVICE_ONLY__)
++    // larry: IGC's dp4a builtins (c + a . b over 4 bytes; ss / su / us / uu = signedness of a, b)
++    extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_ss(int c, int a, int b, bool sat) __attribute__((const));
++    extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_su(int c, int a, int b, bool sat) __attribute__((const));
++    extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_us(int c, int a, int b, bool sat) __attribute__((const));
++    extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_uu(int c, int a, int b, bool sat) __attribute__((const));
++#endif
++
+     template <typename T1, typename T2, typename T3>
+     inline auto dp4a(T1 a, T2 b, T3 c) {
++#if defined(__SYCL_DEVICE_ONLY__)
++      if constexpr (sizeof(T1) == 4 && sizeof(T2) == 4 && std::is_integral_v<T1> && std::is_integral_v<T2> &&
++                    std::is_integral_v<T3>) {
++        using R = dot_product_acc_t<T1, T2>;
++        const int ia = (int) a, ib = (int) b, ic = (int) (R) c;
++        if constexpr (std::is_signed_v<T1> && std::is_signed_v<T2>) return (R) __builtin_IB_dp4a_ss(ic, ia, ib, false);
++        else if constexpr (std::is_signed_v<T1>) return (R) __builtin_IB_dp4a_su(ic, ia, ib, false);
++        else if constexpr (std::is_signed_v<T2>) return (R) __builtin_IB_dp4a_us(ic, ia, ib, false);
++        else return (R) __builtin_IB_dp4a_uu(ic, ia, ib, false);
++      }
++#endif
+       dot_product_acc_t<T1, T2> res = c;
+       auto va = extract_and_sign_or_zero_extend4(a);
+       auto vb = extract_and_sign_or_zero_extend4(b);
 diff --git a/ggml/src/ggml-sycl/dsv41-fused.cpp b/ggml/src/ggml-sycl/dsv41-fused.cpp
 new file mode 100644
-index 000000000..7afcd37ef
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-fused.cpp
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,223 @@
 +// ggml-sycl/dsv41-fused.cpp - larry (Strata-DS4 on Intel): the two fused DeepSeek-V4.1 ops of Xolotl's ggml patch
 +// (GGML_OP_DSV41_FAKE_QUANT, GGML_OP_DSV41_HC_MIXES) for the SYCL backend.  The CUDA versions (ggml-cuda/dsv4-hc.cu)
 +// reproduce the stock-op composites of tools/v41/engine with float tricks (x + 1.5*2^23 - 1.5*2^23 for round-half-even,
@@ -125,12 +361,113 @@ index 000000000..7afcd37ef
 +}
 +
 +#pragma float_control(pop)
++
++// GGML_OP_DSV41_ROUTER (larry): a work-group of 128 per token (8 sub-groups), every lane <= 8 of the experts; each
++// sub-group its own top k (k rounds of a sub-group argmax, ties: lower index), then sub-group 0 the top k of those
++void ggml_sycl_op_dsv41_router(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
++    const ggml_tensor * lg = dst->src[0];
++    GGML_ASSERT(lg->type == GGML_TYPE_F32 && ggml_is_contiguous(lg) && dst->type == GGML_TYPE_F32);
++    const int k = ggml_get_op_params_i32(dst, 0);
++    const bool norm = ggml_get_op_params_i32(dst, 1) != 0;
++    const float scale = ggml_get_op_params_f32(dst, 2);
++    const int ne = (int) lg->ne[0];
++    const int64_t nt = dst->ne[1];
++    constexpr int WG = 128, NSG = WG / 16, VPL = 8, KMAX = 8;
++    GGML_ASSERT(ne <= WG * VPL && k <= KMAX);
++    const float * px = (const float *) lg->data;
++    const float * pb = (const float *) dst->src[1]->data;
++    const float * ps = (const float *) dst->src[2]->data;
++    float * pd = (float *) dst->data;
++    const size_t dstride = dst->nb[1] / 4;
++    ctx.stream()->submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> cv(sycl::range<1>(NSG * KMAX), h);   // candidates: selection value
++        sycl::local_accessor<int, 1> ci(sycl::range<1>(NSG * KMAX), h);     // expert id
++        sycl::local_accessor<float, 1> cw(sycl::range<1>(NSG * KMAX), h);   // sc (the weight)
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nt * WG), sycl::range<1>(WG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const sycl::sub_group sg = it.get_sub_group();
++            const int lane = (int) sg.get_local_linear_id(), s = (int) sg.get_group_linear_id();
++            const int lid = (int) it.get_local_id(0);
++            const int64_t t = (int64_t) it.get_group(0);
++            const float * x = px + t * ne;
++            float sc[VPL], sel[VPL];
++#pragma unroll
++            for (int v = 0; v < VPL; ++v) {
++                const int i = lid + WG * v;
++                if (i < ne) {
++                    const float ax = sycl::fabs(x[i]);
++                    sc[v] = sycl::sqrt(sycl::fmax(x[i], 0.0f) + sycl::log1p(sycl::exp(-ax)));
++                    sel[v] = sc[v] + pb[i] + ps[i];
++                } else {
++                    sc[v] = 0.0f;
++                    sel[v] = -3.0e38f;
++                }
++            }
++            // this sub-group's top k
++            for (int r = 0; r < k; ++r) {
++                float bv = -3.0e38f, bw = 0.0f;
++                int bi = 1 << 30, bvv = 0;
++#pragma unroll
++                for (int v = 0; v < VPL; ++v)
++                    if (sel[v] > bv) { bv = sel[v]; bi = lid + WG * v; bw = sc[v]; bvv = v; }
++                const float gv = sycl::reduce_over_group(sg, bv, sycl::maximum<float>());
++                const int gi = sycl::reduce_over_group(sg, bv == gv ? bi : (1 << 30), sycl::minimum<int>());
++                if (bi == gi && bv == gv) {
++#pragma unroll
++                    for (int v = 0; v < VPL; ++v) if (v == bvv) sel[v] = -3.0e38f;
++                    cv[s * KMAX + r] = gv;
++                    ci[s * KMAX + r] = gi;
++                    cw[s * KMAX + r] = bw;
++                }
++            }
++            sycl::group_barrier(it.get_group());
++            if (s != 0) return;
++            // sub-group 0: the top k of the NSG * k candidates (lane holds candidates lane, lane + 16, ...)
++            constexpr int CPL = NSG * KMAX / 16;
++            float mv[CPL], mw[CPL];
++            int mi[CPL];
++#pragma unroll
++            for (int u = 0; u < CPL; ++u) {
++                const int c = lane + 16 * u, sgi = c / KMAX, rr = c % KMAX;
++                const bool ok = rr < k;
++                mv[u] = ok ? cv[sgi * KMAX + rr] : -3.0e38f;
++                mi[u] = ok ? ci[sgi * KMAX + rr] : (1 << 30);
++                mw[u] = ok ? cw[sgi * KMAX + rr] : 0.0f;
++            }
++            float w_my = 0.0f, sum = 0.0f;
++            int id_my = -1;
++            for (int r = 0; r < k; ++r) {
++                float bv = -3.0e38f, bw = 0.0f;
++                int bi = 1 << 30, bu = 0;
++#pragma unroll
++                for (int u = 0; u < CPL; ++u)
++                    if (mv[u] > bv || (mv[u] == bv && mi[u] < bi)) { bv = mv[u]; bi = mi[u]; bw = mw[u]; bu = u; }
++                const float gv = sycl::reduce_over_group(sg, bv, sycl::maximum<float>());
++                const int gi = sycl::reduce_over_group(sg, bv == gv ? bi : (1 << 30), sycl::minimum<int>());
++                float w = 0.0f;
++                if (bi == gi && bv == gv) {
++#pragma unroll
++                    for (int u = 0; u < CPL; ++u) if (u == bu) mv[u] = -3.0e38f;
++                    w = bw;
++                }
++                w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
++                sum += w;
++                if (lane == r) { w_my = w; id_my = gi; }
++            }
++            if (lane < k) {
++                float * o = pd + (size_t) t * dstride;
++                o[lane] = (float) id_my;
++                o[k + lane] = (norm ? w_my / (sum + 1e-20f) : w_my) * scale;
++            }
++        });
++    });
++}
 diff --git a/ggml/src/ggml-sycl/dsv41-fused.hpp b/ggml/src/ggml-sycl/dsv41-fused.hpp
 new file mode 100644
-index 000000000..f27284400
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-fused.hpp
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,12 @@
 +#ifndef GGML_SYCL_DSV41_FUSED_HPP
 +#define GGML_SYCL_DSV41_FUSED_HPP
 +
@@ -139,14 +476,496 @@ index 000000000..f27284400
 +// larry: Xolotl's fused DeepSeek-V4.1 ops (ggml.h GGML_OP_DSV41_FAKE_QUANT / GGML_OP_DSV41_HC_MIXES) on SYCL
 +void ggml_sycl_op_dsv41_fake_quant(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +void ggml_sycl_op_dsv41_hc_mixes(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// larry: DeepSeek-V4.1's Gate after the router matmul (GGML_OP_DSV41_ROUTER)
++void ggml_sycl_op_dsv41_router(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +
 +#endif  // GGML_SYCL_DSV41_FUSED_HPP
+diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fastmv.cpp
+@@ -0,0 +1,386 @@
++// ggml-sycl/fastmv.cpp - see fastmv.hpp.
++#include "fastmv.hpp"
++
++#include <algorithm>
++
++namespace fastmv {
++namespace {
++
++constexpr int SG = 16;
++
++using u8x8 = sycl::vec<uint8_t, 8>;
++
++inline float h2f(sycl::half h) { return (float) h; }
++
++#ifdef __SYCL_DEVICE_ONLY__
++extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_ss(int c, int a, int b, bool sat) __attribute__((const));
++#endif
++inline int dp4a_ss(uint32_t a, uint32_t b, int c) {   // c + a.s8 . b.s8 (IGC's dp4a: the C++ spelling is ~7x slower)
++#ifdef __SYCL_DEVICE_ONLY__
++    return __builtin_IB_dp4a_ss(c, (int) a, (int) b, false);
++#else
++    int s = c;
++    for (int i = 0; i < 4; ++i) s += (int) (int8_t) (a >> (8 * i)) * (int) (int8_t) (b >> (8 * i));
++    return s;
++#endif
++}
++inline uint32_t sbytes(uint32_t v, uint32_t off) { return (v + (128u - off) * 0x01010101u) ^ 0x80808080u; }   // v - off per byte
++
++// the Q6K_R unit (32 values) against int8 activations: one dp4a per 4 values
++template <int NT>
++inline void q6k_unit_q8(const uint8_t * __restrict ql_all, const uint8_t * __restrict qh_all,
++                        const int8_t * __restrict sc_all, const sycl::half * __restrict d_all, int64_t blk, int ip, int seg,
++                        const int8_t * const * xq, const float * const * xd, int64_t b, int nt, float * acc) {
++    const uint8_t * ql = ql_all + blk * 128 + 64 * ip + 8 * seg;
++    const uint8_t * qh = qh_all + blk * 64 + 32 * ip + 8 * seg;
++    const sycl::uint2 l0 = *reinterpret_cast<const sycl::uint2 *>(ql);
++    const sycl::uint2 l1 = *reinterpret_cast<const sycl::uint2 *>(ql + 32);
++    const sycl::uint2 hh = *reinterpret_cast<const sycl::uint2 *>(qh);
++    const int is = 8 * ip + (seg >> 1);
++    const int8_t * sc = sc_all + blk * 16;
++    const float d = h2f(d_all[blk]);
++    const float s[4] = {d * (float) sc[is], d * (float) sc[is + 2], d * (float) sc[is + 4], d * (float) sc[is + 6]};
++    uint32_t qv[4][2];
++#pragma unroll
++    for (int w = 0; w < 2; ++w) {
++        const uint32_t a = w ? l0.y() : l0.x(), c = w ? l1.y() : l1.x(), h = w ? hh.y() : hh.x();
++        qv[0][w] = sbytes((a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4), 32);
++        qv[1][w] = sbytes((c & 0x0F0F0F0Fu) | (((h >> 2) & 0x03030303u) << 4), 32);
++        qv[2][w] = sbytes(((a >> 4) & 0x0F0F0F0Fu) | (((h >> 4) & 0x03030303u) << 4), 32);
++        qv[3][w] = sbytes(((c >> 4) & 0x0F0F0F0Fu) | (((h >> 6) & 0x03030303u) << 4), 32);
++    }
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        if (t < nt) {
++            const int8_t * x = xq[t] + b * 256 + 128 * ip + 8 * seg;
++            const sycl::float4 dx = *reinterpret_cast<const sycl::float4 *>(xd[t] + b * 8 + 4 * ip);
++            const float dxs[4] = {dx.x(), dx.y(), dx.z(), dx.w()};
++            float a = 0.f;
++#pragma unroll
++            for (int k = 0; k < 4; ++k) {
++                const sycl::uint2 xv = *reinterpret_cast<const sycl::uint2 *>(x + 32 * k);
++                const int sk = dp4a_ss(qv[k][1], xv.y(), dp4a_ss(qv[k][0], xv.x(), 0));
++                a += s[k] * dxs[k] * (float) sk;
++            }
++            acc[t] += a;
++        }
++    }
++}
++
++// One Q6_K unit = 32 values of block `b`: half ip (0/1), lane segment seg (0..3) -> l = 8*seg .. 8*seg+7, the values
++// 128*ip + l + {0, 32, 64, 96}.  Accumulates into acc[t] for NT columns.
++template <int NT>
++inline void q6k_unit(const uint8_t * __restrict ql_all, const uint8_t * __restrict qh_all,
++                     const int8_t * __restrict sc_all, const sycl::half * __restrict d_all, int64_t blk, int ip, int seg,
++                     const float * const * xs, int64_t kbase, int nt, float * acc) {
++    const uint8_t * ql = ql_all + blk * 128 + 64 * ip + 8 * seg;
++    const uint8_t * qh = qh_all + blk * 64 + 32 * ip + 8 * seg;
++    const u8x8 l0 = *reinterpret_cast<const u8x8 *>(ql);
++    const u8x8 l1 = *reinterpret_cast<const u8x8 *>(ql + 32);
++    const u8x8 hh = *reinterpret_cast<const u8x8 *>(qh);
++    const int is = 8 * ip + (seg >> 1);
++    const int8_t * sc = sc_all + blk * 16;
++    const float d = h2f(d_all[blk]);
++    const float s0 = d * (float) sc[is], s1 = d * (float) sc[is + 2], s2 = d * (float) sc[is + 4], s3 = d * (float) sc[is + 6];
++    float w0[8], w1[8], w2[8], w3[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int a = l0[i], b = l1[i], h = hh[i];
++        w0[i] = (float) ((int) ((a & 0xF) | ((h & 3) << 4)) - 32);
++        w1[i] = (float) ((int) ((b & 0xF) | (((h >> 2) & 3) << 4)) - 32);
++        w2[i] = (float) ((int) ((a >> 4) | (((h >> 4) & 3) << 4)) - 32);
++        w3[i] = (float) ((int) ((b >> 4) | (((h >> 6) & 3) << 4)) - 32);
++    }
++    const int64_t o = kbase + 128 * ip + 8 * seg;
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        if (t < nt) {
++            const float * x = xs[t] + o;
++            const sycl::float4 xa0 = *reinterpret_cast<const sycl::float4 *>(x);
++            const sycl::float4 xa1 = *reinterpret_cast<const sycl::float4 *>(x + 4);
++            const sycl::float4 xb0 = *reinterpret_cast<const sycl::float4 *>(x + 32);
++            const sycl::float4 xb1 = *reinterpret_cast<const sycl::float4 *>(x + 36);
++            const sycl::float4 xc0 = *reinterpret_cast<const sycl::float4 *>(x + 64);
++            const sycl::float4 xc1 = *reinterpret_cast<const sycl::float4 *>(x + 68);
++            const sycl::float4 xd0 = *reinterpret_cast<const sycl::float4 *>(x + 96);
++            const sycl::float4 xd1 = *reinterpret_cast<const sycl::float4 *>(x + 100);
++            float a0 = w0[0] * xa0.x() + w0[1] * xa0.y() + w0[2] * xa0.z() + w0[3] * xa0.w() + w0[4] * xa1.x() + w0[5] * xa1.y() + w0[6] * xa1.z() + w0[7] * xa1.w();
++            float a1 = w1[0] * xb0.x() + w1[1] * xb0.y() + w1[2] * xb0.z() + w1[3] * xb0.w() + w1[4] * xb1.x() + w1[5] * xb1.y() + w1[6] * xb1.z() + w1[7] * xb1.w();
++            float a2 = w2[0] * xc0.x() + w2[1] * xc0.y() + w2[2] * xc0.z() + w2[3] * xc0.w() + w2[4] * xc1.x() + w2[5] * xc1.y() + w2[6] * xc1.z() + w2[7] * xc1.w();
++            float a3 = w3[0] * xd0.x() + w3[1] * xd0.y() + w3[2] * xd0.z() + w3[3] * xd0.w() + w3[4] * xd1.x() + w3[5] * xd1.y() + w3[6] * xd1.z() + w3[7] * xd1.w();
++            acc[t] += s0 * a0 + s1 * a1 + s2 * a2 + s3 * a3;
++        }
++    }
++}
++
++
++inline u8x8 ld8_u16(const uint8_t * p) {   // 8 bytes from a 2-byte aligned address
++    const uint16_t * q = reinterpret_cast<const uint16_t *>(p);
++    const uint16_t a = q[0], b = q[1], c = q[2], d = q[3];
++    return u8x8((uint8_t) a, (uint8_t) (a >> 8), (uint8_t) b, (uint8_t) (b >> 8), (uint8_t) c, (uint8_t) (c >> 8), (uint8_t) d, (uint8_t) (d >> 8));
++}
++
++template <int NT>
++inline void q6k_unit_std(const uint8_t * __restrict blkp, int ip, int seg, const float * const * xs, int64_t kbase, int nt,
++                         float * acc) {
++    const uint8_t * ql = blkp + 64 * ip + 8 * seg;
++    const uint8_t * qh = blkp + 128 + 32 * ip + 8 * seg;
++    const u8x8 l0 = ld8_u16(ql);
++    const u8x8 l1 = ld8_u16(ql + 32);
++    const u8x8 hh = ld8_u16(qh);
++    const int is = 8 * ip + (seg >> 1);
++    const int8_t * sc = reinterpret_cast<const int8_t *>(blkp + 192);
++    const float d = (float) sycl::bit_cast<sycl::half>(*reinterpret_cast<const uint16_t *>(blkp + 208));
++    const float s0 = d * (float) sc[is], s1 = d * (float) sc[is + 2], s2 = d * (float) sc[is + 4], s3 = d * (float) sc[is + 6];
++    float w0[8], w1[8], w2[8], w3[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int a = l0[i], b = l1[i], h = hh[i];
++        w0[i] = (float) ((int) ((a & 0xF) | ((h & 3) << 4)) - 32);
++        w1[i] = (float) ((int) ((b & 0xF) | (((h >> 2) & 3) << 4)) - 32);
++        w2[i] = (float) ((int) ((a >> 4) | (((h >> 4) & 3) << 4)) - 32);
++        w3[i] = (float) ((int) ((b >> 4) | (((h >> 6) & 3) << 4)) - 32);
++    }
++    const int64_t o = kbase + 128 * ip + 8 * seg;
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        if (t < nt) {
++            const float * x = xs[t] + o;
++            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) { a0 += w0[i] * x[i]; a1 += w1[i] * x[32 + i]; a2 += w2[i] * x[64 + i]; a3 += w3[i] * x[96 + i]; }
++            acc[t] += s0 * a0 + s1 * a1 + s2 * a2 + s3 * a3;
++        }
++    }
++}
++
++// generic kernel: work-group = RW rows x KS k-slices; each (row, k-slice) is handled by LPR lanes; a sub-group holds
++// SG / LPR rows (or k-slices).  units: Q6K = 32 values (8 per 256-block); F16/F32 = 8 values.
++template <WType T, int NT, int LPR>
++void run(sycl::queue & q, const Args & a, int KS, int RW) {
++    const int64_t K = a.K, N = a.N, G = a.G;
++    const int64_t upr = (T == WType::Q6K_R || T == WType::Q6K || T == WType::Q6K_R8) ? K / 32 : K / 8;     // units per row
++    const int64_t bpr = K / 256;
++    const int lanes_per_wg = RW * KS * LPR;                       // multiple of 16
++    const int64_t n_wg_rows = (N + RW - 1) / RW;
++    const sycl::range<2> gr((size_t) G, (size_t) (n_wg_rows * lanes_per_wg));
++    const sycl::range<2> lr(1, (size_t) lanes_per_wg);
++    const Args A = a;
++    q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) (KS > 1 ? RW * KS * NT : 1)), h);
++        h.parallel_for(sycl::nd_range<2>(gr, lr), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
++            const int64_t g = (int64_t) it.get_global_id(0);
++            const int lid = (int) it.get_local_id(1);
++            const int grp = lid / LPR;                 // (row in wg, k-slice)
++            const int lane = lid % LPR;
++            const int rw = grp / KS, ks = grp % KS;
++            const int64_t row = (int64_t) it.get_group(1) * RW + rw;
++            const int64_t gw = g / A.g_div;
++            float acc[NT];
++#pragma unroll
++            for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
++            const float * xs[NT];
++#pragma unroll
++            for (int t = 0; t < NT; ++t) xs[t] = A.x + g * A.x_batch_stride + (int64_t) (t < A.ncols ? t : 0) * A.x_col_stride;
++            if (row < N) {
++                // this (row, k-slice)'s units: [u0, u1)
++                const int64_t per = (upr + KS - 1) / KS;
++                const int64_t u0 = ks * per, u1 = sycl::min(upr, u0 + per);
++                if constexpr (T == WType::Q6K_R) {
++                    const uint8_t * base = (const uint8_t *) A.w + gw * A.w_batch_bytes;
++                    const int64_t nb = A.n_blocks_total;
++                    const uint8_t * ql = base;
++                    const uint8_t * qh = base + 128 * nb;
++                    const int8_t * sc = (const int8_t *) (base + 192 * nb);
++                    const sycl::half * dd = (const sycl::half *) (base + 208 * nb);
++                    const int64_t blk0 = row * bpr;
++                    for (int64_t u = u0 + lane; u < u1; u += LPR) {
++                        const int64_t b = u >> 3;
++                        const int r8 = (int) (u & 7);
++                        q6k_unit<NT>(ql, qh, sc, dd, blk0 + b, r8 >> 2, r8 & 3, xs, b * 256, A.ncols, acc);
++                    }
++                } else if constexpr (T == WType::Q6K_R8) {
++                    const uint8_t * base = (const uint8_t *) A.w + gw * A.w_batch_bytes;
++                    const int64_t nb = A.n_blocks_total;
++                    const int8_t * xq[NT];
++                    const float * xd[NT];
++#pragma unroll
++                    for (int t = 0; t < NT; ++t) {
++                        const int64_t c = g * A.ncols + (t < A.ncols ? t : 0);   // quant_x's rows: batch-major columns
++                        xq[t] = A.xq + c * K;
++                        xd[t] = A.xd + c * (K / 32);
++                    }
++                    const int64_t blk0 = row * bpr;
++                    for (int64_t u = u0 + lane; u < u1; u += LPR) {
++                        const int64_t b = u >> 3;
++                        const int r8 = (int) (u & 7);
++                        q6k_unit_q8<NT>(base, base + 128 * nb, (const int8_t *) (base + 192 * nb), (const sycl::half *) (base + 208 * nb),
++                                        blk0 + b, r8 >> 2, r8 & 3, xq, xd, b, A.ncols, acc);
++                    }
++                } else if constexpr (T == WType::Q6K) {
++                    const uint8_t * wr = (const uint8_t *) A.w + gw * A.w_batch_bytes + row * A.w_row_bytes;
++                    for (int64_t u = u0 + lane; u < u1; u += LPR) {
++                        const int64_t b = u >> 3;
++                        const int r8 = (int) (u & 7);
++                        q6k_unit_std<NT>(wr + b * 210, r8 >> 2, r8 & 3, xs, b * 256, A.ncols, acc);
++                    }
++                } else if constexpr (T == WType::F16) {
++                    const sycl::half * wr = (const sycl::half *) ((const uint8_t *) A.w + gw * A.w_batch_bytes + row * A.w_row_bytes);
++                    for (int64_t u = u0 + lane; u < u1; u += LPR) {
++                        const sycl::vec<sycl::half, 8> wv = *reinterpret_cast<const sycl::vec<sycl::half, 8> *>(wr + u * 8);
++#pragma unroll
++                        for (int t = 0; t < NT; ++t) {
++                            if (t < A.ncols) {
++                                const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(xs[t] + u * 8);
++                                const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(xs[t] + u * 8 + 4);
++                                acc[t] += (float) wv[0] * x0.x() + (float) wv[1] * x0.y() + (float) wv[2] * x0.z() + (float) wv[3] * x0.w() +
++                                          (float) wv[4] * x1.x() + (float) wv[5] * x1.y() + (float) wv[6] * x1.z() + (float) wv[7] * x1.w();
++                            }
++                        }
++                    }
++                } else {
++                    const float * wr = (const float *) ((const uint8_t *) A.w + gw * A.w_batch_bytes + row * A.w_row_bytes);
++                    for (int64_t u = u0 + lane; u < u1; u += LPR) {
++                        const sycl::float4 w0 = *reinterpret_cast<const sycl::float4 *>(wr + u * 8);
++                        const sycl::float4 w1 = *reinterpret_cast<const sycl::float4 *>(wr + u * 8 + 4);
++#pragma unroll
++                        for (int t = 0; t < NT; ++t) {
++                            if (t < A.ncols) {
++                                const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(xs[t] + u * 8);
++                                const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(xs[t] + u * 8 + 4);
++                                acc[t] += sycl::dot(w0, x0) + sycl::dot(w1, x1);
++                            }
++                        }
++                    }
++                }
++            }
++            // reduce over the LPR lanes of this (row, k-slice): they are consecutive lanes of one sub-group
++            const sycl::sub_group sg = it.get_sub_group();
++#pragma unroll
++            for (int t = 0; t < NT; ++t) {
++#pragma unroll
++                for (int off = LPR / 2; off > 0; off >>= 1) acc[t] += sycl::permute_group_by_xor(sg, acc[t], off);
++            }
++            if (KS == 1) {
++                if (lane == 0 && row < N) {
++#pragma unroll
++                    for (int t = 0; t < NT; ++t)
++                        if (t < A.ncols) A.y[g * A.y_batch_stride + t * A.y_col_stride + row] = acc[t];
++                }
++            } else {
++                if (lane == 0) {
++#pragma unroll
++                    for (int t = 0; t < NT; ++t) part[(rw * KS + ks) * NT + t] = acc[t];
++                }
++                sycl::group_barrier(it.get_group());
++                if (ks == 0 && lane == 0 && row < N) {
++#pragma unroll
++                    for (int t = 0; t < NT; ++t) {
++                        if (t < A.ncols) {
++                            float s = 0.0f;
++                            for (int k2 = 0; k2 < KS; ++k2) s += part[(rw * KS + k2) * NT + t];
++                            A.y[g * A.y_batch_stride + t * A.y_col_stride + row] = s;
++                        }
++                    }
++                }
++            }
++        });
++    });
++}
++
++template <WType T, int NT>
++void pick(sycl::queue & q, const Args & a) {
++    // lanes per row from the units a row has; split K when the launch would have too few sub-groups
++    const int64_t upr = (T == WType::Q6K_R || T == WType::Q6K || T == WType::Q6K_R8) ? a.K / 32 : a.K / 8;
++    int lpr = upr >= 128 ? 16 : upr >= 48 ? 8 : 4;
++    const int64_t rows = a.N * a.G;
++    const int64_t want_sg = 4096;                                  // ~2 waves of B70 hardware threads
++    int ks = 1;
++    while (ks < 64 && rows * ks * lpr / SG < want_sg && upr / (ks * 2) >= lpr * 2) ks *= 2;
++    int rw = std::max(1, std::min(256 / (ks * lpr), 16));           // rows per work-group (wg <= 256 lanes)
++    if (ks * lpr > 256) rw = 1;
++    // a work-group must be a whole number of sub-groups
++    while ((rw * ks * lpr) % SG) ++rw;
++    if (lpr == 16) run<T, NT, 16>(q, a, ks, rw);
++    else if (lpr == 8) run<T, NT, 8>(q, a, ks, rw);
++    else run<T, NT, 4>(q, a, ks, rw);
++}
++
++}  // namespace
++
++bool launch(sycl::queue & q, WType t, const Args & a) {
++    if (a.ncols < 1 || a.ncols > 8 || a.K <= 0 || a.N <= 0) return false;
++    if ((t == WType::Q6K_R || t == WType::Q6K || t == WType::Q6K_R8) && a.K % 256) return false;
++    if (t == WType::Q6K_R8 && (!a.xq || !a.xd)) return false;
++    if (a.K % 8) return false;
++    const bool one = a.ncols == 1;
++    switch (t) {
++        case WType::Q6K_R: one ? pick<WType::Q6K_R, 1>(q, a) : pick<WType::Q6K_R, 8>(q, a); break;
++        case WType::Q6K: one ? pick<WType::Q6K, 1>(q, a) : pick<WType::Q6K, 8>(q, a); break;
++        case WType::F16: one ? pick<WType::F16, 1>(q, a) : pick<WType::F16, 8>(q, a); break;
++        case WType::F32: one ? pick<WType::F32, 1>(q, a) : pick<WType::F32, 8>(q, a); break;
++        case WType::Q6K_R8: one ? pick<WType::Q6K_R8, 1>(q, a) : pick<WType::Q6K_R8, 8>(q, a); break;
++    }
++    return true;
++}
++
++sycl::event quant_x(sycl::queue & q, const float * x, int64_t x_col_stride, int64_t x_batch_stride, int ncols, int64_t G,
++                    int64_t K, int8_t * xq, float * xd) {
++    const int64_t ng = K / 32;
++    return q.parallel_for(sycl::range<1>((size_t) (G * ncols * ng)), [=](sycl::id<1> id) {
++        const int64_t c = (int64_t) id[0] / ng, gi = (int64_t) id[0] % ng;   // c = row g * ncols + column
++        const float * p = x + (c / ncols) * x_batch_stride + (c % ncols) * x_col_stride + gi * 32;
++        float v[32];
++        float amax = 0.f;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const sycl::float4 f = reinterpret_cast<const sycl::float4 *>(p)[i];
++            v[4 * i] = f.x(); v[4 * i + 1] = f.y(); v[4 * i + 2] = f.z(); v[4 * i + 3] = f.w();
++        }
++#pragma unroll
++        for (int i = 0; i < 32; ++i) amax = sycl::fmax(amax, sycl::fabs(v[i]));
++        const float id_ = amax > 0.f ? 127.0f / amax : 0.f;
++        uint32_t w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++#pragma unroll
++        for (int i = 0; i < 32; ++i) w[i / 4] |= (uint32_t) ((int) sycl::rint(v[i] * id_) & 0xFF) << (8 * (i % 4));
++        sycl::uint4 * o = reinterpret_cast<sycl::uint4 *>(xq + c * K + gi * 32);
++        o[0] = sycl::uint4(w[0], w[1], w[2], w[3]);
++        o[1] = sycl::uint4(w[4], w[5], w[6], w[7]);
++        xd[c * ng + gi] = amax / 127.0f;
++    });
++}
++
++sycl::event dequant_q6k_planar_f16(sycl::queue & q, const void * slice, int64_t nrows, int64_t K, sycl::half * y) {
++    using h8 = sycl::vec<sycl::half, 8>;
++    const int64_t nb = nrows * (K / 256), per_row = K / 8;
++    const uint8_t * base = (const uint8_t *) slice;
++    return q.parallel_for(sycl::range<1>((size_t) (nrows * per_row)), [=](sycl::id<1> id) {
++        const int64_t r = (int64_t) id[0] / per_row, v0 = ((int64_t) id[0] % per_row) * 8;
++        const int64_t blk = r * (K / 256) + v0 / 256;
++        const int j = (int) (v0 % 256);                    // 8 values: half ip, group k (l + 32 k), l0 .. l0 + 7
++        const int ip = j / 128, k = (j % 128) / 32, l0 = j % 32;
++        const uint8_t * ql = base + blk * 128 + 64 * ip;
++        const uint8_t * qh = base + 128 * nb + blk * 64 + 32 * ip;
++        const int8_t * sc = (const int8_t *) (base + 192 * nb + blk * 16);
++        const float d = (float) ((const sycl::half *) (base + 208 * nb))[blk] * (float) sc[8 * ip + (l0 / 16) + 2 * k];
++        h8 o;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const int l = l0 + i;
++            const int lo = (k & 1) ? ql[l + 32] : ql[l];
++            const int q4 = (k & 2) ? (lo >> 4) : (lo & 0xF);
++            const int q = q4 | (((qh[l] >> (2 * k)) & 3) << 4);
++            o[i] = (sycl::half) (d * (float) (q - 32));
++        }
++        *reinterpret_cast<h8 *>(y + r * K + v0) = o;
++    });
++}
++
++sycl::event cols_to_f16(sycl::queue & q, const float * x, int64_t x_col_stride, int64_t ncols, int64_t K, sycl::half * y) {
++    return q.parallel_for(sycl::range<1>((size_t) (ncols * K)), [=](sycl::id<1> id) {
++        const int64_t c = (int64_t) id[0] / K, k = (int64_t) id[0] % K;
++        y[id[0]] = (sycl::half) x[c * x_col_stride + k];
++    });
++}
++
++}  // namespace fastmv
+diff --git a/ggml/src/ggml-sycl/fastmv.hpp b/ggml/src/ggml-sycl/fastmv.hpp
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fastmv.hpp
+@@ -0,0 +1,58 @@
++// ggml-sycl/fastmv.hpp - larry (DeepSeek-V4.1 on Intel Arc B70): mat-vec kernels for the decode / verify shapes of the
++// DSV4.1 dense half (1..8 columns), written for bandwidth on Xe2.
++//
++// ggml-sycl's DMMV / MMVQ kernels reach 400-590 GB/s on large matrices but 150-300 GB/s on the dense half's small ones
++// (5120x512, 5120x1280, 2304x5120, the 8 grouped 4096x1024 of wo_a run as 8 launches) and ~14 GB/s on the hyper-
++// connection projections (F16, 20480 wide, 24 rows: one row per work-group).  These kernels:
++//   * read ggml-sycl's REORDERED Q6_K layout (whole tensor: ql[128] | qh[64] | scales[16] | d per block, each plane
++//     contiguous), so every load is aligned and wide; F16 / F32 rows directly;
++//   * give each lane 32-value units with consecutive lanes on consecutive bytes; LPR lanes per row (4 / 8 / 16) so a
++//     short row still keeps every lane busy;
++//   * split K over KS sub-groups of a work-group (reduced in local memory) when the matrix has few rows;
++//   * take a batch dimension (wo_a's 8 groups: one launch) and up to 8 columns (DSpark verify passes).
++//
++// y[g][c][r] = sum_k W[g][r][k] * x[g][c][k]   (x: f32, contiguous in k; any column / batch stride)
++#pragma once
++
++#include <sycl/sycl.hpp>
++
++#include <cstdint>
++
++namespace fastmv {
++
++enum class WType { Q6K_R, Q6K, F16, F32, Q6K_R8 };   // Q6K = ggml's standard block_q6_K layout (210-byte blocks);
++                                                    // Q6K_R8 = Q6K_R with int8 activations (xq / xd, dp4a)
++
++struct Args {
++    const void * w = nullptr;   // weights
++    int64_t K = 0, N = 0;       // row length, rows per batch
++    int64_t G = 1;              // batches (src0 ne[2]); src1 batch g uses weight batch g / g_div
++    int64_t g_div = 1;
++    int64_t n_blocks_total = 0; // Q6K_R: blocks per plane set (a 2-D tensor: all of it; a 3-D one: one weight batch,
++                                // ggml-sycl's reorder_qw_q6_k_moe lays every batch out as its own ql|qh|scales|d planes)
++    size_t w_row_bytes = 0;     // F16/F32: bytes per row
++    size_t w_batch_bytes = 0;   // bytes per weight batch (Q6K_R: the plane set's base advances by this)
++    const float * x = nullptr;
++    int64_t x_col_stride = 0, x_batch_stride = 0;   // floats
++    float * y = nullptr;
++    int64_t y_col_stride = 0, y_batch_stride = 0;   // floats
++    int ncols = 1;
++    // Q6K_R8: the activations quantised by quant_x (same strides as x, in elements): x ~ xd[col][k / 32] * xq[col][k]
++    const int8_t * xq = nullptr;
++    const float * xd = nullptr;
++};
++
++// for G batches of ncols columns (row r = g * ncols + c, K % 32 == 0):
++//   xq[r * K + k] = round(x[g * x_batch_stride + c * x_col_stride + k] / xd[r * K / 32 + k / 32])
++sycl::event quant_x(sycl::queue & q, const float * x, int64_t x_col_stride, int64_t x_batch_stride, int ncols, int64_t G,
++                    int64_t K, int8_t * xq, float * xd);
++
++// ggml-sycl's per-slice reordered Q6_K (one slice: ql | qh | scales | d planes over nrows x K) -> f16 rows [nrows][K]
++sycl::event dequant_q6k_planar_f16(sycl::queue & q, const void * slice, int64_t nrows, int64_t K, sycl::half * y);
++// f16 copy of ncols columns (column stride in floats): y[c * K + k] = x[c * x_col_stride + k]
++sycl::event cols_to_f16(sycl::queue & q, const float * x, int64_t x_col_stride, int64_t ncols, int64_t K, sycl::half * y);
++
++// launch; returns false when the shape is not covered (caller falls back)
++bool launch(sycl::queue & q, WType t, const Args & a);
++
++}  // namespace fastmv
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -18,6 +18,7 @@
+ #include "fattn-tile.hpp"
+ #include "fattn-vec.hpp"
+ #include "fattn.hpp"
++#include "fattn-dsv4.hpp"   // larry: DeepSeek-V4.1 prompt attention on XMX
+ #include "fattn-onednn.hpp"
+ 
+ 
+@@ -307,6 +308,15 @@
+                 (long long)V_dbg->ne[1]);
+     }
+ 
++    // larry: DeepSeek-V4.1's prompt shape (one query per batch, MQA, per-query keys, sinks) as batched XMX GEMMs
++    if (ggml_sycl_fattn_dsv4_mqa_ok(dst)) {
++        ggml_sycl_flash_attn_ext_dsv4_mqa(ctx, dst);
++        return;
++    }
++    if (ggml_sycl_fattn_dsv4_dec_ok(dst)) {   // larry: the decode / verify shape
++        ggml_sycl_flash_attn_ext_dsv4_dec(ctx, dst);
++        return;
++    }
+     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+     switch (fk) {
+         case BEST_FATTN_KERNEL_NONE:
 diff --git a/ggml/src/ggml-sycl/fattn-dsv4.cpp b/ggml/src/ggml-sycl/fattn-dsv4.cpp
 new file mode 100644
-index 000000000..e6522a680
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fattn-dsv4.cpp
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,178 @@
 +// ggml-sycl/fattn-dsv4.cpp - larry (Strata-DS4 on Intel): flash attention for DeepSeek-V4.1's prompt shape on XMX.
 +//
 +// The DS4 engines (Xolotl tools/v41/engine/ds41_dense.cpp) attend with the QUERY as the batch: every query has its
@@ -160,6 +979,7 @@ index 000000000..e6522a680
 +//   O_b = P_b . V_b                  [NH x D], written straight into dst ([D, NH, 1, n] contiguous)
 +// Used for n >= GGML_SYCL_DSV4_MQA_MIN (8) queries; decode keeps the TILE/VEC kernels.  GGML_SYCL_DSV4_MQA=0 = off.
 +#include "fattn-dsv4.hpp"
++#include "fattn-dsv4-dec.hpp"
 +
 +#include <oneapi/mkl.hpp>
 +
@@ -268,12 +1088,478 @@ index 000000000..e6522a680
 +    mkl::blas::row_major::gemm_batch(*stream, mkl::transpose::nontrans, mkl::transpose::nontrans, NH, D, M, 1.0f, p, M,
 +                                     NH * M, (const sycl::half *) V->data, D, M * D, 0.0f, (float *) dst->data, D, NH * D, n);
 +}
++
++bool ggml_sycl_fattn_dsv4_dec_ok(const ggml_tensor * dst) {
++    static const int on = env_int("GGML_SYCL_DSV4_DEC", 1);
++    if (!on) return false;
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    if (!Q || !K || !V || !mask) return false;
++    if (K != V && K->data != V->data) return false;                        // the kernel reads V from K
++    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (K->type != GGML_TYPE_F32 && K->type != GGML_TYPE_F16) return false;
++    if (mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) return false;
++    if (sinks && sinks->type != GGML_TYPE_F32) return false;
++    const int64_t D = Q->ne[0], NH = Q->ne[2], n = Q->ne[3], M = K->ne[1];
++    if (D != dsv4dec::DD || Q->ne[1] != 1 || NH % 32 || n < 1 || M < 1) return false;
++    if (K->ne[0] != D || K->ne[2] != 1 || K->ne[3] != n) return false;   // MQA, keys per query
++    const size_t es = ggml_type_size(K->type);
++    if (K->nb[0] != es || K->nb[1] != (size_t) D * es || K->nb[3] % es) return false;
++    if (Q->nb[0] != 4 || Q->nb[2] % 4 || Q->nb[3] % 4) return false;
++    const size_t ms = ggml_type_size(mask->type);
++    if (mask->ne[0] < M || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != n || mask->nb[0] != ms || mask->nb[3] % ms) return false;
++    if (dst->ne[0] != D || dst->ne[1] != NH || dst->ne[2] != 1 || dst->ne[3] != n || !ggml_is_contiguous(dst)) return false;
++    // 16-byte aligned rows for the vector loads
++    if (((uintptr_t) K->data) % 16 || ((uintptr_t) dst->data) % 16 || ((uintptr_t) Q->data) % 16) return false;
++    float max_bias = 0.0f, logit_softcap = 0.0f;
++    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    return max_bias == 0.0f && logit_softcap == 0.0f;
++}
++
++void ggml_sycl_flash_attn_ext_dsv4_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    dsv4dec::Args a;
++    a.D = (int) Q->ne[0]; a.NH = (int) Q->ne[2]; a.n = (int) Q->ne[3]; a.M = (int) K->ne[1];
++    memcpy(&a.scale, (const float *) dst->op_params + 0, sizeof(float));
++    a.q = (const float *) Q->data; a.q_h = Q->nb[2] / 4; a.q_b = Q->nb[3] / 4;
++    a.k = K->data; a.k_f16 = K->type == GGML_TYPE_F16; a.k_b = K->nb[3] / ggml_type_size(K->type);
++    a.mask = mask->data; a.m_f16 = mask->type == GGML_TYPE_F16; a.m_b = mask->nb[3] / ggml_type_size(mask->type);
++    a.sinks = sinks ? (const float *) sinks->data : nullptr;
++    a.o = (float *) dst->data;
++    static const int xmx = env_int("GGML_SYCL_DSV4_DEC_XMX", 1);
++    if (xmx && a.NH % dsv4dec::XHG == 0 && dsv4dec::n_chunks(a.M, dsv4dec::XKC) <= 32) {
++        ggml_sycl_pool_alloc<float> part(ctx.pool(), dsv4dec::xmx_scratch_floats(a.NH, a.M, a.n));
++        a.part = part.get();
++        dsv4dec::launch_xmx(*ctx.stream(), a);
++        return;
++    }
++    ggml_sycl_pool_alloc<float> part(ctx.pool(), dsv4dec::scratch_floats(a.NH, a.M, a.n));
++    a.part = part.get();
++    dsv4dec::launch(*ctx.stream(), a);
++}
+diff --git a/ggml/src/ggml-sycl/fattn-dsv4-dec.hpp b/ggml/src/ggml-sycl/fattn-dsv4-dec.hpp
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-dsv4-dec.hpp
+@@ -0,0 +1,406 @@
++// ggml-sycl/fattn-dsv4-dec.hpp - larry (DeepSeek-V4.1 on Intel Arc): flash attention for the DECODE / verify shape.
++//
++// Each of n (< 8) queries attends with 64 MQA heads (D 512) to its own key set (its window rows + its top-k compressed
++// rows, M <= ~640, K = V) plus one sink logit per head.  The generic TILE kernel took 62 us per layer for one query,
++// and the graph around it padded M to 256 and cast K and the mask to f16 (six more kernels).  Here, flash-decoding:
++//   1. per (query, KC-key chunk, HG heads): the chunk's keys -> local memory, one sub-group per head: scores (lanes
++//      split D; a reduce-scatter leaves keys KPL L .. KPL L + KPL - 1 on lane L), the chunk's max / sum, its O share
++//   2. per (query, head), one sub-group: the chunks' parts and the sink combined into O.
++// K and the mask may be f32 (no casts in the graph) or f16; any M.
++#pragma once
++
++#include <sycl/sycl.hpp>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace dsv4dec {
++
++constexpr int DD = 512;  // head dim this kernel is built for
++
++struct Args {
++    const float * q = nullptr;   // q[b * q_b + h * q_h + d]
++    size_t q_h = 0, q_b = 0;
++    const void * k = nullptr;    // K[b * k_b + j * D + d] (= V)
++    bool k_f16 = false;
++    size_t k_b = 0;
++    const void * mask = nullptr; // mask[b * m_b + j]
++    bool m_f16 = false;
++    size_t m_b = 0;
++    const float * sinks = nullptr;  // [NH] or null
++    float * o = nullptr;         // o[(b * NH + h) * D + d]
++    int D = DD, NH = 0, M = 0, n = 0;
++    float scale = 1.0f;
++    float * part = nullptr;      // scratch_floats() floats
++};
++
++inline int n_chunks(int M, int KC) { return (M + KC - 1) / KC; }
++inline size_t scratch_floats(int NH, int M, int n, int KC = 32) { return (size_t) n * n_chunks(M, KC) * NH * (DD + 2); }
++
++// KC keys per chunk (16 or 32), HG heads (sub-groups) per work-group, KT the local copy's type (half / float)
++template <int KC, int HG, typename KT>
++sycl::event launch_t(sycl::queue & q, const Args & a, sycl::event * first = nullptr) {
++    static_assert(KC == 16 || KC == 32, "KC");
++    constexpr int KPL = KC / 16;   // keys per lane after the reduce-scatter
++    const int nch = n_chunks(a.M, KC);
++    const int NH = a.NH, M = a.M, n = a.n;
++    constexpr int D = DD, DPL = D / 16, LD = D + (sizeof(KT) == 2 ? 8 : 4);   // dims per lane; local row stride
++    const Args A = a;
++    sycl::event e1 = q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<KT, 1> kl(sycl::range<1>((size_t) KC * LD), h);
++        h.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t) n, (size_t) nch, (size_t) (NH / HG) * HG * 16),
++                                         sycl::range<3>(1, 1, (size_t) HG * 16)),
++                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int b = (int) it.get_group(0), c = (int) it.get_group(1), hg = (int) it.get_group(2);
++            const int lid = (int) it.get_local_id(2);
++            const sycl::sub_group sg = it.get_sub_group();
++            const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
++            const int hh = hg * HG + s;
++            const int j0 = c * KC;
++            const int nk = sycl::min(KC, M - j0);
++            // 1. the chunk's keys -> local memory, 4 values per step (unrolled: the loads in flight together)
++#pragma unroll 8
++            for (int idx = lid * 4; idx < KC * D; idx += HG * 16 * 4) {
++                const int row = idx / D, d = idx % D;
++                sycl::float4 fv(0.0f, 0.0f, 0.0f, 0.0f);
++                if (row < nk) {
++                    const size_t g = (size_t) b * A.k_b + (size_t) (j0 + row) * D + d;
++                    if (A.k_f16) {
++                        const sycl::half4 hv = *reinterpret_cast<const sycl::half4 *>((const sycl::half *) A.k + g);
++                        fv = sycl::float4((float) hv.x(), (float) hv.y(), (float) hv.z(), (float) hv.w());
++                    } else {
++                        fv = *reinterpret_cast<const sycl::float4 *>((const float *) A.k + g);
++                    }
++                }
++                *reinterpret_cast<sycl::vec<KT, 4> *>(&kl[(size_t) row * LD + d]) = fv.template convert<KT>();
++            }
++            // the head's query in registers (scaled): lane L's dims are 128 g + 8 L + e (g < 4, e < 8)
++            float qr[DPL];
++            const float * qp = A.q + (size_t) b * A.q_b + (size_t) hh * A.q_h;
++#pragma unroll
++            for (int g = 0; g < 4; ++g)
++#pragma unroll
++                for (int e = 0; e < 8; ++e) qr[8 * g + e] = qp[128 * g + 8 * lane + e] * A.scale;
++            sycl::group_barrier(it.get_group());
++            using v8 = sycl::vec<KT, 8>;
++            // 2. scores: per key the lane's partial dot over its dims
++            float sc[KC];
++#pragma unroll
++            for (int j = 0; j < KC; ++j) {
++                float acc = 0.0f;
++#pragma unroll
++                for (int g = 0; g < 4; ++g) {
++                    const v8 kv = *reinterpret_cast<const v8 *>(&kl[(size_t) j * LD + 128 * g + 8 * lane]);
++#pragma unroll
++                    for (int e = 0; e < 8; ++e) acc += qr[8 * g + e] * (float) kv[e];
++                }
++                sc[j] = acc;
++            }
++            // reduce-scatter over the 16 lanes: lane L ends with the totals of keys KPL L + e
++#pragma unroll
++            for (int st = 0; st < 4; ++st) {
++                const int mask = 8 >> st;
++                const int half = KC >> (st + 1);
++                const bool hi = (lane & mask) != 0;
++#pragma unroll
++                for (int k = 0; k < half; ++k) {
++                    const float send = hi ? sc[k] : sc[k + half];
++                    const float keep = hi ? sc[k + half] : sc[k];
++                    sc[k] = keep + sycl::permute_group_by_xor(sg, send, mask);
++                }
++            }
++            // 3. mask, the chunk's max and sum (masked / missing keys: weight 0)
++            float v[KPL], p[KPL];
++            float vm = -1e30f;
++#pragma unroll
++            for (int e = 0; e < KPL; ++e) {
++                const int key = KPL * lane + e;
++                float x = -1e30f;
++                if (key < nk) {
++                    const size_t mi = (size_t) b * A.m_b + (size_t) (j0 + key);
++                    const float mv = A.m_f16 ? (float) ((const sycl::half *) A.mask)[mi] : ((const float *) A.mask)[mi];
++                    x = sycl::fmax(sc[e] + sycl::fmax(mv, -1e30f), -1e30f);
++                }
++                v[e] = x;
++                vm = sycl::fmax(vm, x);
++            }
++            const float mx = sycl::reduce_over_group(sg, vm, sycl::maximum<float>());
++            float ps = 0.0f;
++#pragma unroll
++            for (int e = 0; e < KPL; ++e) { p[e] = v[e] > -1e29f ? sycl::exp(v[e] - mx) : 0.0f; ps += p[e]; }
++            const float l = sycl::reduce_over_group(sg, ps, sycl::plus<float>());
++            // 4. this chunk's O share: the lane's dims as above
++            float o[DPL];
++#pragma unroll
++            for (int i = 0; i < DPL; ++i) o[i] = 0.0f;
++#pragma unroll
++            for (int j = 0; j < KC; ++j) {
++                const float pj = sycl::select_from_group(sg, p[j % KPL], j / KPL);
++#pragma unroll
++                for (int g = 0; g < 4; ++g) {
++                    const v8 kv = *reinterpret_cast<const v8 *>(&kl[(size_t) j * LD + 128 * g + 8 * lane]);
++#pragma unroll
++                    for (int e = 0; e < 8; ++e) o[8 * g + e] += pj * (float) kv[e];
++                }
++            }
++            float * pp = A.part + (((size_t) b * nch + c) * NH + hh) * (D + 2);
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                *reinterpret_cast<sycl::float4 *>(pp + 128 * g + 8 * lane) = sycl::float4(o[8 * g], o[8 * g + 1], o[8 * g + 2], o[8 * g + 3]);
++                *reinterpret_cast<sycl::float4 *>(pp + 128 * g + 8 * lane + 4) = sycl::float4(o[8 * g + 4], o[8 * g + 5], o[8 * g + 6], o[8 * g + 7]);
++            }
++            if (lane == 0) { pp[D] = mx; pp[D + 1] = l; }
++        });
++    });
++    if (first) *first = e1;
++    // 5. combine: one sub-group per (query, head); lane c (and c + 16, ...) reads chunk c's max / sum, the weights go
++    // round by shuffles, every lane adds up its dims (as above) over the chunks
++    constexpr int SGW = 4;
++    const size_t rows = (size_t) n * NH;
++    return q.parallel_for(sycl::nd_range<1>(sycl::range<1>((rows + SGW - 1) / SGW * SGW * 16), sycl::range<1>(SGW * 16)),
++                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++        const sycl::sub_group sg = it.get_sub_group();
++        const size_t row = (size_t) it.get_group(0) * SGW + sg.get_group_linear_id();   // b * NH + h
++        if (row >= rows) return;
++        const int lane = (int) sg.get_local_linear_id();
++        const int b = (int) (row / NH), hh = (int) (row % NH);
++        const float * pb = A.part + ((size_t) b * nch * NH + hh) * (D + 2);
++        const size_t cs = (size_t) NH * (D + 2);   // chunk stride
++        constexpr int MAXC = 64;                   // chunks: <= 4 per lane (M <= 1024 at KC 16)
++        float mc[MAXC / 16], lc[MAXC / 16];
++        float gm = A.sinks ? A.sinks[hh] : -1e30f;
++#pragma unroll
++        for (int r = 0; r < MAXC / 16; ++r) {
++            const int c = lane + 16 * r;
++            mc[r] = c < nch ? pb[c * cs + D] : -1e30f;
++            lc[r] = c < nch ? pb[c * cs + D + 1] : 0.0f;
++            gm = sycl::fmax(gm, mc[r]);
++        }
++        gm = sycl::reduce_over_group(sg, gm, sycl::maximum<float>());
++        float w[MAXC / 16], ls = 0.0f;
++#pragma unroll
++        for (int r = 0; r < MAXC / 16; ++r) { w[r] = mc[r] > -1e29f ? sycl::exp(mc[r] - gm) : 0.0f; ls += lc[r] * w[r]; }
++        float L = sycl::reduce_over_group(sg, ls, sycl::plus<float>());
++        if (A.sinks) L += sycl::exp(A.sinks[hh] - gm);
++        const float inv = L > 0.0f ? 1.0f / L : 0.0f;
++        float acc[DPL];
++#pragma unroll
++        for (int i = 0; i < DPL; ++i) acc[i] = 0.0f;
++        for (int c = 0; c < nch; ++c) {
++            const int r = c / 16;
++            const float wr = r == 0 ? w[0] : r == 1 ? w[1] : r == 2 ? w[2] : w[3];
++            const float wc = sycl::select_from_group(sg, wr, c % 16);
++            const float * pc = pb + c * cs;
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(pc + 128 * g + 8 * lane);
++                const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(pc + 128 * g + 8 * lane + 4);
++                acc[8 * g] += x0.x() * wc; acc[8 * g + 1] += x0.y() * wc; acc[8 * g + 2] += x0.z() * wc; acc[8 * g + 3] += x0.w() * wc;
++                acc[8 * g + 4] += x1.x() * wc; acc[8 * g + 5] += x1.y() * wc; acc[8 * g + 6] += x1.z() * wc; acc[8 * g + 7] += x1.w() * wc;
++            }
++        }
++        float * op = A.o + row * D;
++#pragma unroll
++        for (int g = 0; g < 4; ++g) {
++            *reinterpret_cast<sycl::float4 *>(op + 128 * g + 8 * lane) =
++                sycl::float4(acc[8 * g] * inv, acc[8 * g + 1] * inv, acc[8 * g + 2] * inv, acc[8 * g + 3] * inv);
++            *reinterpret_cast<sycl::float4 *>(op + 128 * g + 8 * lane + 4) =
++                sycl::float4(acc[8 * g + 4] * inv, acc[8 * g + 5] * inv, acc[8 * g + 6] * inv, acc[8 * g + 7] * inv);
++        }
++    });
++}
++
++// ---- the XMX form: per (query, 64-key chunk, 32 heads) work-group, the chunk's keys (f16) and Q^T (f16, scaled) in
++// local memory, S^T = K . Q^T and O = P . K as joint_matrix tiles (8 x 16 x 16), the chunk's softmax in between.
++// Parts: O [query][chunk][head][D] and (max, sum) [query][chunk][head][2] (16-byte aligned rows for the matrix stores).
++namespace jm = sycl::ext::oneapi::experimental::matrix;
++constexpr int XKC = 64, XHG = 32;
++
++inline size_t xmx_scratch_floats(int NH, int M, int n) { return (size_t) n * n_chunks(M, XKC) * NH * (DD + 2); }
++
++inline sycl::event launch_xmx(sycl::queue & q, const Args & a, sycl::event * first = nullptr) {
++    const int nch = n_chunks(a.M, XKC);
++    const int NH = a.NH, M = a.M, n = a.n;
++    constexpr int D = DD;
++    constexpr int KS = D + 8;     // ks row stride (halves): ks[key][d]
++    constexpr int QS = XHG + 8;   // qt row stride (halves): qt[d][head]
++    constexpr int SS = XHG + 4;   // ss row stride (floats): ss[key][head]
++    constexpr int PS = XKC + 16;  // ps row stride (halves): ps[head][key]
++    const Args A = a;
++    float * pO = a.part;
++    float * pML = a.part + (size_t) n * nch * NH * D;
++    sycl::event e1 = q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<sycl::half, 1> ks(sycl::range<1>((size_t) XKC * KS), h);
++        sycl::local_accessor<sycl::half, 1> qt(sycl::range<1>((size_t) D * QS), h);
++        sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) XKC * SS), h);
++        sycl::local_accessor<sycl::half, 1> ps(sycl::range<1>((size_t) XHG * PS), h);
++        sycl::local_accessor<float, 1> mk(sycl::range<1>((size_t) XKC), h);
++        h.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t) n, (size_t) nch, (size_t) (NH / XHG) * 256),
++                                         sycl::range<3>(1, 1, 256)),
++                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int b = (int) it.get_group(0), c = (int) it.get_group(1), hg = (int) it.get_group(2);
++            const int lid = (int) it.get_local_id(2);
++            const sycl::sub_group sg = it.get_sub_group();
++            const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
++            const int j0 = c * XKC;
++            const int nk = sycl::min(XKC, M - j0);
++            // 1. the chunk's keys -> ks (f16; rows past the key count are zero), unrolled
++#pragma unroll 8
++            for (int idx = lid * 4; idx < XKC * D; idx += 256 * 4) {
++                const int row = idx / D, d = idx % D;
++                sycl::half4 hv(0.0f, 0.0f, 0.0f, 0.0f);
++                if (row < nk) {
++                    const size_t g = (size_t) b * A.k_b + (size_t) (j0 + row) * D + d;
++                    if (A.k_f16) {
++                        hv = *reinterpret_cast<const sycl::half4 *>((const sycl::half *) A.k + g);
++                    } else {
++                        const sycl::float4 fv = *reinterpret_cast<const sycl::float4 *>((const float *) A.k + g);
++                        hv = sycl::half4((sycl::half) fv.x(), (sycl::half) fv.y(), (sycl::half) fv.z(), (sycl::half) fv.w());
++                    }
++                }
++                *reinterpret_cast<sycl::half4 *>(&ks[(size_t) row * KS + d]) = hv;
++            }
++            // the chunk's mask -> mk (-1e30 for keys past the count)
++            if (lid < XKC) {
++                float mv = -1e30f;
++                if (lid < nk) {
++                    const size_t mi = (size_t) b * A.m_b + (size_t) (j0 + lid);
++                    mv = sycl::fmax(A.m_f16 ? (float) ((const sycl::half *) A.mask)[mi] : ((const float *) A.mask)[mi], -1e30f);
++                }
++                mk[lid] = mv;
++            }
++            // 2. Q^T of this work-group's 32 heads -> qt (scaled f16)
++#pragma unroll 8
++            for (int idx = lid * 4; idx < XHG * D; idx += 256 * 4) {
++                const int hl = idx / D, d = idx % D;
++                const sycl::float4 v = *reinterpret_cast<const sycl::float4 *>(A.q + (size_t) b * A.q_b + (size_t) (hg * XHG + hl) * A.q_h + d);
++                qt[(size_t) d * QS + hl] = (sycl::half) (v.x() * A.scale);
++                qt[(size_t) (d + 1) * QS + hl] = (sycl::half) (v.y() * A.scale);
++                qt[(size_t) (d + 2) * QS + hl] = (sycl::half) (v.z() * A.scale);
++                qt[(size_t) (d + 3) * QS + hl] = (sycl::half) (v.w() * A.scale);
++            }
++            sycl::group_barrier(it.get_group());
++            auto kp = ks.template get_multi_ptr<sycl::access::decorated::no>();
++            // 3. S^T: one 8-key x 16-head tile per sub-group (keys 8 mt.., heads 16 nt..), 32 steps over D
++            {
++                const int mt = s >> 1, nt = s & 1;
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> ma;
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> mb;
++                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> mc;
++                jm::joint_matrix_fill(sg, mc, 0.0f);
++                auto qp = qt.template get_multi_ptr<sycl::access::decorated::no>();
++                for (int k = 0; k < D / 16; ++k) {
++                    jm::joint_matrix_load(sg, ma, kp + (size_t) (mt * 8) * KS + k * 16, KS);
++                    jm::joint_matrix_load(sg, mb, qp + (size_t) (k * 16) * QS + nt * 16, QS);
++                    jm::joint_matrix_mad(sg, mc, ma, mb, mc);
++                }
++                auto sp = ss.template get_multi_ptr<sycl::access::decorated::no>();
++                jm::joint_matrix_store(sg, mc, sp + (size_t) (mt * 8) * SS + nt * 16, SS, jm::layout::row_major);
++            }
++            sycl::group_barrier(it.get_group());
++            // 4. the chunk's softmax per head: sub-groups 0, 1, lane = head; P (f16) -> ps[head][key]
++            if (s < 2) {
++                const int hl = s * 16 + lane, hh = hg * XHG + hl;
++                float xv[XKC];
++                float mx = -1e30f;
++#pragma unroll
++                for (int j = 0; j < XKC; ++j) {
++                    xv[j] = sycl::fmax(ss[(size_t) j * SS + hl] + mk[j], -1e30f);
++                    mx = sycl::fmax(mx, xv[j]);
++                }
++                float l = 0.0f;
++#pragma unroll
++                for (int j = 0; j < XKC; ++j) {
++                    const float p = xv[j] > -1e29f ? sycl::exp(xv[j] - mx) : 0.0f;
++                    l += p;
++                    ps[(size_t) hl * PS + j] = (sycl::half) p;
++                }
++                float * ml = pML + (((size_t) b * nch + c) * NH + hh) * 2;
++                ml[0] = mx;
++                ml[1] = l;
++            }
++            sycl::group_barrier(it.get_group());
++            // 5. this chunk's O = P . K: 4 head tiles x 32 dim tiles, 8 per sub-group, 4 steps over the keys
++            {
++                auto pp = ps.template get_multi_ptr<sycl::access::decorated::no>();
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> ma;
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> mb;
++                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> mc;
++                for (int ti = 0; ti < 8; ++ti) {
++                    const int tile = s * 8 + ti, ht = tile / 32, dt = tile % 32;
++                    jm::joint_matrix_fill(sg, mc, 0.0f);
++#pragma unroll
++                    for (int k = 0; k < XKC / 16; ++k) {
++                        jm::joint_matrix_load(sg, ma, pp + (size_t) (ht * 8) * PS + k * 16, PS);
++                        jm::joint_matrix_load(sg, mb, kp + (size_t) (k * 16) * KS + dt * 16, KS);
++                        jm::joint_matrix_mad(sg, mc, ma, mb, mc);
++                    }
++                    float * dst = pO + (((size_t) b * nch + c) * NH + hg * XHG + ht * 8) * D + dt * 16;
++                    jm::joint_matrix_store(sg, mc, sycl::address_space_cast<sycl::access::address_space::global_space,
++                                                                             sycl::access::decorated::no>(dst), D, jm::layout::row_major);
++                }
++            }
++        });
++    });
++    if (first) *first = e1;
++    // 6. combine (as launch_t's, with the parts split into O and (max, sum))
++    constexpr int SGW = 4;
++    const size_t rows = (size_t) n * NH;
++    return q.parallel_for(sycl::nd_range<1>(sycl::range<1>((rows + SGW - 1) / SGW * SGW * 16), sycl::range<1>(SGW * 16)),
++                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++        const sycl::sub_group sg = it.get_sub_group();
++        const size_t row = (size_t) it.get_group(0) * SGW + sg.get_group_linear_id();   // b * NH + h
++        if (row >= rows) return;
++        const int lane = (int) sg.get_local_linear_id();
++        const int b = (int) (row / NH), hh = (int) (row % NH);
++        const float * ob = pO + ((size_t) b * nch * NH + hh) * D;
++        const float * mb = pML + ((size_t) b * nch * NH + hh) * 2;
++        const size_t cs = (size_t) NH * D, ms = (size_t) NH * 2;   // chunk strides
++        constexpr int MAXC = 32;                                  // chunks: <= 2 per lane (M <= 2048)
++        float mc[MAXC / 16], lc[MAXC / 16];
++        float gm = A.sinks ? A.sinks[hh] : -1e30f;
++#pragma unroll
++        for (int r = 0; r < MAXC / 16; ++r) {
++            const int c = lane + 16 * r;
++            mc[r] = c < nch ? mb[c * ms] : -1e30f;
++            lc[r] = c < nch ? mb[c * ms + 1] : 0.0f;
++            gm = sycl::fmax(gm, mc[r]);
++        }
++        gm = sycl::reduce_over_group(sg, gm, sycl::maximum<float>());
++        float w[MAXC / 16], ls = 0.0f;
++#pragma unroll
++        for (int r = 0; r < MAXC / 16; ++r) { w[r] = mc[r] > -1e29f ? sycl::exp(mc[r] - gm) : 0.0f; ls += lc[r] * w[r]; }
++        float L = sycl::reduce_over_group(sg, ls, sycl::plus<float>());
++        if (A.sinks) L += sycl::exp(A.sinks[hh] - gm);
++        const float inv = L > 0.0f ? 1.0f / L : 0.0f;
++        float acc[D / 16];
++#pragma unroll
++        for (int i = 0; i < D / 16; ++i) acc[i] = 0.0f;
++        for (int c = 0; c < nch; ++c) {
++            const float wc = sycl::select_from_group(sg, c < 16 ? w[0] : w[1], c % 16);
++            const float * pc = ob + c * cs;
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(pc + 128 * g + 8 * lane);
++                const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(pc + 128 * g + 8 * lane + 4);
++                acc[8 * g] += x0.x() * wc; acc[8 * g + 1] += x0.y() * wc; acc[8 * g + 2] += x0.z() * wc; acc[8 * g + 3] += x0.w() * wc;
++                acc[8 * g + 4] += x1.x() * wc; acc[8 * g + 5] += x1.y() * wc; acc[8 * g + 6] += x1.z() * wc; acc[8 * g + 7] += x1.w() * wc;
++            }
++        }
++        float * op = A.o + row * D;
++#pragma unroll
++        for (int g = 0; g < 4; ++g) {
++            *reinterpret_cast<sycl::float4 *>(op + 128 * g + 8 * lane) =
++                sycl::float4(acc[8 * g] * inv, acc[8 * g + 1] * inv, acc[8 * g + 2] * inv, acc[8 * g + 3] * inv);
++            *reinterpret_cast<sycl::float4 *>(op + 128 * g + 8 * lane + 4) =
++                sycl::float4(acc[8 * g + 4] * inv, acc[8 * g + 5] * inv, acc[8 * g + 6] * inv, acc[8 * g + 7] * inv);
++        }
++    });
++}
++
++// the configuration the hook uses
++inline sycl::event launch(sycl::queue & q, const Args & a, sycl::event * first = nullptr) {
++    return launch_t<32, 32, sycl::half>(q, a, first);
++}
++
++}  // namespace dsv4dec
 diff --git a/ggml/src/ggml-sycl/fattn-dsv4.hpp b/ggml/src/ggml-sycl/fattn-dsv4.hpp
 new file mode 100644
-index 000000000..75227ff34
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fattn-dsv4.hpp
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,14 @@
 +#ifndef GGML_SYCL_FATTN_DSV4_HPP
 +#define GGML_SYCL_FATTN_DSV4_HPP
 +
@@ -283,45 +1569,171 @@ index 000000000..75227ff34
 +// strided batched oneMKL fp16 GEMMs around a softmax kernel (fattn-dsv4.cpp).
 +bool ggml_sycl_fattn_dsv4_mqa_ok(const ggml_tensor * dst);
 +void ggml_sycl_flash_attn_ext_dsv4_mqa(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// larry: the decode / verify shape (< 8 queries; f32 or f16 keys and mask, any key count): fattn-dsv4-dec.hpp
++bool ggml_sycl_fattn_dsv4_dec_ok(const ggml_tensor * dst);
++void ggml_sycl_flash_attn_ext_dsv4_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +
 +#endif  // GGML_SYCL_FATTN_DSV4_HPP
-diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
-index 394cda593..b535b627c 100644
---- a/ggml/src/ggml-sycl/fattn.cpp
-+++ b/ggml/src/ggml-sycl/fattn.cpp
-@@ -18,6 +18,7 @@
- #include "fattn-tile.hpp"
- #include "fattn-vec.hpp"
- #include "fattn.hpp"
-+#include "fattn-dsv4.hpp"   // larry: DeepSeek-V4.1 prompt attention on XMX
- #include "fattn-onednn.hpp"
- 
- 
-@@ -307,6 +308,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
-                 (long long)V_dbg->ne[1]);
-     }
- 
-+    // larry: DeepSeek-V4.1's prompt shape (one query per batch, MQA, per-query keys, sinks) as batched XMX GEMMs
-+    if (ggml_sycl_fattn_dsv4_mqa_ok(dst)) {
-+        ggml_sycl_flash_attn_ext_dsv4_mqa(ctx, dst);
-+        return;
-+    }
-     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
-     switch (fk) {
-         case BEST_FATTN_KERNEL_NONE:
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index b24664a0b..6663558fb 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -70,6 +70,7 @@
+@@ -70,6 +70,9 @@
  #include "ggml-sycl/set_rows.hpp"
  #include "ggml-sycl/set.hpp"
  #include "ggml-sycl/dsv4-hc.hpp"
-+#include "ggml-sycl/dsv41-fused.hpp"   // larry: Xolotl's fused DeepSeek-V4.1 ops
++#include "ggml-sycl/dsv41-fused.hpp"
++#include <unordered_set>
++#include "ggml-sycl/fastmv.hpp"   // larry: mat-vecs for the DSV4.1 decode shapes   // larry: Xolotl's fused DeepSeek-V4.1 ops
  #include "ggml-sycl/lightning-indexer.hpp"
  #include "ggml-sycl/conv2d.hpp"
  #include "ggml-sycl/conv2d-dw.hpp"
-@@ -5434,6 +5435,12 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
+@@ -4734,6 +4737,135 @@
+            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+ }
+ 
++
++// larry (DeepSeek-V4.1 decode): fastmv.cpp's kernels where ggml-sycl's are slow (measured on a B70), 1..8 columns:
++//   * F16 weights (the hyper-connection projections, 20480 -> 24: ~70 us -> ~5 us a call) and F32 ones (the router)
++//   * 2-D Q6_K (reordered by ggml-sycl): int8 activations + dp4a (Q6K_R8), ~1.7x the ESIMD mat-vec
++//   * wo_a (a 3-D Q6_K view: 8 groups, never reordered by ggml-sycl): reordered per slice here on first use, then dp4a;
++//     prompt chunks against it go through larry_slices_gemm (GGML_SYCL_LARRY_WOA=0: the standard-layout kernel)
++// GGML_SYCL_LARRY_FASTMV=0 = off, GGML_SYCL_LARRY_Q6R8=0 = no int8 Q6_K paths.
++// larry: Q6_K weights the hook reordered PER SLICE itself (3-D views: wo_a) - by data address; every product with
++// them must then come through larry_fastmv / larry_slices_gemm (ggml's own paths read views in the standard layout)
++static std::unordered_set<const void *> g_larry_slice_planar;
++
++// a 3-D Q6_K view covering its parent exactly, slices ne02 x nb02 bytes
++static bool larry_slice_view_ok(const ggml_tensor * src0) {
++    const ggml_tensor * par = src0->view_src ? src0->view_src : src0;
++    return src0->type == GGML_TYPE_Q6_K && src0->ne[2] > 1 && src0->ne[3] == 1 && src0->data == par->data &&
++           src0->ne[0] % QK_K == 0 && src0->nb[0] == sizeof(block_q6_K) &&
++           src0->nb[1] == (size_t) (src0->ne[0] / QK_K) * sizeof(block_q6_K) && src0->nb[2] == src0->nb[1] * src0->ne[1] &&
++           src0->nb[2] * src0->ne[2] == ggml_nbytes(par) && par->extra &&
++           !static_cast<const ggml_tensor_extra_gpu *>(par->extra)->optimized_feature.reorder;
++}
++
++// prompt chunks against a per-slice planar Q6_K weight: per slice, W (f16) and the slice's columns (f16), one GEMM
++static bool larry_slices_gemm(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[3] != 1 || dst->ne[3] != 1) return false;
++    const int64_t K = src0->ne[0], N = src0->ne[1], ncols = src1->ne[1], G = src1->ne[2];
++    if (src1->ne[0] != K || G % src0->ne[2] || dst->ne[0] != N || dst->ne[1] != ncols || dst->ne[2] != G) return false;
++    if (src1->nb[0] != 4 || dst->nb[0] != 4) return false;
++    dpct::queue_ptr st = ctx.stream();
++    ggml_sycl_pool_alloc<sycl::half> wf(ctx.pool(), (size_t) N * K);
++    ggml_sycl_pool_alloc<sycl::half> xf(ctx.pool(), (size_t) ncols * K);
++    const int64_t g_div = G / src0->ne[2];
++    for (int64_t g = 0; g < G; ++g) {
++        if (g % g_div == 0)
++            fastmv::dequant_q6k_planar_f16(*st, (const char *) src0->data + (g / g_div) * src0->nb[2], N, K, wf.get());
++        fastmv::cols_to_f16(*st, (const float *) ((const char *) src1->data + g * src1->nb[2]), (int64_t) (src1->nb[1] / 4), ncols, K, xf.get());
++        // dst slice g, row-major [ncols][N] (ld = nb1 / 4) = X [ncols x K] . W^T
++        oneapi::mkl::blas::row_major::gemm(*st, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans, ncols, N, K, 1.0f,
++                                           xf.get(), K, wf.get(), K, 0.0f,
++                                           (float *) ((char *) dst->data + g * dst->nb[2]), (int64_t) (dst->nb[1] / 4));
++    }
++    return true;
++}
++
++static bool larry_fastmv(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    static const int on = ggml_sycl_get_env("GGML_SYCL_LARRY_FASTMV", 1);
++    static const int f16_max_rows = ggml_sycl_get_env("GGML_SYCL_LARRY_FASTMV_F16_ROWS", 1 << 30);
++    static const int q6r8 = ggml_sycl_get_env("GGML_SYCL_LARRY_Q6R8", 1);
++    if (!on || dst->op != GGML_OP_MUL_MAT) return false;
++    if (!src0->buffer || ggml_backend_buffer_is_sycl_split(src0->buffer)) return false;
++    static const int woa = ggml_sycl_get_env("GGML_SYCL_LARRY_WOA", 1);
++    const bool slice_planar = src0->type == GGML_TYPE_Q6_K && g_larry_slice_planar.count(src0->data) != 0;
++    if (slice_planar && src1->ne[1] > 8) {   // a prompt chunk against a weight only this hook can read now
++        if (larry_slices_gemm(ctx, src0, src1, dst)) return true;
++        GGML_ABORT("larry_fastmv: per-slice planar Q6_K weight in an unsupported product");
++    }
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    const int64_t ncols = src1->ne[1];
++    if (ncols < 1 || ncols > 8 || src1->ne[3] != 1 || src0->ne[3] != 1 || dst->ne[3] != 1) return false;
++    if (src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || src1->ne[0] != src0->ne[0]) return false;
++    const int64_t K = src0->ne[0], N = src0->ne[1], G = src1->ne[2];
++    if (src0->ne[2] < 1 || G % src0->ne[2] || dst->ne[0] != N || dst->ne[1] != ncols || dst->ne[2] != G) return false;
++    if (((uintptr_t) src1->data) % 16 || (src1->nb[1] / 4) % 4 || (src1->nb[2] / 4) % 4) return false;
++    fastmv::Args a;
++    fastmv::WType t;
++    if (src0->type == GGML_TYPE_F16) {
++        if (N > f16_max_rows || src0->nb[0] != 2 || src0->nb[1] != (size_t) K * 2 || K % 8) return false;
++        t = fastmv::WType::F16;
++        a.w_row_bytes = src0->nb[1];
++        a.w_batch_bytes = src0->nb[2];
++    } else if (src0->type == GGML_TYPE_F32) {   // the router (5120 x 384): oneMKL's GEMV otherwise
++        if (src0->nb[0] != 4 || src0->nb[1] != (size_t) K * 4 || K % 8) return false;
++        t = fastmv::WType::F32;
++        a.w_row_bytes = src0->nb[1];
++        a.w_batch_bytes = src0->nb[2];
++    } else if (src0->type == GGML_TYPE_Q6_K && src0->ne[2] == 1 && G == 1 && q6r8) {
++        // a 2-D Q6_K weight: ggml-sycl's lazy reorder (once per tensor; the prompt path reads that layout too), then
++        // fastmv's dp4a kernel against int8 activations (~1.7x ggml-sycl's ESIMD mat-vec at these shapes)
++        if (K % QK_K || src0->nb[0] != sizeof(block_q6_K) || src0->nb[1] != (size_t) (K / QK_K) * sizeof(block_q6_K)) return false;
++        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
++        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++        if (!extra || !extra->optimized_feature.reorder) return false;
++        t = fastmv::WType::Q6K_R8;
++        a.n_blocks_total = N * (K / QK_K);
++        a.w_batch_bytes = 0;
++    } else if (src0->type == GGML_TYPE_Q6_K && src0->ne[2] > 1 && G > 1 && q6r8 && woa &&
++               (slice_planar || larry_slice_view_ok(src0))) {
++        // wo_a: reorder the parent per slice once (the first decode-shaped product, an eager run), then dp4a
++        if (!slice_planar) {
++            const ggml_tensor * par = src0->view_src ? src0->view_src : src0;
++            if (!reorder_qw_q6_k_moe((uint8_t *) par->data, src0->nb[2], src0->ne[2], ctx.stream())) return false;
++            g_larry_slice_planar.insert(src0->data);
++        }
++        t = fastmv::WType::Q6K_R8;
++        a.n_blocks_total = N * (K / QK_K);
++        a.w_batch_bytes = src0->nb[2];
++    } else if (src0->type == GGML_TYPE_Q6_K && src0->ne[2] > 1 && G > 1 && ncols == 1) {
++        // wo_a is a reshaped VIEW of a 2-D tensor: no extra of its own, never reordered by ggml-sycl (src1 is 3-D), and
++        // its prompt path reads the view's (absent) reorder flag - so it stays in the standard layout and is read as is.
++        if (K % QK_K || src0->nb[0] != sizeof(block_q6_K) || src0->nb[1] != (size_t) (K / QK_K) * sizeof(block_q6_K)) return false;
++        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++        if (extra && extra->optimized_feature.reorder) {
++            t = fastmv::WType::Q6K_R;             // a real 3-D tensor ggml-sycl reordered per slice
++            a.n_blocks_total = N * (K / QK_K);
++        } else {
++            t = fastmv::WType::Q6K;
++            a.w_row_bytes = src0->nb[1];
++        }
++        a.w_batch_bytes = src0->nb[2];
++    } else {
++        return false;
++    }
++    a.w = src0->data;
++    a.K = K; a.N = N; a.G = G; a.g_div = G / src0->ne[2];
++    a.x = (const float *) src1->data;
++    a.x_col_stride = (int64_t) (src1->nb[1] / 4); a.x_batch_stride = (int64_t) (src1->nb[2] / 4);
++    a.y = (float *) dst->data;
++    a.y_col_stride = (int64_t) (dst->nb[1] / 4); a.y_batch_stride = (int64_t) (dst->nb[2] / 4);
++    a.ncols = (int) ncols;
++    if (t == fastmv::WType::Q6K_R8) {   // the int8 activations: freed back to the pool after this op is queued (in order)
++        ggml_sycl_pool_alloc<int8_t> xq(ctx.pool(), (size_t) G * ncols * K);
++        ggml_sycl_pool_alloc<float> xd(ctx.pool(), (size_t) G * ncols * K / 32);
++        fastmv::quant_x(*ctx.stream(), a.x, a.x_col_stride, a.x_batch_stride, (int) ncols, G, K, xq.get(), xd.get());
++        a.xq = xq.get();
++        a.xd = xd.get();
++        return fastmv::launch(*ctx.stream(), t, a);
++    }
++    return fastmv::launch(*ctx.stream(), t, a);
++}
++
+ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+ 
+@@ -4747,6 +4879,9 @@
+         ggml_sycl_op_fwht(ctx, src1, dst)) {
+         return;
+     }
++    if (larry_fastmv(ctx, src0, src1, dst)) {
++        return;
++    }
+ 
+     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
+     int64_t min_compute_capability = INT_MAX;
+@@ -5434,6 +5569,15 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -331,10 +1743,77 @@ index b24664a0b..6663558fb 100644
 +        case GGML_OP_DSV41_HC_MIXES:
 +            ggml_sycl_op_dsv41_hc_mixes(ctx, dst);
 +            break;
++        case GGML_OP_DSV41_ROUTER:
++            ggml_sycl_op_dsv41_router(ctx, dst);
++            break;
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -6469,6 +6476,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+@@ -6121,6 +6265,50 @@
+     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+ 
+ #ifdef GGML_SYCL_GRAPH
++    // larry: a graph its caller keeps (cgraph->uid != 0: allocated once, recomputed every step - DeepSeek-V4.1's
++    // per-layer decode graphs) is recorded once into a SYCL graph and replayed.  A small kernel costs ~3.4 us
++    // start-to-start in an in-order queue on the B70 and ~0.85 us inside a replayed graph, and the host submits one
++    // graph instead of every op.  The first run is eager (lazy weight reorders, first-use allocations), the second
++    // records; a recording that throws (an op waited on the host) leaves the graph eager for good.  The VMM pool keeps
++    // the addresses a recording baked in.  GGML_SYCL_GRAPH_CACHE=1 turns it on.
++    static const int graph_cache = ggml_sycl_get_env("GGML_SYCL_GRAPH_CACHE", 0);
++    if (graph_cache && cgraph->uid != 0) {
++        auto & e = sycl_ctx->larry_graphs[cgraph];
++        if (e.uid != cgraph->uid) { e.exec.reset(); e.uid = cgraph->uid; e.runs = 0; e.bad = false; }
++        queue_ptr st = sycl_ctx->stream();
++        if (e.exec) {
++            st->ext_oneapi_graph(*e.exec);
++            return GGML_STATUS_SUCCESS;
++        }
++        if (!e.bad && e.runs++ >= 1) {
++            bool rec_ok = false;
++            try {
++                sycl_ex::command_graph<sycl_ex::graph_state::modifiable> g(*st);
++                g.begin_recording(*st);
++                try {
++                    ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
++                    rec_ok = true;
++                } catch (sycl::exception const & ex) {
++                    GGML_LOG_WARN("%s: graph %p (%d nodes) not recordable: %s - eager\n", __func__, (const void *) cgraph,
++                                  cgraph->n_nodes, ex.what());
++                }
++                g.end_recording();
++                if (rec_ok) {
++                    e.exec = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(g.finalize());
++                    st->ext_oneapi_graph(*e.exec);
++                    return GGML_STATUS_SUCCESS;
++                }
++            } catch (sycl::exception const & ex) {
++                GGML_LOG_WARN("%s: graph %p: %s - eager\n", __func__, (const void *) cgraph, ex.what());
++            }
++            e.bad = true;
++        }
++        ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
++        return GGML_STATUS_SUCCESS;
++    }
++#endif
++
++#ifdef GGML_SYCL_GRAPH
+     bool use_sycl_graph = false;
+     if (g_ggml_sycl_enable_graph) {
+         use_sycl_graph = check_graph_compatibility(cgraph);
+@@ -6229,6 +6417,12 @@
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
+ }
+ 
++void * ggml_backend_sycl_get_queue(ggml_backend_t backend) {
++    if (!ggml_backend_is_sycl(backend)) return nullptr;
++    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
++    return (void *) ctx->stream();
++}
++
+ int ggml_backend_sycl_get_device_count() {
+     return ggml_sycl_info().device_count;
+ }
+@@ -6469,6 +6663,13 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -343,14 +1822,15 @@ index b24664a0b..6663558fb 100644
 +        case GGML_OP_DSV41_HC_MIXES:
 +            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
 +                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
++        case GGML_OP_DSV41_ROUTER:
++            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
          case GGML_OP_LIGHTNING_INDEXER:
              return op->src[0]->type == GGML_TYPE_F32 &&
                  (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
 diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/lightning-indexer.cpp
-index 823b713ca..117b624e3 100644
 --- a/ggml/src/ggml-sycl/lightning-indexer.cpp
 +++ b/ggml/src/ggml-sycl/lightning-indexer.cpp
-@@ -144,7 +144,86 @@ static void lightning_indexer_f32_sycl(
+@@ -144,7 +144,86 @@
          });
  }
  

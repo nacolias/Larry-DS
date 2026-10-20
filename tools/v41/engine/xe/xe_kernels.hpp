@@ -62,6 +62,32 @@ sycl::event xe_sum_parts(sycl::queue& q, const float* parts, int nparts, int n, 
 /// Dequantise `nrows` rows of `type` (n weights each, `row_bytes` apart) into F32 (the parity test).
 sycl::event xe_dequant_rows(sycl::queue& q, int type, const uint8_t* rows, int nrows, int row_bytes, int n, float* y);
 
+// ---- the planar int8 path (xe_planar.cpp): experts stored repacked on the cards, int8 activations, dp4a ----
+
+/// int8 activation rows of n values: q[row * n] (int8), d[row * n / 32] (scale: x ~ d * q), s[row * n / 16] (sum of q
+/// over 16 values).
+struct XeQ8 {
+    int8_t* q = nullptr;
+    float* d = nullptr;
+    int32_t* s = nullptr;
+};
+
+/// The file layout of an expert blob (gate | up | down) -> the planar layout, out of place, same size and offsets.
+sycl::event xe_repack_blob(sycl::queue& q, const uint8_t* src, uint8_t* dst, int gu_type, int d_type, size_t up_off,
+                           size_t down_off, int n_embd, int n_ff);
+/// Quantises `nrows` rows of n f32 values (n % 32 == 0) into `out`.
+sycl::event xe_quant_rows(sycl::queue& q, const float* x, int nrows, int n, XeQ8 out);
+/// xe_experts on PLANAR experts: X quantised (xe_quant_rows of the call's ntok rows), H = scratch [nj][8] rows of n_ff.
+/// max_nt = the most tokens any of the jobs has (0: ntok).
+sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
+                          int n_ff, float swiglu_limit, bool accumulate, int max_nt = 0);
+
+/// xe_experts_y on PLANAR experts (Y: [nj][8][n_embd]; H scratch as above).
+sycl::event xe_experts_y_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H, float* Y, int n_embd, int n_ff,
+                            float swiglu_limit, int max_nt);
+/// xe_dequant_rows_f16 of a PLANAR matrix (nrows rows of n values).
+sycl::event xe_dequant_planar_f16(sycl::queue& q, int type, const uint8_t* mat, int nrows, int n, sycl::half* y);
+
 // ---- the prompt path's GEMM form (an expert with many tokens): fp16 operands for oneMKL's XMX GEMMs ----
 
 /// The same dequantisation into fp16 (row-major [nrows][n]).

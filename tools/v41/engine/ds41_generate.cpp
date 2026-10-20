@@ -26,6 +26,7 @@
 #include "ds41_moe.hpp"
 #if defined(DS41_XE)
 #include "ds41_xe_tier.hpp"   // larry: the multi-card Intel Arc (SYCL) expert tier
+#include "ggml-sycl.h"
 #endif
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
@@ -81,7 +82,12 @@ struct Args {
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
+#if defined(DS41_XE)
+    // larry: no routing prediction (the Xe tier has no prefetch; finish_predict would read a prediction back every layer)
+    double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 0.0;
+#else
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
+#endif
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
     int threads = 0, prefill_chunk = 0, prompt_batch = 8192;   // prompt_batch: layer-major batch B (0 = the chunk path)
     int64_t ctx = 0;
@@ -402,6 +408,8 @@ int main(int argc, char ** argv) {
     }
 #if defined(DS41_XE)
     if (!tier.init(TG, &src, mc, mc.cpu_only ? nullptr : dense.routed_dev(), err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+    // the decode / verify sums on the dense half's queue: no host wait per layer (STRATA_XE_SYNC=1: the tier waits)
+    if (!mc.cpu_only && !std::getenv("STRATA_XE_SYNC")) tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
 #else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
 #endif

@@ -474,12 +474,27 @@ static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mo
 #endif
 }
 
-static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
+// the shared expert (model.py Expert, clamped SwiGLU) on the routed experts' input
+static ggml_tensor * shexp_ffn(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor * fn) {
+    const float lim = (float) im.g.swiglu_limit;
+    ggml_tensor * up = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
+    ggml_tensor * gt = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
+    if (lim > 0) {
+        up = ggml_clamp(gc, up, -lim, lim);
+        gt = ggml_clamp(gc, gt, NEG_INF, lim);
+    }
+    return ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_swiglu_split(gc, gt, up));
+}
+
+// with_shexp = false (larry, decode): the shared expert is left out; attn_router runs it as its own graph (build_shexp)
+// after the router readback, so the dense card computes it while the expert cards compute the routed experts
+static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0,
+                                bool with_shexp = true, int64_t max_nodes = 8192) {
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
     const Ds41Geometry & G = im.g;
     B b { &im, gc, &G };
-    ggml_cgraph * gf = ggml_new_graph_custom(gc, 8192, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, max_nodes, false);
     const int64_t D = im.D, HC = im.HC, DH = im.DH, NH = im.NH, SWA = im.SWA, RAW = im.RAW;
     const int64_t r = L.ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
@@ -645,14 +660,20 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // queries, fattn-dsv4.cpp in larry's ggml-sycl patch) takes any multiple of 16 - padding there only moves bytes
     const char * mqa_env = std::getenv("GGML_SYCL_DSV4_MQA");
     const bool sycl_mqa = im.sycl && n >= 8 && M % 16 == 0 && !(mqa_env && mqa_env[0] == '0');
-    if (!im.cpu && !sycl_mqa && M % 256) {
+    // larry: ggml-sycl's DSV4 decode / verify attention (< 8 queries, fattn-dsv4-dec.hpp) reads f32 keys of any count -
+    // no padding, no key cast (GGML_SYCL_DSV4_DEC=0: the generic path)
+    const char * dec_env = std::getenv("GGML_SYCL_DSV4_DEC");
+    const bool sycl_dec = im.sycl && !sycl_mqa && DH == 512 && NH % 32 == 0 && !(dec_env && dec_env[0] == '0');
+    if (!im.cpu && !sycl_mqa && !sycl_dec && M % 256) {
         const int64_t pad = 256 - M % 256;
         Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
         Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
         M += pad;
     }
-    ggml_tensor * k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
+    ggml_tensor * k4 = ggml_reshape_4d(gc, Kall, DH, M, 1, n);
+    if (!sycl_dec) k4 = ggml_cast(gc, k4, GGML_TYPE_F16);
     ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);    // [DH, 1, NH, n]
+    // the mask stays f16 (ggml_flash_attn_ext asserts it; it is M halves)
     ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
     ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
@@ -714,25 +735,28 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     } else {
         sel = ggml_add(gc, s0, rb);
     }
-    ggml_tensor * ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
-    ggml_tensor * wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
-    if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
-    wts = ggml_scale(gc, wts, (float) G.weights_scale);
-
-    // ---- shared expert (model.py Expert, clamped SwiGLU)
-    const float lim = (float) G.swiglu_limit;
-    ggml_tensor * up = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
-    ggml_tensor * gt = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
-    if (lim > 0) {
-        up = ggml_clamp(gc, up, -lim, lim);
-        gt = ggml_clamp(gc, gt, NEG_INF, lim);
+    ggml_tensor * ids = nullptr, * wts = nullptr;
+    // larry: ggml-sycl's fused Gate (GGML_OP_DSV41_ROUTER: one kernel for the ~11 below) with the flat bias (the default;
+    // STRATA_ROUTER_FUSED=0: the composite).  Its ids are floats; the cpy into o_ids converts them.
+    static const bool fused_router = [] { const char * v = std::getenv("STRATA_ROUTER_FUSED"); return !(v && v[0] == '0'); }();
+    if (im.sycl && fused_router && rb_protect <= 0 && rb_margin < 0.0f) {
+        ggml_tensor * ro = ggml_dsv41_router(gc, rl, im.BL(il, "exp_probs_b.bias"), ggml_reshape_1d(gc, rb, im.NE), (int) im.NU,
+                                             G.norm_topk, (float) G.weights_scale);   // [2 NU, n]
+        ids = ggml_view_2d(gc, ro, im.NU, n, ro->nb[1], 0);
+        wts = ggml_view_2d(gc, ro, im.NU, n, ro->nb[1], (size_t) im.NU * 4);
+    } else {
+        ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
+        wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
+        if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
+        wts = ggml_scale(gc, wts, (float) G.weights_scale);
     }
-    ggml_tensor * se = ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_swiglu_split(gc, gt, up));
+
+    // ---- shared expert
+    if (with_shexp) outs.push_back(ggml_cpy(gc, shexp_ffn(im, gc, il, fn), b.cols2(im.shexp, D, n, col0)));
 
     outs.push_back(ggml_cpy(gc, h, b.cols3(im.hap, D, HC, n, col0)));
     outs.push_back(ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, n, col0)));
     outs.push_back(ggml_cpy(gc, ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0)));
-    outs.push_back(ggml_cpy(gc, se, b.cols2(im.shexp, D, n, col0)));
     outs.push_back(ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)));
     outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
     outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
@@ -842,6 +866,15 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     *out = ggml_argsort_top_k(gc, sc, 16);
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
+    return gf;
+}
+
+// the shared expert of layer il on o_fn (what build_attn(with_shexp = false) wrote) into shexp
+static ggml_cgraph * build_shexp(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
+    B b { &im, gc, &im.g };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
+    const int64_t D = im.D;
+    ggml_build_forward_expand(gf, ggml_cpy(gc, shexp_ffn(im, gc, il, b.cols2(im.o_fn, D, n, col0)), b.cols2(im.shexp, D, n, col0)));
     return gf;
 }
 
@@ -1292,8 +1325,32 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     return true;
 }
 
+// larry: the kept graphs (per layer, cap and pass width) only ever accumulate in gctx; when it is more than 60 % used
+// (a long serve session: verify passes of several widths across many cap buckets) they all go and are rebuilt lazily -
+// at a pass's start, when no graph of the previous one is held
+static void reset_kept_graphs(Ds41Dense::Impl & im) {
+    ggml_backend_synchronize(im.backend);
+    im.graphs.clear();
+    im.logits_out.clear();
+    im.predict_out.clear();
+    im.predict_out_n.clear();
+    im.fpredict_out.clear();
+    im.fpredict_ahead.clear();
+    for (Allo * al : { &im.allo_dec, &im.allo_pass }) {
+        al->graph_epoch.clear();
+        al->compute_bufs.clear();
+        ++al->epoch;
+    }
+    const size_t sz = ggml_get_mem_size(im.gctx);
+    ggml_free(im.gctx);
+    ggml_init_params gp = { sz, nullptr, true };
+    im.gctx = ggml_init(gp);
+    std::fprintf(stderr, "ds41_dense: kept graphs reset (their context was full)\n");
+}
+
 bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     Impl & im = *p_;
+    if (im.gctx && ggml_used_mem(im.gctx) > ggml_get_mem_size(im.gctx) / 10 * 6) reset_kept_graphs(im);
     if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
     im.pos0 = pos0;
     im.n = n;
@@ -1302,11 +1359,13 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     // embeddings -> state
     ggml_context * gc = nullptr;
     ggml_cgraph * gf = nullptr;
-    const bool cached = n == 1;
+    static const bool pass_cache = [] { const char * v = std::getenv("STRATA_PASS_CACHE"); return !(v && v[0] == '0'); }();
+    const bool cached = n == 1 || (pass_cache && n <= 8);
     std::vector<uint8_t> meta;
     if (cached) {
-        auto it = im.graphs.find({ -1, 0, 0, 1 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1 }, build_init(im, im.gctx, 1)).first;
+        const Impl::GKey key { -1, 0, 0, (int64_t) n };
+        auto it = im.graphs.find(key);
+        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_init(im, im.gctx, n)).first;
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
@@ -1490,11 +1549,17 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const int64_t cap = r ? im.pass_cap[r] : 0;
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
-    const bool cached = n == 1;
+    // larry: verify passes (n <= 8) keep their graphs too, one per (layer, cap, width) - built and allocated once, not
+    // per layer per pass (STRATA_PASS_CACHE=0: rebuilt every call, as before)
+    static const bool pass_cache = [] { const char * v = std::getenv("STRATA_PASS_CACHE"); return !(v && v[0] == '0'); }();
+    const bool cached = n == 1 || (pass_cache && n <= 8);
+    // larry: decode runs the shared expert as its own graph after the readback (STRATA_SHEXP_INLINE=1: in the attention graph)
+    static const bool split_shexp = std::getenv("STRATA_SHEXP_INLINE") == nullptr;
     if (cached) {
-        const Impl::GKey key { il, 1, cap, 1 };
+        const Impl::GKey key { il, 1, cap, (int64_t) n };
         auto it = im.graphs.find(key);
-        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
+        // a kept graph is a few hundred nodes: room for 2048 (the gctx holds hundreds of them: layers x caps x widths)
+        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n, 0, !split_shexp, 2048)).first;
         gf = it->second;
     } else {
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
@@ -1514,6 +1579,12 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
     *fn_host = im.host_fn.data();
     if (fn_dev) *fn_dev = im.o_fn;
+    if (cached && split_shexp) {   // queued now: it runs on this card while the tier's cards run the routed experts
+        const Impl::GKey key { il, 7, 0, (int64_t) n };
+        auto it = im.graphs.find(key);
+        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_shexp(im, im.gctx, il, n)).first;
+        if (!im.compute(it->second, true)) return false;
+    }
     return true;
 }
 
@@ -1561,11 +1632,13 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
-    const bool cached = n == 1;
+    static const bool pass_cache = [] { const char * v = std::getenv("STRATA_PASS_CACHE"); return !(v && v[0] == '0'); }();
+    const bool cached = n == 1 || (pass_cache && n <= 8);
     std::vector<uint8_t> meta;
     if (cached) {
-        auto it = im.graphs.find({ -1, 2, 0, 1 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1 }, build_finish(im, im.gctx, 1)).first;
+        const Impl::GKey key { -1, 2, 0, (int64_t) n };
+        auto it = im.graphs.find(key);
+        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_finish(im, im.gctx, n)).first;
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));

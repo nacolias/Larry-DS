@@ -10,7 +10,7 @@ if(TARGET ggml-sycl AND TARGET ds41_dense AND TARGET ds41_moe_cpu)
     else()
         set(_xe_sycl -fsycl)
     endif()
-    add_library(ds41_xe SHARED ${_xe_dir}/xe_kernels.cpp ${_xe_dir}/ds41_xe_tier.cpp)
+    add_library(ds41_xe SHARED ${_xe_dir}/xe_kernels.cpp ${_xe_dir}/xe_planar.cpp ${_xe_dir}/ds41_xe_tier.cpp)
     target_include_directories(ds41_xe PUBLIC ${_xe_dir} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_v41_dir})
     find_package(MKL CONFIG REQUIRED)   # oneMKL SYCL BLAS: the prompt path's fp16 GEMMs
     target_link_libraries(ds41_xe PRIVATE ds41_moe_cpu strata_kernels_cpu ggml-cpu ggml-base MKL::MKL_SYCL::BLAS)

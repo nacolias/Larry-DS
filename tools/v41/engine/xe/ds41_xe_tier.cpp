@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -78,6 +79,10 @@ struct XeCard {
     float* part_host = nullptr;     ///< [8][n_embd]
     float* dslots = nullptr;        ///< dense card only: [cards + 1][8][n_embd], every card's decode part (+ the CPU's)
     bool busy = false;              ///< this call enqueued work on it
+    sycl::event stage_ev;           ///< the last copy out of stage_host (async decode: wait before refilling it)
+    /// decode / verify: the card's command sequence of a call (stage copy, quantise, gate/up, down, copy to the dense
+    /// card's slot) recorded once per shape (jobs, tokens, kernel variant) and replayed - one submission, not five
+    std::map<uint32_t, std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> dgraphs;
     // prompt-chunk scratch (grown on demand)
     float* cX = nullptr; size_t cX_cap = 0;          ///< floats
     float* cOUT = nullptr; size_t cOUT_cap = 0;      ///< floats
@@ -88,6 +93,12 @@ struct XeCard {
     uint8_t* gscratch = nullptr; size_t gscratch_cap = 0;  ///< the GEMM path's operands (bytes)
     float* cX2 = nullptr; size_t cX2_cap = 0;              ///< the dense card's copy of the other cards' sum
     uint8_t* bounce = nullptr; size_t bounce_cap = 0;      ///< pinned staging for streamed experts in pageable memory
+    // the planar int8 path (xe_planar.cpp): every expert a card holds is stored repacked
+    uint8_t* rstage = nullptr;      ///< [blob_max]: a file-layout blob on its way to its planar slot
+    std::mutex rmu;                 ///< makes (copy into rstage, repack out of it) one unit for concurrent uploaders
+    xe::XeQ8 xq, hq;                ///< decode / verify: X [8][n_embd], H [kMaxDecodeJobs][8][n_ff]
+    xe::XeQ8 cxq; size_t cxq_rows = 0;   ///< prompt chunks: X [n][n_embd]
+    xe::XeQ8 chq; int chq_jobs = 0;      ///< prompt chunks: H [jobs][8][n_ff]
 
     uint8_t* alloc_expert(size_t bytes) {
         if (slabs.empty() || slab_used + bytes > kSlab) {
@@ -151,6 +162,11 @@ struct Ds41XeImpl {
     std::vector<uint8_t> ftmp;             ///< file-tier reads (decode)
     Ds41MoeStats st;
     std::mutex mu;
+    bool planar = true;                ///< STRATA_XE_PLANAR (default 1): experts repacked on the cards, int8 kernels
+    bool tier_graphs = true;           ///< STRATA_XE_GRAPH (default 1): decode / verify card work as replayed SYCL graphs
+    sycl::queue* dense_q = nullptr;    ///< set_dense_queue: decode sums go there, no host wait
+    sycl::event last_sum;              ///< the previous decode call's sum on dense_q (its slots / stages are reused)
+    sycl::event hsum_ev;               ///< the copy of hsum (the CPU part) into the dense card's slot
 
     int64_t key(int64_t l, int64_t e) const { return l * g.n_experts + e; }
     int cls(int64_t l, int64_t e) const { return g.cls(l, e); }
@@ -172,6 +188,26 @@ XeJob make_job(const Ds41XeImpl& im, int64_t l, int64_t e, const uint8_t* dptr) 
     j.d_row = (uint16_t) f.d_row;
     j.nt = 0;
     return j;
+}
+
+/// Copies the file-layout blob of (l, e) at `src` (host USM, or device-readable) into its planar slot `dst` on card
+/// `c`: through c.rstage, repacked there (in queue order: the next upload's copy waits for this repack).  Returns the
+/// copy's event (`src` is free once it completes).
+sycl::event upload_planar(const Ds41XeImpl& im, XeCard& c, int64_t l, int64_t e, const uint8_t* src, uint8_t* dst) {
+    const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
+    if (!im.planar) return c.q.memcpy(dst, src, f.bytes);
+    std::lock_guard<std::mutex> lk(c.rmu);
+    sycl::event ev = c.q.memcpy(c.rstage, src, f.bytes);
+    xe::xe_repack_blob(c.q, c.rstage, dst, f.gu_type, f.d_type, f.up_off, f.down_off, (int) im.g.n_embd, (int) im.g.n_ff);
+    return ev;
+}
+
+bool alloc_q8(xe::XeQ8& a, size_t rows, size_t n, sycl::queue& q) {
+    if (a.q) { sycl::free(a.q, q); sycl::free(a.d, q); sycl::free(a.s, q); }
+    a.q = sycl::malloc_device<int8_t>(rows * n, q);
+    a.d = sycl::malloc_device<float>(rows * n / 32, q);
+    a.s = sycl::malloc_device<int32_t>(rows * n / 16, q);
+    return a.q && a.d && a.s;
 }
 
 /// Where the host copy of (l, e) is: the arena, or (file tier) a read into `tmp`.
@@ -230,6 +266,8 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
     im.cfg = cfg;
     im.blobs = blobs;
     im.L = geom.swiglu_limit;
+    im.planar = env_i("STRATA_XE_PLANAR", 1) != 0;
+    im.tier_graphs = env_i("STRATA_XE_GRAPH", 1) != 0;
     const int64_t NCL = geom.n_classes();
     im.fl.assign((size_t) NCL, cpu::NativeFmt());
     im.bl.assign((size_t) NCL, 0);
@@ -306,6 +344,11 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
         c.OUT = sycl::malloc_device<float>((size_t) 2 * kMaxJobTok * H, c.q);
         c.part_host = sycl::malloc_host<float>((size_t) kMaxJobTok * H, c.q);
         if (!c.stage_dev || !c.stage_host || !c.H || !c.OUT || !c.part_host) { err = "xe tier: scratch allocation failed"; return false; }
+        c.rstage = sycl::malloc_device<uint8_t>((size_t) im.blob_max, c.q);
+        if (!c.rstage || !alloc_q8(c.xq, kMaxJobTok, (size_t) H, c.q) || !alloc_q8(c.hq, (size_t) kMaxDecodeJobs * kMaxJobTok, (size_t) F, c.q)) {
+            err = "xe tier: int8 scratch allocation failed";
+            return false;
+        }
         if (c.dense) {
             c.dslots = sycl::malloc_device<float>((im.cards.size() + 1) * kMaxJobTok * H, c.q);
             if (!c.dslots) { err = "xe tier: slot allocation failed"; return false; }
@@ -478,7 +521,7 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         const auto& le = dev_list[k];
         const size_t key = (size_t) im.key(le.first, le.second);
         XeCard& c = *im.cards[(size_t) im.card_of[key]];
-        c.q.memcpy((void*) im.dptr[key], buf, im.bbytes(le.first, le.second)).wait();
+        upload_planar(im, c, le.first, le.second, buf, (uint8_t*) im.dptr[key]).wait();
     });
     const double t1 = now_ms();
     read_all(im, in_arena, nth, [&](size_t k, const uint8_t* buf) {
@@ -532,11 +575,11 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         uint8_t* p = c.alloc_expert(b);
         if (!p) break;
         if (sycl::get_pointer_type(im.aptr[key], im.ctx) == sycl::usm::alloc::host) {
-            c.q.memcpy(p, im.aptr[key], b);
+            upload_planar(im, c, le.first, le.second, im.aptr[key], p);
         } else {
             if (hused + b > half) { hcur ^= 1; hused = 0; hev[hcur].wait(); }
             std::memcpy(c.bounce + (size_t) hcur * half + hused, im.aptr[key], b);
-            hev[hcur] = c.q.memcpy(p, c.bounce + (size_t) hcur * half + hused, b);
+            hev[hcur] = upload_planar(im, c, le.first, le.second, c.bounce + (size_t) hcur * half + hused, p);
             hused += (b + 255) & ~(size_t) 255;
         }
         im.card_of[key] = (int8_t) c.idx;
@@ -552,6 +595,7 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
 }
 
 void Ds41XeTier::set_slot_gib(double gib) { im_->slot_gib = gib; }
+void Ds41XeTier::set_dense_queue(void* q) { im_->dense_q = (sycl::queue*) q; }
 void Ds41XeTier::set_cache_enabled(bool on) { im_->cache_enabled = on; }
 
 void Ds41XeTier::release_cache() {
@@ -628,10 +672,20 @@ void cpu_ents(Ds41XeImpl& im, int64_t l, const std::vector<const Ent*>& ents, co
     im.st.cpu_ms += now_ms() - t0;
 }
 
+/// A card's share of a decode / verify call: its n jobs (staged in c.stage_dev, X at xoff) into dst [nt][n_embd].
+sycl::event card_experts(Ds41XeImpl& im, XeCard& c, int n, int nt, int max_nt, size_t xoff, float* dst) {
+    const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
+    const XeJob* jobs = (const XeJob*) c.stage_dev;
+    const float* X = (const float*) (c.stage_dev + xoff);
+    if (!im.planar) return xe::xe_experts(c.q, jobs, n, nt, X, c.H, dst, H, F, im.L, false);
+    xe::xe_quant_rows(c.q, X, nt, H, c.xq);
+    return xe::xe_experts_q8(c.q, jobs, n, nt, c.xq, c.hq, dst, H, F, im.L, false, max_nt);
+}
+
 /// One decode / verify call: nt <= 8 tokens.  out_host (nt x n_embd) or out_dev (the dense card) gets the sum.
 bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const float* w, const float* x, float* out_host,
                void* out_dev) {
-    const int64_t H = im.g.n_embd, F = im.g.n_ff;
+    const int64_t H = im.g.n_embd;
     const int K = (int) im.g.top_k;
     const double t0 = now_ms();
     static thread_local std::vector<Ent> ents;
@@ -640,8 +694,11 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     // per card: its jobs; the rest: the CPU pool
     std::vector<const Ent*> cpu_list;
     const size_t NC = im.cards.size();
-    std::vector<int> nj(NC, 0);
-    for (auto& cp : im.cards) cp->busy = false;
+    std::vector<int> nj(NC, 0), mnt(NC, 0);
+    for (auto& cp : im.cards) {
+        cp->busy = false;
+        if (im.dense_q) cp->stage_ev.wait();   // a back-to-back call (no dense sync between): its stage copy is done
+    }
     for (const Ent& en : ents) {
         const size_t key = (size_t) im.key(l, en.e);
         const int c = im.card_of[key];
@@ -653,11 +710,16 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         for (int s = 0; s < en.nt; ++s) { j.tok[s] = en.tok[s]; j.w[s] = en.w[s]; }
         std::memcpy(cd.stage_host + (size_t) nj[(size_t) c] * sizeof(XeJob), &j, sizeof(XeJob));
         ++nj[(size_t) c];
+        mnt[(size_t) c] = std::max(mnt[(size_t) c], en.nt);
         im.st.hits += 1;
     }
     const size_t xoff = (kMaxDecodeJobs * sizeof(XeJob) + kStageAlign - 1) / kStageAlign * kStageAlign;
     const size_t n_out = (size_t) nt * H;
     XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
+    static const bool sprof = env_i("STRATA_XE_PROF", 0) != 0;
+    static double sp[5] = {0, 0, 0, 0, 0};
+    static int64_t sp_n = 0, sp_jobs = 0;
+    double ts0 = sprof ? now_ms() : 0;
     if (out_dev && dc) {
         // DEVICE OUTPUT (every decode / verify step): each card's part goes straight into the dense card's slot
         // (card-to-card copy), the CPU pool's part into the last slot, and one sum kernel on the dense card - which
@@ -671,37 +733,94 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             if (n == 0) continue;
             c.busy = true;
             std::memcpy(c.stage_host + xoff, x, n_out * 4);
-            c.q.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);   // jobs and X in one copy
             float* dst = c.dense ? slots + (size_t) c.idx * kMaxJobTok * H : c.OUT;
-            sycl::event ev = xe::xe_experts(c.q, (const XeJob*) c.stage_dev, n, nt, (const float*) (c.stage_dev + xoff),
-                                            c.H, dst, (int) H, (int) F, im.L, false);
-            if (!c.dense) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
+            const int mv = mnt[(size_t) c.idx] <= 1 ? 1 : mnt[(size_t) c.idx] <= 2 ? 2 : mnt[(size_t) c.idx] <= 4 ? 4 : 8;
+            // the whole sequence; its first command waits for `prev` (the previous call's sum reads the slots this
+            // call's cards write) unless it is being recorded (a replay carries that dependency instead)
+            auto enqueue = [&](const sycl::event* prev) {
+                if (prev) {
+                    c.q.submit([&](sycl::handler& h) {
+                        h.depends_on(*prev);
+                        h.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);   // jobs and X in one copy
+                    });
+                } else {
+                    c.q.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);
+                }
+                sycl::event ev = card_experts(im, c, n, nt, mv, xoff, dst);
+                if (!c.dense) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
+                return ev;
+            };
+            sycl::event ev;
+            if (im.dense_q && im.planar && im.tier_graphs && nt == 1) {   // decode; verify shapes vary too much to amortise a recording
+                namespace sx = sycl::ext::oneapi::experimental;
+                const uint32_t key = (uint32_t) n | ((uint32_t) nt << 8) | ((uint32_t) mv << 12);
+                auto it = c.dgraphs.find(key);
+                if (it == c.dgraphs.end()) {
+                    sx::command_graph<sx::graph_state::modifiable> g(c.q.get_context(), c.q.get_device());
+                    g.begin_recording(c.q);
+                    enqueue(nullptr);
+                    g.end_recording();
+                    it = c.dgraphs.emplace(key, std::make_unique<sx::command_graph<sx::graph_state::executable>>(g.finalize())).first;
+                }
+                const sycl::event prev = im.last_sum;
+                sx::command_graph<sx::graph_state::executable>& eg = *it->second;
+                ev = c.q.submit([&](sycl::handler& h) {
+                    h.depends_on(prev);
+                    h.ext_oneapi_graph(eg);
+                });
+                c.stage_ev = ev;   // the stage copy is inside: the whole replay must be done before stage_host is refilled
+            } else if (im.dense_q) {
+                const sycl::event prev = im.last_sum;
+                ev = enqueue(&prev);
+                c.stage_ev = ev;
+            } else {
+                ev = enqueue(nullptr);
+            }
             deps.push_back(ev);
             used.push_back(c.idx);
         }
+        double ts1 = sprof ? now_ms() : 0;
+        sycl::queue& qd = im.dense_q ? *im.dense_q : dc->q;
         if (!cpu_list.empty()) {
             float* hs = im.hsum.data();
+            im.hsum_ev.wait();   // the previous call's copy of hsum has been made
             std::memset(hs, 0, n_out * 4);
             cpu_ents(im, l, cpu_list, x, hs);
-            deps.push_back(dc->q.memcpy(slots + NC * kMaxJobTok * H, hs, n_out * 4));
+            im.hsum_ev = qd.memcpy(slots + NC * kMaxJobTok * H, hs, n_out * 4);
+            deps.push_back(im.hsum_ev);
             used.push_back((int) NC);
         }
+        double ts2 = sprof ? now_ms() : 0;
         float* o = (float*) out_dev;
         if (used.empty()) {
-            dc->q.memset(o, 0, n_out * 4).wait();
+            sycl::event ev = qd.memset(o, 0, n_out * 4);
+            if (im.dense_q) im.last_sum = ev; else ev.wait();
         } else {
             int sl[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             const int ns = (int) used.size();
             for (int k = 0; k < ns && k < 8; ++k) sl[k] = used[(size_t) k];
             const size_t stride = (size_t) kMaxJobTok * H;
-            dc->q.submit([&](sycl::handler& h) {
+            sycl::event ev = qd.submit([&](sycl::handler& h) {
                 h.depends_on(deps);
                 h.parallel_for(sycl::range<1>(n_out), [=](sycl::id<1> i) {
                     float sum = 0.0f;
                     for (int k = 0; k < ns; ++k) sum += slots[(size_t) sl[k] * stride + i];
                     o[i] = sum;
                 });
-            }).wait();
+            });
+            if (im.dense_q) im.last_sum = ev; else ev.wait();
+        }
+        if (sprof) {
+            const double ts3 = now_ms();
+            sp[0] += ts0 - t0;      // grouping + job building (before the cards' submissions)
+            sp[1] += ts1 - ts0;     // the cards' submissions
+            sp[2] += ts2 - ts1;     // CPU-pool experts
+            sp[3] += ts3 - ts2;     // sum submission + wait for everything
+            for (int c = 0; c < (int) NC; ++c) sp_jobs += nj[(size_t) c];
+            if (++sp_n % 2000 == 0)
+                std::fprintf(stderr, "xe decode prof (%lld calls, %.2f card jobs/call): per call prep %.1f us, submit %.1f us, cpu %.1f us, "
+                             "sum+wait %.1f us = %.1f us\n", (long long) sp_n, (double) sp_jobs / sp_n, 1e3 * sp[0] / sp_n,
+                             1e3 * sp[1] / sp_n, 1e3 * sp[2] / sp_n, 1e3 * sp[3] / sp_n, 1e3 * (sp[0] + sp[1] + sp[2] + sp[3]) / sp_n);
         }
         im.st.wall_ms += now_ms() - t0;
         return true;
@@ -713,8 +832,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         c.busy = true;
         std::memcpy(c.stage_host + xoff, x, n_out * 4);
         c.q.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);
-        xe::xe_experts(c.q, (const XeJob*) c.stage_dev, n, nt, (const float*) (c.stage_dev + xoff), c.H, c.OUT,
-                       (int) H, (int) F, im.L, false);
+        card_experts(im, c, n, nt, mnt[(size_t) c.idx], xoff, c.OUT);
         c.q.memcpy(c.part_host, c.OUT, n_out * 4);
     }
     float* hs = im.hsum.data();
@@ -974,6 +1092,8 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 return im.card_of[key] >= 0 ? im.dptr[key] : c.stream + soff[(size_t) e];
             };
             auto in_round = [&](int32_t e) { return im.card_of[(size_t) im.key(l, e)] >= 0 ? r == 0 : round_of[(size_t) e] == r; };
+            // resident experts are stored planar (int8 kernels); streamed ones arrive in the file layout (F32 kernels)
+            auto is_planar = [&](int32_t e) { return im.planar && im.card_of[(size_t) im.key(l, e)] >= 0; };
             // ---- the GEMM experts of this round
             std::vector<int32_t> ge;
             int64_t gm_max = 0, gp = 0;
@@ -1022,13 +1142,18 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     const int64_t m = (int64_t) by_e[(size_t) e].size();
                     const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
                     const uint8_t* blob = dptr_of(e);
+                    const bool pl = is_planar(e);
+                    auto deq = [&](int type, const uint8_t* mat, int64_t rows, size_t row_b, int64_t nv, sycl::half* out) {
+                        if (pl) xe::xe_dequant_planar_f16(c.q, type, mat, (int) rows, (int) nv, out);
+                        else xe::xe_dequant_rows_f16(c.q, type, mat, (int) rows, (int) row_b, (int) nv, out);
+                    };
                     xe::xe_gather_rows_f16(c.q, c.cX, dtok + base, (int) m, (int) H, Xg);
-                    xe::xe_dequant_rows_f16(c.q, f.gu_type, blob, (int) F, (int) f.gu_row, (int) H, Wgu);
-                    xe::xe_dequant_rows_f16(c.q, f.gu_type, blob + f.up_off, (int) F, (int) f.gu_row, (int) H, Wgu + (size_t) F * H);
+                    deq(f.gu_type, blob, F, f.gu_row, H, Wgu);
+                    deq(f.gu_type, blob + f.up_off, F, f.gu_row, H, Wgu + (size_t) F * H);
                     mkl::blas::row_major::gemm(c.q, mkl::transpose::nontrans, mkl::transpose::trans, m, 2 * F, H, 1.0f, Xg, H,
                                                Wgu, H, 0.0f, G, 2 * F);
                     xe::xe_swiglu_f16(c.q, G, (int) m, (int) F, im.L, Hh);
-                    xe::xe_dequant_rows_f16(c.q, f.d_type, blob + f.down_off, (int) H, (int) f.d_row, (int) F, Wd);
+                    deq(f.d_type, blob + f.down_off, H, f.d_row, F, Wd);
                     mkl::blas::row_major::gemm(c.q, mkl::transpose::nontrans, mkl::transpose::trans, m, H, F, 1.0f, Hh, F,
                                                Wd, F, 0.0f, Yg + (size_t) base * H, H);
                     base += m;
@@ -1041,40 +1166,74 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 g_bp.gemm_e += (int64_t) ge.size();
                 lap(g_bp.gemm_us);
             }
-            // ---- the small experts of this round: mat-vec jobs of <= 8 tokens, in batches of BJ
-            std::vector<XeJob> jobs;
-            std::vector<std::vector<int32_t>> jslots;
+            // ---- the small experts of this round: mat-vec jobs of <= 8 tokens, in batches of BJ; planar and file-layout
+            // jobs in separate batches (their kernels differ)
+            std::vector<XeJob> jobs, jobs_raw;
+            std::vector<std::vector<int32_t>> jslots, jslots_raw;
             for (int32_t e : cl[(size_t) c.idx]) {
                 if (!in_round(e) || (int) by_e[(size_t) e].size() >= gemm_min) continue;
                 const auto& v = by_e[(size_t) e];
+                const bool pl = is_planar(e);
                 for (size_t i0 = 0; i0 < v.size(); i0 += kMaxJobTok) {
                     XeJob j = make_job(im, l, e, dptr_of(e));
                     j.nt = (uint8_t) std::min<size_t>(kMaxJobTok, v.size() - i0);
                     std::vector<int32_t> sl;
                     for (int s = 0; s < j.nt; ++s) { j.tok[s] = v[i0 + s] / K; j.w[s] = 1.0f; sl.push_back(v[i0 + s]); }
-                    jobs.push_back(j);
-                    jslots.push_back(sl);
+                    (pl ? jobs : jobs_raw).push_back(j);
+                    (pl ? jslots : jslots_raw).push_back(sl);
                 }
                 if (im.card_of[(size_t) im.key(l, e)] >= 0) ++hits;
             }
-            for (size_t b0 = 0; b0 < jobs.size(); b0 += (size_t) BJ) {
-                const size_t nb = std::min<size_t>((size_t) BJ, jobs.size() - b0);
-                c.q.wait();   // cjobs (shared memory) and cS are read by the previous batch / the GEMM gather
-                std::fill(S.begin(), S.end(), -1);
-                for (size_t q = 0; q < nb; ++q) {
-                    c.cjobs[q] = jobs[b0 + q];
-                    const auto& sl = jslots[b0 + q];
-                    for (size_t s = 0; s < sl.size(); ++s) S[(size_t) sl[s]] = (int32_t) (q * kMaxJobTok + s);
-                }
-                {
+            bool xq_done = false;
+            auto run_jobs = [&](const std::vector<XeJob>& js, const std::vector<std::vector<int32_t>>& jss, bool pl) -> bool {
+                for (size_t b0 = 0; b0 < js.size(); b0 += (size_t) BJ) {
+                    const size_t nb = std::min<size_t>((size_t) BJ, js.size() - b0);
+                    c.q.wait();   // cjobs (shared memory) and cS are read by the previous batch / the GEMM gather
+                    std::fill(S.begin(), S.end(), -1);
+                    int max_nt = 1;
+                    for (size_t q = 0; q < nb; ++q) {
+                        c.cjobs[q] = js[b0 + q];
+                        max_nt = std::max(max_nt, (int) js[b0 + q].nt);
+                        const auto& sl = jss[b0 + q];
+                        for (size_t s = 0; s < sl.size(); ++s) S[(size_t) sl[s]] = (int32_t) (q * kMaxJobTok + s);
+                    }
+                    if (pl && !xq_done) {   // this chunk's X in int8, once per card per call
+                        if (c.cxq_rows < (size_t) n) {
+                            bool okq;
+                            {
+                                std::lock_guard<std::mutex> lk(g_submit);
+                                okq = alloc_q8(c.cxq, (size_t) n, (size_t) H, c.q);
+                            }
+                            if (!okq) { std::fprintf(stderr, "xe tier: card %d: int8 X allocation failed (n %d)\n", c.idx, n); return false; }
+                            c.cxq_rows = (size_t) n;
+                        }
+                        if (c.chq_jobs < BJ) {
+                            bool okh;
+                            {
+                                std::lock_guard<std::mutex> lk(g_submit);
+                                okh = alloc_q8(c.chq, (size_t) BJ * kMaxJobTok, (size_t) F, c.q);
+                            }
+                            if (!okh) { std::fprintf(stderr, "xe tier: card %d: int8 H allocation failed\n", c.idx); return false; }
+                            c.chq_jobs = BJ;
+                        }
+                        std::lock_guard<std::mutex> lk(g_submit);
+                        xe::xe_quant_rows(c.q, c.cX, n, (int) H, c.cxq);
+                        xq_done = true;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(g_submit);
+                        c.q.memcpy(c.cS, S.data(), S.size() * 4);
+                    }
+                    c.q.wait();
                     std::lock_guard<std::mutex> lk(g_submit);
-                    c.q.memcpy(c.cS, S.data(), S.size() * 4);
+                    if (pl) xe::xe_experts_y_q8(c.q, c.cjobs, (int) nb, c.cxq, c.chq, c.cY, (int) H, (int) F, im.L, max_nt);
+                    else xe::xe_experts_y(c.q, c.cjobs, (int) nb, c.cX, c.cH, c.cY, (int) H, (int) F, im.L);
+                    xe::xe_gather(c.q, c.cY, c.cS, c.cW, n, K, (int) H, c.cOUT, true);
                 }
-                c.q.wait();
-                std::lock_guard<std::mutex> lk(g_submit);
-                xe::xe_experts_y(c.q, c.cjobs, (int) nb, c.cX, c.cH, c.cY, (int) H, (int) F, im.L);
-                xe::xe_gather(c.q, c.cY, c.cS, c.cW, n, K, (int) H, c.cOUT, true);
-            }
+                return true;
+            };
+            if (!run_jobs(jobs, jslots, true) || !run_jobs(jobs_raw, jslots_raw, false)) return false;
+            jobs.insert(jobs.end(), jobs_raw.begin(), jobs_raw.end());
             g_bp.small_j += (int64_t) jobs.size();
             if (!jobs.empty()) lap(g_bp.small_us);
         }
@@ -1136,6 +1295,20 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         }
         if (first) std::memset(out_host, 0, NE * 4);
     }
+    if (const char* dp = std::getenv("STRATA_XE_DUMP_CHUNK")) {   // debug: every chunk call's output (per card too)
+        static std::FILE* df = std::fopen(dp, "wb");
+        if (df) {
+            std::vector<float> hv(NE);
+            for (auto& cp : im.cards) {
+                if (!cp->busy) continue;
+                cp->q.memcpy(hv.data(), cp->cOUT, NE * 4).wait();
+                const int32_t hdr[3] = {(int32_t) l, cp->idx, (int32_t) n};
+                std::fwrite(hdr, 4, 3, df);
+                std::fwrite(hv.data(), 4, NE, df);
+            }
+            std::fflush(df);
+        }
+    }
     if (prof) {
         g_bp.prep += t_prep - t0;
         g_bp.cards += t_cards - t_prep;
@@ -1184,7 +1357,8 @@ void Ds41XeTier::close() {
         auto fr = [&](void* p) { if (p) sycl::free(p, c.q); };
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cH); fr(c.cY); fr(c.stream);
-        fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots);
+        fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots); fr(c.rstage);
+        for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }
     }
     im.cards.clear();
     for (uint8_t* p : im.achunks) {
