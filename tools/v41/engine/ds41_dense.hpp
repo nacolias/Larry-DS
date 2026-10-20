@@ -26,6 +26,8 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -103,6 +105,10 @@ public:
     const int32_t * batch_ids() const;
     const float * batch_wts() const;
     const float * batch_fn() const;
+    /// larry: the fn rows on the device (o_fn, [D, NC] floats on card 0; null on the CPU backend), and whether the
+    /// batch spans read them back into batch_fn() at all (set_fn_host(false): a GPU tier copies them card-to-card)
+    const float * batch_fn_dev() const;
+    void set_fn_host(bool on);
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
@@ -111,6 +117,9 @@ public:
     /// write a layer-major batch's routed sums straight into it (run_chunk_dev) instead of upload_routed's host trip.
     float * routed_dev();
     bool finish_span(int il, int col0, int n);
+    /// larry (pipelined prompt batch): while set, the span calls (attn_router_span[_kv], finish_span) hold this lock
+    /// around their enqueues (not their waits) - the tier's card threads enqueue concurrently
+    void set_submit_lock(std::mutex * m, std::atomic<int> * prio = nullptr);
     /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
     void prof_report(const char * tag);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred

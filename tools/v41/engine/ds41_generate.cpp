@@ -89,7 +89,7 @@ struct Args {
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
 #endif
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
-    int threads = 0, prefill_chunk = 0, prompt_batch = 8192;   // prompt_batch: layer-major batch B (0 = the chunk path)
+    int threads = 0, prefill_chunk = 0, prompt_batch = 16384;  // prompt_batch: layer-major batch B (0 = the chunk path); larry: 16384 (one pipelined batch up to 16K)
     int64_t ctx = 0;
     float temp = 0.0f;
     uint64_t seed = 1;
@@ -932,8 +932,133 @@ int main(int argc, char ** argv) {
                     cut = (cut / SB) * SB;
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
                 }
-                double t0 = now_ms();
+                // larry, STRATA_PIPE (default 1): every layer's columns in two parts, the tier's part overlapping the
+                // dense card's other part:  D(l,0) | join T(l-1,1), F(l-1,1) | launch T(l,0) | D(l,1) | join T(l,0),
+                // F(l,0) | launch T(l,1).  With enc-skip the split moves at layer CL (the previous layer finishes
+                // completely first).  The tier's card threads then enqueue while the dense half does, so the dense
+                // half takes the tier's submit lock around its enqueues.
+                static const bool pipe_env = !(std::getenv("STRATA_PIPE") && std::getenv("STRATA_PIPE")[0] == '0');
+                float * prdev = routed_host ? nullptr : dense.routed_dev();
+                // the parts of layer l's columns: [lo, mid) and [mid, B), one part [lo, B) (mid < 0), or none (lo >= B)
+                auto split_of = [&](int l, int & lo, int & mid) {
+                    lo = (cut > 0 && l >= CL) ? cut : 0;
+                    mid = lo + (int) std::lround((double) (B - lo) / 2.0 / SB) * SB;
+                    if (mid <= lo || mid >= B) mid = -1;
+                };
+                bool pipe = pipe_env && prdev && !mc.cpu_only, any2 = false;
+                int part_max = 0;   // the largest tier call of the batch
                 for (int l = 0; l < n_layer; ++l) {
+                    int lo, mid;
+                    split_of(l, lo, mid);
+                    if (lo >= B) continue;
+                    if (mid > 0) { any2 = true; part_max = std::max(part_max, std::max(mid - lo, B - mid)); }
+                    else part_max = std::max(part_max, B - lo);
+                }
+                pipe = pipe && any2 && part_max <= piece;
+                // larry: the tier streams each layer's arena experts onto the expert cards ahead of its run_chunk_dev
+                // (layers whose tier call has >= STRATA_XE_PREFETCH_MIN tokens; with enc-skip the layers from CL on
+                // run only the phase-B columns)
+                {
+                    static const int pf_min = std::getenv("STRATA_XE_PREFETCH_MIN") ? std::atoi(std::getenv("STRATA_XE_PREFETCH_MIN")) : 2048;
+                    const int nb = cut > 0 ? B - cut : B;
+                    const int pf_last = nb >= pf_min ? n_layer - 1 : (cut > 0 && B >= pf_min ? CL - 1 : -1);
+                    if (pf_last >= 0 && !mc.cpu_only) tier.prefetch_begin(0, pf_last, pipe ? part_max : B);
+                }
+                if (pipe) {
+                    dense.set_submit_lock(&Ds41XeTier::submit_mutex(), &Ds41XeTier::submit_priority());
+                    static const bool xp2p = !(std::getenv("STRATA_XE_XP2P") && std::getenv("STRATA_XE_XP2P")[0] == '0');
+                    const float * fn_dev = xp2p ? dense.batch_fn_dev() : nullptr;
+                    if (fn_dev) dense.set_fn_host(false);
+                    bool inflight = false;
+                    int fl = -1, fa = 0, fb = 0;   // the part whose finish waits for the tier call in flight
+                    auto PD = [&](int l, int a0, int a1) -> bool {
+                        const double t = now_ms();
+                        for (int s = a0; s < a1; s += SB)
+                            if (!dense.attn_router_span(l, s, std::min(SB, a1 - s))) { ferr = dense.last_error(); return false; }
+                        fd_dense += now_ms() - t;
+                        return true;
+                    };
+                    auto PF = [&](int l, int a0, int a1) -> bool {
+                        const double t = now_ms();
+                        for (int s = a0; s < a1; s += SB)
+                            if (!dense.finish_span(l, s, std::min(SB, a1 - s))) { ferr = dense.last_error(); return false; }
+                        fd_dense += now_ms() - t;
+                        return true;
+                    };
+                    // serve DSpark seed (bcap_n > 0): the batch's last bcap_n rows of the state leaving dm_layers[j] (as
+                    // the serial loop's capture), read once that layer's last part is finished
+                    auto PC = [&](int l) -> bool {
+                        if (!(bcap_n > 0 && c0 + B == n)) return true;
+                        for (int j = 0; j < 3; ++j) {
+                            if (l != dm_layers[j]) continue;
+                            const int cn = std::min(bcap_n, B);
+                            bcap_got = cn;
+                            bool okr;
+                            {
+                                Ds41XeTier::submit_priority().fetch_add(1);
+                                std::lock_guard<std::mutex> lk(Ds41XeTier::submit_mutex());
+                                Ds41XeTier::submit_priority().fetch_sub(1);
+                                okr = dense.read_state_cols(B - cn, cn, vx);
+                            }
+                            if (!okr) { ferr = dense.last_error(); return false; }
+                            const size_t HC = vx.size() / ((size_t) cn * n_embd);
+                            for (int t = 0; t < cn; ++t) {
+                                float * dst = bcap_vh.data() + (size_t) (bcap_n - cn + t) * 3 * n_embd + (size_t) j * n_embd;
+                                for (size_t h = 0; h < HC; ++h) {
+                                    const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
+                                    for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                                }
+                            }
+                        }
+                        return true;
+                    };
+                    auto PJ = [&]() -> bool {   // join the tier call in flight, then finish its part
+                        if (!inflight) return true;
+                        inflight = false;
+                        const double t = now_ms();
+                        const bool ok = tier.run_chunk_wait();
+                        fd_tier += now_ms() - t;
+                        if (!ok) { ferr = "tier run refused"; return false; }
+                        return PF(fl, fa, fb) && (fb < B || PC(fl));
+                    };
+                    auto PT = [&](int l, int a0, int a1, bool last) -> bool {
+                        inflight = tier.run_chunk_dev_async(l, a1 - a0, dense.batch_ids() + (size_t) a0 * top_k,
+                                                            dense.batch_wts() + (size_t) a0 * top_k,
+                                                            dense.batch_fn() + (size_t) a0 * n_embd, prdev + (size_t) a0 * n_embd, last,
+                                                            fn_dev ? fn_dev + (size_t) a0 * n_embd : nullptr);
+                        if (!inflight) { ferr = "tier run refused"; return false; }
+                        fl = l; fa = a0; fb = a1;
+                        return true;
+                    };
+                    // two-part layer l:  D(l,0) [T(l-1,1) runs] | join, F(l-1,1) | T(l,0) | D(l,1) [T(l,0) runs] | join,
+                    // F(l,0) | T(l,1).  A one-part layer, an empty one, a moving split and layer CL drain first.
+                    bool okp = true;
+                    int plo = -1, pmid = -2;
+                    for (int l = 0; okp && l < n_layer; ++l) {
+                        int lo, mid;
+                        split_of(l, lo, mid);
+                        if (mid < 0 || lo != plo || mid != pmid || (cut > 0 && l == CL)) okp = PJ();
+                        if (okp && cut > 0 && l == CL) {
+                            const double t = now_ms();
+                            for (int s = 0; okp && s < cut; s += SB)
+                                if (!dense.attn_router_span_kv(l, s, std::min(SB, cut - s))) { ferr = dense.last_error(); okp = false; }
+                            fd_dense += now_ms() - t;
+                        }
+                        if (okp && lo < B) {
+                            if (mid < 0) okp = PD(l, lo, B) && PT(l, lo, B, true);
+                            else okp = PD(l, lo, mid) && PJ() && PT(l, lo, mid, false) && PD(l, mid, B) && PJ() && PT(l, mid, B, true);
+                        }
+                        plo = lo;
+                        pmid = mid;
+                    }
+                    okp = okp && PJ();
+                    if (!okp) tier.run_chunk_wait();   // never leave the tier thread running
+                    dense.set_submit_lock(nullptr);
+                    dense.set_fn_host(true);
+                    if (!okp) { tier.prefetch_end(); return false; }
+                }
+                double t0 = now_ms();
+                for (int l = 0; !pipe && l < n_layer; ++l) {
                     if (l < 4) vram_log("batch layer", l);
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state
@@ -993,6 +1118,7 @@ int main(int argc, char ** argv) {
                         }
                     }
                 }
+                tier.prefetch_end();
                 fd_dense += now_ms() - t0;
                 const double tl = now_ms();
                 if (all_logits) {   // every row, one sub-batch at a time (a B-wide head would need a ~2 GiB buffer)
@@ -1773,6 +1899,7 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,
                  (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
+    dense.prof_report("prompt");
     std::fprintf(stderr, "prompt split: dense %.1f s, experts %.1f s (file wait %.1f s), logits %.1f s\n", fd_dense / 1000.0,
                  fd_tier / 1000.0, pst.file_ms / 1000.0, fd_logits / 1000.0);
     if (a.ppl) {

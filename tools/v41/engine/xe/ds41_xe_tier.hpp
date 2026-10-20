@@ -27,6 +27,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 namespace strata::v41 {
 
@@ -73,6 +75,23 @@ public:
     static bool keep_cache_mode() { return false; }
     bool release_prestage() { return false; }
     void release_chunk() {}
+    /// larry, STRATA_XE_PREFETCH (default 1): a layer-major prompt batch whose layers first..last each run one
+    /// run_chunk_dev of >= STRATA_XE_PREFETCH_MIN (2048) tokens declares them here; the tier then streams every arena
+    /// expert of layer l + 1 onto the expert cards (a copy queue per card; pageable experts staged into pinned memory
+    /// by a helper thread first) while layer l computes and the dense card runs layer l + 1, and run_chunk_dev(l + 1)
+    /// reads them in place.  prefetch_end() after the batch (frees the cards' buffers).  Returns false = off.
+    bool prefetch_begin(int64_t first, int64_t last, int n_call);
+    void prefetch_end();
+    /// larry (pipelined prompt batch, STRATA_PIPE): run_chunk_dev on a tier thread - returns at once, run_chunk_wait()
+    /// joins it (false = the call failed).  `last_of_layer`: the layer's last call (its prefetch slot is recycled then).
+    bool run_chunk_dev_async(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev,
+                             bool last_of_layer, const float* x_dev = nullptr);   ///< x_dev: X on the dense card (copied card-to-card)
+    bool run_chunk_wait();
+    /// The lock around every SYCL enqueue of the tier's threads; the dense half takes it too while a pipelined batch
+    /// has a tier call in flight (the Level Zero driver has deadlocked / faulted under concurrent enqueues).
+    static std::mutex& submit_mutex();
+    /// While > 0 the tier's threads hold off taking the submit lock (the dense half increments it while it waits).
+    static std::atomic<int>& submit_priority();
 
     void prefetch(int64_t, const int32_t*, int = 16) {}
     void prefetch_multi(int64_t, const int32_t*, int, int) {}
