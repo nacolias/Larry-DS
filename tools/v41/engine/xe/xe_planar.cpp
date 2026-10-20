@@ -333,6 +333,7 @@ sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H
             const int row = r0 + s * 4 + rg;
             const XeJob& jb = jobs[j];
             const int nt = jb.nt;
+            if (nt == 0) return;   // a null job (a replayed graph's padding): the whole work-group leaves together
             const XSet xs{X.q, X.d, X.s, n_embd};
             int rows[NT];
 #pragma unroll
@@ -438,6 +439,7 @@ sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq
         for (int j = 0; j < nj; ++j) {
             const XeJob& jb = jobs[j];
             const int nt = jb.nt;
+            if (nt == 0) continue;   // a null job (padding)
             int rows[NT];
 #pragma unroll
             for (int t = 0; t < NT; ++t) rows[t] = j * kMaxJobTok + (t < nt ? t : 0);

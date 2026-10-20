@@ -484,12 +484,13 @@ diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fastmv.cpp
-@@ -0,0 +1,555 @@
+@@ -0,0 +1,585 @@
 +// ggml-sycl/fastmv.cpp - see fastmv.hpp.
 +#include "fastmv.hpp"
 +
 +#include <algorithm>
 +#include <cstdlib>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 +
 +namespace fastmv {
 +namespace {
@@ -500,6 +501,9 @@ new file mode 100644
 +
 +inline float h2f(sycl::half h) { return (float) h; }
 +
++#ifndef SYCL_EXTERNAL   // larry: -fno-sycl-rdc builds leave it undefined; the IGC builtins need only the device attribute
++#define SYCL_EXTERNAL __attribute__((sycl_device))
++#endif
 +#ifdef __SYCL_DEVICE_ONLY__
 +extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_ss(int c, int a, int b, bool sat) __attribute__((const));
 +#endif
@@ -779,7 +783,7 @@ new file mode 100644
 +// Q6K_R8 against several int8 columns (verify passes): each lane group owns R rows and loads every column's
 +// activations once for all of them - the single-row kernel re-reads ~8x its weight bytes of activations from L1 at
 +// 5 columns, which caps it near 300 GB/s.  Units and lanes as the generic kernel (LPR lanes per row group).
-+template <int NT, int LPR, int R>
++template <int NT, int LPR, int R, bool BIG>   // BIG: the 256-register mode (half the threads per EU, no spills)
 +void run_r8m(sycl::queue & q, const Args & a, int KS, int RW) {
 +    const int64_t K = a.K, N = a.N, G = a.G;
 +    const int64_t upr = K / 32, bpr = K / 256;
@@ -791,7 +795,7 @@ new file mode 100644
 +    const Args A = a;
 +    q.submit([&](sycl::handler & h) {
 +        sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) (KS > 1 ? RW * KS * R * NT : 1)), h);
-+        h.parallel_for(sycl::nd_range<2>(gr, lr), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
++        auto kern = [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
 +            const int64_t g = (int64_t) it.get_global_id(0);
 +            const int lid = (int) it.get_local_id(1);
 +            const int grp = lid / LPR, lane = lid % LPR;
@@ -899,11 +903,17 @@ new file mode 100644
 +                    }
 +                }
 +            }
-+        });
++        };
++        if constexpr (BIG) {
++            namespace sxo = sycl::ext::oneapi::experimental;
++            h.parallel_for(sycl::nd_range<2>(gr, lr), sxo::properties{sycl::ext::intel::experimental::grf_size<256>}, kern);
++        } else {
++            h.parallel_for(sycl::nd_range<2>(gr, lr), kern);
++        }
 +    });
 +}
 +
-+template <int NT, int R>
++template <int NT, int R, bool BIG>
 +void pick_r8m(sycl::queue & q, const Args & a) {
 +    const int64_t upr = a.K / 32;
 +    const int lpr = upr >= 128 ? 16 : upr >= 48 ? 8 : 4;
@@ -914,30 +924,51 @@ new file mode 100644
 +    int rw = std::max(1, std::min(256 / (ks * lpr), 16));
 +    if (ks * lpr > 256) rw = 1;
 +    while ((rw * ks * lpr) % SG) ++rw;
-+    if (lpr == 16) run_r8m<NT, 16, R>(q, a, ks, rw);
-+    else if (lpr == 8) run_r8m<NT, 8, R>(q, a, ks, rw);
-+    else run_r8m<NT, 4, R>(q, a, ks, rw);
++    if (lpr == 16) run_r8m<NT, 16, R, BIG>(q, a, ks, rw);
++    else if (lpr == 8) run_r8m<NT, 8, R, BIG>(q, a, ks, rw);
++    else run_r8m<NT, 4, R, BIG>(q, a, ks, rw);
 +}
 +
-+// GGML_SYCL_FASTMV_R8M_R: rows per lane group of the multi-column Q6K_R8 kernel (0 = the generic kernel)
-+template <int R>
++// GGML_SYCL_FASTMV_R8M_R / _R8M1_R: rows per lane group of the row-blocked Q6K_R8 kernel for several columns / one
++// column (0 = the generic kernel); GGML_SYCL_FASTMV_R8M_BIG=1: its 256-register mode
++template <int R, bool BIG>
 +bool r8m_cols(sycl::queue & q, const Args & a) {
 +    switch (a.ncols) {
-+        case 2: pick_r8m<2, R>(q, a); return true;
-+        case 3: pick_r8m<3, R>(q, a); return true;
-+        case 4: pick_r8m<4, R>(q, a); return true;
-+        case 5: pick_r8m<5, R>(q, a); return true;
-+        case 6: pick_r8m<6, R>(q, a); return true;
-+        case 7: pick_r8m<7, R>(q, a); return true;
-+        case 8: pick_r8m<8, R>(q, a); return true;
++        case 1: pick_r8m<1, R, BIG>(q, a); return true;
++        case 2: pick_r8m<2, R, BIG>(q, a); return true;
++        case 3: pick_r8m<3, R, BIG>(q, a); return true;
++        case 4: pick_r8m<4, R, BIG>(q, a); return true;
++        case 5: pick_r8m<5, R, BIG>(q, a); return true;
++        case 6: pick_r8m<6, R, BIG>(q, a); return true;
++        case 7: pick_r8m<7, R, BIG>(q, a); return true;
++        case 8: pick_r8m<8, R, BIG>(q, a); return true;
 +    }
 +    return false;
 +}
 +
 +bool r8m(sycl::queue & q, const Args & a) {
-+    static const int R = [] { const char * e = std::getenv("GGML_SYCL_FASTMV_R8M_R"); return e ? std::atoi(e) : 0; }();
-+    if (R == 2) return r8m_cols<2>(q, a);
-+    if (R == 4) return r8m_cols<4>(q, a);
++    auto env = [](const char * k, int d) { const char * e = std::getenv(k); return e ? std::atoi(e) : d; };
++    static const int Rm = env("GGML_SYCL_FASTMV_R8M_R", -1), R1 = env("GGML_SYCL_FASTMV_R8M1_R", -1);
++    static const bool big = env("GGML_SYCL_FASTMV_R8M_BIG", 0) != 0;
++    static const bool autop = env("GGML_SYCL_FASTMV_R8M", 1) != 0;
++    const int R = a.ncols == 1 ? R1 : Rm;
++    if (R >= 0) {   // explicit (benches)
++        if (R == 2) return big ? r8m_cols<2, true>(q, a) : r8m_cols<2, false>(q, a);
++        if (R == 4) return big ? r8m_cols<4, true>(q, a) : r8m_cols<4, false>(q, a);
++        return false;
++    }
++    if (!autop) return false;
++    // measured on the B70 (bench/fm2, DeepSeek-V4.1's shapes): >= 16 MB matrices stream best two rows per lane group
++    // in the 256-register mode (5 columns: q_b 86 -> 65 us, o_b 112 -> 73 us; 1 column with long rows: o_b 78 -> 69),
++    // smaller ones with several columns two rows per group (shexp 32 -> 30), the rest (and kv) the generic kernel
++    const double mb = (double) a.N * (double) a.K * (double) a.G * (210.0 / 256.0) / 1e6;
++    if (a.ncols == 1) {
++        if (mb >= 16 && a.K >= 4096) return r8m_cols<2, true>(q, a);
++        if (mb >= 16) return r8m_cols<2, false>(q, a);
++        return false;
++    }
++    if (mb >= 16) return r8m_cols<2, true>(q, a);
++    if (a.N * a.G >= 1024) return r8m_cols<2, false>(q, a);
 +    return false;
 +}
 +
@@ -973,8 +1004,7 @@ new file mode 100644
 +        case WType::F16: one ? pick<WType::F16, 1>(q, a) : pick<WType::F16, 8>(q, a); break;
 +        case WType::F32: one ? pick<WType::F32, 1>(q, a) : pick<WType::F32, 8>(q, a); break;
 +        case WType::Q6K_R8:
-+            if (one) pick<WType::Q6K_R8, 1>(q, a);
-+            else if (!r8m(q, a)) pick<WType::Q6K_R8, 8>(q, a);
++            if (!r8m(q, a)) one ? pick<WType::Q6K_R8, 1>(q, a) : pick<WType::Q6K_R8, 8>(q, a);
 +            break;
 +    }
 +    return true;
@@ -1902,7 +1932,30 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5434,6 +5569,15 @@
+@@ -5134,6 +5269,22 @@
+             return;
+         }
+     }
++    // larry: a few tokens (the DSpark draft block: 5) - the fused per-token GEMV once per token, ids read on the
++    // device; the routed path below waits on the host for the ids (a full queue drain per call).  Measured on the
++    // draft: 8.9 -> 9.5 ms/pass (the per-token GEMVs re-read shared experts) - off by default
++    static const int mmid_loop = ggml_sycl_get_env("GGML_SYCL_LARRY_MMID_LOOP", 0);
++    if (mmid_loop && ne12 > 1 && ne12 <= 8 && ids->ne[1] == ne12 && ggml_is_contiguous(src1)) {
++        bool ok = true;
++        for (int64_t t = 0; t < ne12 && ok; ++t) {
++            ggml_tensor s1 = *src1, it = *ids, d = *dst;
++            s1.ne[2] = 1; s1.data = (char *) src1->data + t * src1->nb[2];
++            it.ne[1] = 1; it.data = (char *) ids->data + t * ids->nb[1];
++            d.ne[2] = 1;  d.data = (char *) dst->data + t * dst->nb[2];
++            ok = ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, &s1, &it, &d);
++            GGML_ASSERT(ok || t == 0);   // the fused path takes every token or none (same shapes and types)
++        }
++        if (ok) return;
++    }
+ 
+     std::vector<char> ids_host(ggml_nbytes(ids));
+     const char * ids_dev = (const char *) ids->data;
+@@ -5434,6 +5585,15 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -1918,7 +1971,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -6121,6 +6265,63 @@
+@@ -6121,6 +6281,63 @@
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
  
  #ifdef GGML_SYCL_GRAPH
@@ -1982,7 +2035,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
      bool use_sycl_graph = false;
      if (g_ggml_sycl_enable_graph) {
          use_sycl_graph = check_graph_compatibility(cgraph);
-@@ -6229,6 +6430,12 @@
+@@ -6229,6 +6446,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -1995,7 +2048,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +6676,13 @@
+@@ -6469,6 +6692,13 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

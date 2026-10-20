@@ -1635,8 +1635,9 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     // so the host's wait ends when the router's rows land, not when this card is idle
     const bool async = cached && dense_async_on() && im.sycl;
     if (async && !im.rb_ev) im.rb_ev = ggml_backend_event_new(ggml_backend_get_device(im.backend));
-    const bool tl = ds41_dense_tl_hook && n == 1 && async;
-    if (tl) ds41_dense_tl_hook(0);
+    const bool tl = ds41_dense_tl_hook && async;
+    const int tlo = n == 1 ? 0 : 8;   // timeline ids: decode 0.., verify passes 8..
+    if (tl) ds41_dense_tl_hook(tlo + 0);
     const double tp0 = g_decprof_on ? dprof_now() : 0;
     const bool ok = im.compute(gf, cached, async);
     if (gc) ggml_free(gc);
@@ -1647,7 +1648,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
     if (async && im.rb_ev) ggml_backend_event_record(im.rb_ev, im.backend);
-    if (tl) ds41_dense_tl_hook(1);
+    if (tl) ds41_dense_tl_hook(tlo + 1);
     double ts = 0;
     auto shexp = [&]() -> bool {   // queued now: it runs on this card while the tier's cards run the routed experts
         if (!(cached && split_shexp)) return true;
@@ -1660,7 +1661,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         return true;
     };
     if (async && im.rb_ev && !shexp()) return false;
-    if (tl) ds41_dense_tl_hook(2);
+    if (tl) ds41_dense_tl_hook(tlo + 2);
     const double tp2 = g_decprof_on ? dprof_now() : 0;
     if (async && im.rb_ev) ggml_backend_event_synchronize(im.rb_ev);
     else ggml_backend_synchronize(im.backend);
@@ -1738,7 +1739,7 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     const double tf0 = g_decprof_on ? dprof_now() : 0;
     const bool ok = im.compute(gf, cached, im.sycl);
     if (g_decprof_on && n == 1) g_decprof[4] += dprof_now() - tf0;
-    if (ds41_dense_tl_hook && n == 1 && im.sycl && dense_async_on()) ds41_dense_tl_hook(4);
+    if (ds41_dense_tl_hook && cached && im.sycl && dense_async_on()) ds41_dense_tl_hook(n == 1 ? 4 : 12);
     if (gc) ggml_free(gc);
     return ok;
 }

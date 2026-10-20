@@ -83,6 +83,7 @@ struct XeCard {
     /// decode / verify: the card's command sequence of a call (stage copy, quantise, gate/up, down, copy to the dense
     /// card's slot) recorded once per shape (jobs, tokens, kernel variant) and replayed - one submission, not five
     std::map<uint32_t, std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> dgraphs;
+    std::map<uint32_t, const float*> dgraph_x;   ///< per recording: the direct X it reads (null: the staged one)
     // prompt-chunk scratch (grown on demand)
     float* cX = nullptr; size_t cX_cap = 0;          ///< floats
     float* cOUT = nullptr; size_t cOUT_cap = 0;      ///< floats
@@ -128,12 +129,22 @@ struct XeCard {
 };
 
 struct Ds41XeImpl {
-    // STRATA_GPU_TL: the decode timeline's profiling tags - (id, event) on the dense queue; per card (start, end)
-    std::vector<std::pair<int, sycl::event>> tl;
-    std::vector<std::vector<std::pair<sycl::event, sycl::event>>> tl_card;
-    double tl_sum[8][8] = {};   // [from id][to id] device us
-    long tl_n[8][8] = {};
-    std::vector<double> tl_csum;
+    // STRATA_GPU_TL: the decode timeline - stamps (a one-lane kernel setting a pinned flag) whose arrival a monitor
+    // thread times on the host clock: rings[0] = the dense queue, rings[1 + c] = card c's queue
+    struct TlRing {
+        volatile uint32_t* flag = nullptr;   // host USM [kTlCap]
+        std::vector<int> id;
+        std::vector<double> t;               // host us when the monitor saw the flag
+        std::atomic<uint32_t> issued{0}, seen{0};
+        uint32_t done = 0;                   // the flush's position
+    };
+    static constexpr uint32_t kTlCap = 1u << 16;
+    std::vector<std::unique_ptr<TlRing>> tl_rings;
+    std::thread tl_mon;
+    std::atomic<bool> tl_stop{false};
+    double tl_sum[16][16] = {};   // dense: [from id][to id] us
+    long tl_n[16][16] = {};
+    std::vector<double> tl_cbusy, tl_clag, tl_csum_lag;   // per card: start->end, dense 1->start, end->dense 3
     std::vector<long> tl_cn;
     long tl_tokens = 0;
     Ds41MoeGeom g;
@@ -172,6 +183,8 @@ struct Ds41XeImpl {
     std::mutex mu;
     bool planar = true;                ///< STRATA_XE_PLANAR (default 1): experts repacked on the cards, int8 kernels
     bool tier_graphs = true;           ///< STRATA_XE_GRAPH (default 1): decode / verify card work as replayed SYCL graphs
+    bool tier_graphs_multi = false;    ///< STRATA_XE_GRAPH_MULTI (default 0): verify calls too (jobs padded to a bucket)
+    bool x_direct = true;              ///< STRATA_XE_XDIRECT (default 1): the cards read a pinned X straight from the host
     sycl::queue* dense_q = nullptr;    ///< set_dense_queue: decode sums go there, no host wait
     sycl::event last_sum;              ///< the previous decode call's sum on dense_q (its slots / stages are reused)
     sycl::event hsum_ev;               ///< the copy of hsum (the CPU part) into the dense card's slot
@@ -276,6 +289,8 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
     im.L = geom.swiglu_limit;
     im.planar = env_i("STRATA_XE_PLANAR", 1) != 0;
     im.tier_graphs = env_i("STRATA_XE_GRAPH", 1) != 0;
+    im.x_direct = env_i("STRATA_XE_XDIRECT", 1) != 0;
+    im.tier_graphs_multi = env_i("STRATA_XE_GRAPH_MULTI", 0) != 0;   // measured: no gain (the cards' dispatch is not submit-bound)
     const int64_t NCL = geom.n_classes();
     im.fl.assign((size_t) NCL, cpu::NativeFmt());
     im.bl.assign((size_t) NCL, 0);
@@ -608,45 +623,108 @@ void Ds41XeTier::set_dense_queue(void* q) { im_->dense_q = (sycl::queue*) q; }
 
 bool Ds41XeTier::tl_on() { static const bool on = env_i("STRATA_GPU_TL", 0) != 0; return on; }
 
+namespace {
+double tl_now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+void tl_start(Ds41XeImpl& im) {
+    if (!im.tl_rings.empty()) return;
+    for (size_t r = 0; r <= im.cards.size(); ++r) {
+        auto ring = std::make_unique<Ds41XeImpl::TlRing>();
+        ring->flag = sycl::malloc_host<uint32_t>(Ds41XeImpl::kTlCap, im.ctx);
+        for (uint32_t k = 0; k < Ds41XeImpl::kTlCap; ++k) ring->flag[k] = 0;
+        ring->id.assign(Ds41XeImpl::kTlCap, -1);
+        ring->t.assign(Ds41XeImpl::kTlCap, 0.0);
+        im.tl_rings.push_back(std::move(ring));
+    }
+    im.tl_mon = std::thread([&im] {
+        while (!im.tl_stop.load(std::memory_order_relaxed)) {
+            for (auto& rp : im.tl_rings) {
+                Ds41XeImpl::TlRing& r = *rp;
+                uint32_t sn = r.seen.load(std::memory_order_relaxed);
+                while (sn < r.issued.load(std::memory_order_acquire) && r.flag[sn % Ds41XeImpl::kTlCap]) {
+                    r.t[sn % Ds41XeImpl::kTlCap] = tl_now_us();
+                    r.flag[sn % Ds41XeImpl::kTlCap] = 0;
+                    r.seen.store(++sn, std::memory_order_release);
+                }
+            }
+        }
+    });
+}
+
+void tl_print(Ds41XeImpl& im);
+
+void tl_stamp(Ds41XeImpl& im, size_t ring, sycl::queue& q, int id) {
+    tl_start(im);
+    Ds41XeImpl::TlRing& r = *im.tl_rings[ring];
+    const uint32_t k = r.issued.load(std::memory_order_relaxed) % Ds41XeImpl::kTlCap;
+    r.id[k] = id;
+    volatile uint32_t* f = r.flag;
+    q.single_task([=] { f[k] = 1u; });
+    r.issued.fetch_add(1, std::memory_order_release);
+}
+}  // namespace
+
 void Ds41XeTier::tl_tag(int id) {
     Ds41XeImpl& im = *im_;
     if (!tl_on() || !im.dense_q) return;
-    im.tl.emplace_back(id, sycl::ext::oneapi::experimental::submit_profiling_tag(*im.dense_q));
+    tl_stamp(im, 0, *im.dense_q, id);
 }
 
 void Ds41XeTier::tl_flush() {
     Ds41XeImpl& im = *im_;
-    if (!tl_on()) return;
-    auto ns = [](const sycl::event& e) { return (double) e.get_profiling_info<sycl::info::event_profiling::command_end>(); };
-    if (!im.tl.empty()) im.tl.back().second.wait();
-    for (size_t i = 1; i < im.tl.size(); ++i) {
-        const int a = im.tl[i - 1].first, b = im.tl[i].first;
-        if (a < 0 || a > 7 || b < 0 || b > 7) continue;
-        im.tl_sum[a][b] += 1e-3 * (ns(im.tl[i].second) - ns(im.tl[i - 1].second));
+    if (!tl_on() || im.tl_rings.empty()) return;
+    const double t0 = tl_now_us();
+    for (auto& rp : im.tl_rings)   // everything stamped has run (the logits were read); give the monitor a moment
+        while (rp->seen.load(std::memory_order_acquire) < rp->issued.load(std::memory_order_acquire) && tl_now_us() - t0 < 2e5) {}
+    const uint32_t C = Ds41XeImpl::kTlCap;
+    Ds41XeImpl::TlRing& d = *im.tl_rings[0];
+    const uint32_t dn = d.seen.load(std::memory_order_acquire);
+    // dense transitions; and the times of this token's dense stamps 1 and 3 in order (one per layer)
+    std::vector<double> t1, t3;
+    for (uint32_t k = d.done; k < dn; ++k) {
+        const int b = d.id[k % C];
+        if (b == 1 || b == 9) t1.push_back(d.t[k % C]);
+        if (b == 3 || b == 11) t3.push_back(d.t[k % C]);
+        if (k == d.done) continue;
+        const int a = d.id[(k - 1) % C];
+        if (a < 0 || a > 15 || b < 0 || b > 15) continue;
+        im.tl_sum[a][b] += d.t[k % C] - d.t[(k - 1) % C];
         ++im.tl_n[a][b];
     }
-    im.tl.clear();
-    im.tl_csum.resize(im.cards.size(), 0.0);
-    im.tl_cn.resize(im.cards.size(), 0);
-    im.tl_card.resize(im.cards.size());
-    for (size_t c = 0; c < im.tl_card.size(); ++c) {
-        for (auto& se : im.tl_card[c]) {
-            se.second.wait();
-            im.tl_csum[c] += 1e-3 * (ns(se.second) - ns(se.first));
-            ++im.tl_cn[c];
+    d.done = dn;
+    const size_t NC = im.tl_rings.size() - 1;
+    im.tl_cbusy.resize(NC, 0.0); im.tl_clag.resize(NC, 0.0); im.tl_csum_lag.resize(NC, 0.0); im.tl_cn.resize(NC, 0);
+    for (size_t c = 0; c < NC; ++c) {
+        Ds41XeImpl::TlRing& r = *im.tl_rings[1 + c];
+        const uint32_t rn = r.seen.load(std::memory_order_acquire);
+        for (uint32_t k = r.done; k + 1 < rn; ++k) {
+            if (r.id[k % C] != 10 || r.id[(k + 1) % C] != 11) continue;
+            const double ts = r.t[k % C], te = r.t[(k + 1) % C];
+            // the dense stamps around it: the last readback-done before its start, the first sum-done after its end
+            auto lb = std::upper_bound(t1.begin(), t1.end(), ts);
+            auto ub = std::lower_bound(t3.begin(), t3.end(), te);
+            if (lb == t1.begin() || ub == t3.end()) continue;
+            im.tl_cbusy[c] += te - ts; im.tl_clag[c] += ts - *(lb - 1); im.tl_csum_lag[c] += *ub - te; ++im.tl_cn[c];
         }
-        im.tl_card[c].clear();
+        r.done = rn;
     }
-    if (++im.tl_tokens % 64) return;
-    std::fprintf(stderr, "gpu timeline (%ld tokens), dense card us per step:", im.tl_tokens);
-    for (int a = 0; a < 8; ++a)
-        for (int b = 0; b < 8; ++b)
+    if (++im.tl_tokens % 64 == 0) tl_print(im);
+}
+
+namespace {
+void tl_print(Ds41XeImpl& im) {
+    const size_t NC = im.tl_cn.size();
+    std::fprintf(stderr, "gpu timeline (%ld flushes, host-clock stamps) dense us:", im.tl_tokens);
+    for (int a = 0; a < 16; ++a)
+        for (int b = 0; b < 16; ++b)
             if (im.tl_n[a][b]) std::fprintf(stderr, " %d->%d %.1f (x%ld)", a, b, im.tl_sum[a][b] / im.tl_n[a][b], im.tl_n[a][b]);
-    std::fprintf(stderr, "; cards (dispatch -> copy done):");
-    for (size_t c = 0; c < im.tl_csum.size(); ++c)
-        if (im.tl_cn[c]) std::fprintf(stderr, " %zu: %.1f (x%ld)", c, im.tl_csum[c] / im.tl_cn[c], im.tl_cn[c]);
+    std::fprintf(stderr, "; cards [readback->start, start->end, end->sum]:");
+    for (size_t c = 0; c < NC; ++c)
+        if (im.tl_cn[c]) std::fprintf(stderr, " %zu: %.1f %.1f %.1f (x%ld)", c, im.tl_clag[c] / im.tl_cn[c], im.tl_cbusy[c] / im.tl_cn[c],
+                                      im.tl_csum_lag[c] / im.tl_cn[c], im.tl_cn[c]);
     std::fprintf(stderr, "\n");
 }
+}  // namespace
 void Ds41XeTier::set_cache_enabled(bool on) { im_->cache_enabled = on; }
 
 void Ds41XeTier::release_cache() {
@@ -724,10 +802,10 @@ void cpu_ents(Ds41XeImpl& im, int64_t l, const std::vector<const Ent*>& ents, co
 }
 
 /// A card's share of a decode / verify call: its n jobs (staged in c.stage_dev, X at xoff) into dst [nt][n_embd].
-sycl::event card_experts(Ds41XeImpl& im, XeCard& c, int n, int nt, int max_nt, size_t xoff, float* dst) {
+sycl::event card_experts(Ds41XeImpl& im, XeCard& c, int n, int nt, int max_nt, size_t xoff, float* dst, const float* xsrc = nullptr) {
     const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
     const XeJob* jobs = (const XeJob*) c.stage_dev;
-    const float* X = (const float*) (c.stage_dev + xoff);
+    const float* X = xsrc ? xsrc : (const float*) (c.stage_dev + xoff);   // xsrc: pinned host rows, read over PCIe
     if (!im.planar) return xe::xe_experts(c.q, jobs, n, nt, X, c.H, dst, H, F, im.L, false);
     xe::xe_quant_rows(c.q, X, nt, H, c.xq);
     return xe::xe_experts_q8(c.q, jobs, n, nt, c.xq, c.hq, dst, H, F, im.L, false, max_nt);
@@ -768,14 +846,21 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     const size_t n_out = (size_t) nt * H;
     XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
     static const bool sprof = env_i("STRATA_XE_PROF", 0) != 0;
-    static double sp[5] = {0, 0, 0, 0, 0};
-    static int64_t sp_n = 0, sp_jobs = 0;
+    static double spa[2][5] = {};   // [decode, verify]
+    static int64_t spa_n[2] = {0, 0}, spa_jobs[2] = {0, 0};
+    const int spk = nt > 1;
+    double* sp = spa[spk];
     double ts0 = sprof ? now_ms() : 0;
     if (out_dev && dc) {
         // DEVICE OUTPUT (every decode / verify step): each card's part goes straight into the dense card's slot
         // (card-to-card copy), the CPU pool's part into the last slot, and one sum kernel on the dense card - which
         // waits for the other cards' copies through their events, so the host waits once per layer, not per card.
         float* slots = dc->dslots;   // [NC + 1][8][H] on the dense card
+        // direct X: the call's rows are pinned host memory (the dense half's readback mirror) - no staging copy
+        static const float* xd_last = nullptr;
+        static bool xd_ok = false;
+        if (x != xd_last) { xd_last = x; xd_ok = sycl::get_pointer_type(x, im.ctx) == sycl::usm::alloc::host; }
+        const bool xd = im.x_direct && xd_ok;
         std::vector<sycl::event> deps;
         std::vector<int> used;
         for (auto& cp : im.cards) {
@@ -783,31 +868,46 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             const int n = nj[(size_t) c.idx];
             if (n == 0) continue;
             c.busy = true;
-            std::memcpy(c.stage_host + xoff, x, n_out * 4);
+            if (!xd) std::memcpy(c.stage_host + xoff, x, n_out * 4);
+            // replayed graph: decode as is; a verify call's jobs padded with null jobs (nt 0: the kernels skip them)
+            // to a bucket, so a few recordings per card cover every pass
+            const bool graph = im.dense_q && im.planar && im.tier_graphs && (nt == 1 || im.tier_graphs_multi);
+            int ng = n;
+            if (graph && nt > 1) {
+                static const int kb[] = {2, 4, 6, 8, 12, 16, 24, 32, 48, kMaxDecodeJobs};
+                for (int b : kb) if (b >= n) { ng = b; break; }
+                XeJob z;
+                std::memcpy(&z, c.stage_host, sizeof(XeJob));   // job 0's blob and types: valid, never read
+                z.nt = 0;
+                for (int k = n; k < ng; ++k) std::memcpy(c.stage_host + (size_t) k * sizeof(XeJob), &z, sizeof(XeJob));
+            }
             float* dst = c.dense ? slots + (size_t) c.idx * kMaxJobTok * H : c.OUT;
             const int mv = mnt[(size_t) c.idx] <= 1 ? 1 : mnt[(size_t) c.idx] <= 2 ? 2 : mnt[(size_t) c.idx] <= 4 ? 4 : 8;
             // the whole sequence; its first command waits for `prev` (the previous call's sum reads the slots this
             // call's cards write) unless it is being recorded (a replay carries that dependency instead)
             auto enqueue = [&](const sycl::event* prev) {
+                const size_t cpb = xd ? (size_t) ng * sizeof(XeJob) : xoff + n_out * 4;   // the jobs (and X unless direct)
                 if (prev) {
                     c.q.submit([&](sycl::handler& h) {
                         h.depends_on(*prev);
-                        h.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);   // jobs and X in one copy
+                        h.memcpy(c.stage_dev, c.stage_host, cpb);
                     });
                 } else {
-                    c.q.memcpy(c.stage_dev, c.stage_host, xoff + n_out * 4);
+                    c.q.memcpy(c.stage_dev, c.stage_host, cpb);
                 }
-                sycl::event ev = card_experts(im, c, n, nt, mv, xoff, dst);
+                sycl::event ev = card_experts(im, c, ng, nt, mv, xoff, dst, xd ? x : nullptr);
                 if (!c.dense) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
                 return ev;
             };
-            sycl::event ev, tl_start;
-            if (Ds41XeTier::tl_on()) tl_start = sycl::ext::oneapi::experimental::submit_profiling_tag(c.q);
-            if (im.dense_q && im.planar && im.tier_graphs && nt == 1) {   // decode; verify shapes vary too much to amortise a recording
+            sycl::event ev;
+            if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 10);
+            if (graph) {
                 namespace sx = sycl::ext::oneapi::experimental;
-                const uint32_t key = (uint32_t) n | ((uint32_t) nt << 8) | ((uint32_t) mv << 12);
+                const uint32_t key = (uint32_t) ng | ((uint32_t) nt << 8) | ((uint32_t) mv << 12);
                 auto it = c.dgraphs.find(key);
+                if (it != c.dgraphs.end() && c.dgraph_x[key] != (xd ? x : nullptr)) { c.dgraphs.erase(it); it = c.dgraphs.end(); }
                 if (it == c.dgraphs.end()) {
+                    c.dgraph_x[key] = xd ? x : nullptr;   // the X a recording reads (direct X: baked into its quant kernel)
                     sx::command_graph<sx::graph_state::modifiable> g(c.q.get_context(), c.q.get_device());
                     g.begin_recording(c.q);
                     enqueue(nullptr);
@@ -828,10 +928,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             } else {
                 ev = enqueue(nullptr);
             }
-            if (Ds41XeTier::tl_on()) {
-                if (im.tl_card.size() < NC) im.tl_card.resize(NC);
-                im.tl_card[(size_t) c.idx].emplace_back(tl_start, sycl::ext::oneapi::experimental::submit_profiling_tag(c.q));
-            }
+            if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
             deps.push_back(ev);
             used.push_back(c.idx);
         }
@@ -866,18 +963,22 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             });
             if (im.dense_q) im.last_sum = ev; else ev.wait();
         }
-        if (Ds41XeTier::tl_on() && im.dense_q) im.tl.emplace_back(3, sycl::ext::oneapi::experimental::submit_profiling_tag(*im.dense_q));
+        if (Ds41XeTier::tl_on() && im.dense_q) tl_stamp(im, 0, *im.dense_q, nt == 1 ? 3 : 11);
         if (sprof) {
             const double ts3 = now_ms();
             sp[0] += ts0 - t0;      // grouping + job building (before the cards' submissions)
             sp[1] += ts1 - ts0;     // the cards' submissions
             sp[2] += ts2 - ts1;     // CPU-pool experts
             sp[3] += ts3 - ts2;     // sum submission + wait for everything
+            int64_t& sp_n = spa_n[spk];
+            int64_t& sp_jobs = spa_jobs[spk];
             for (int c = 0; c < (int) NC; ++c) sp_jobs += nj[(size_t) c];
-            if (++sp_n % 2000 == 0)
-                std::fprintf(stderr, "xe decode prof (%lld calls, %.2f card jobs/call): per call prep %.1f us, submit %.1f us, cpu %.1f us, "
-                             "sum+wait %.1f us = %.1f us\n", (long long) sp_n, (double) sp_jobs / sp_n, 1e3 * sp[0] / sp_n,
-                             1e3 * sp[1] / sp_n, 1e3 * sp[2] / sp_n, 1e3 * sp[3] / sp_n, 1e3 * (sp[0] + sp[1] + sp[2] + sp[3]) / sp_n);
+            sp[4] += cpu_list.size();
+            if (++sp_n % 1000 == 0)
+                std::fprintf(stderr, "xe %s prof (%lld calls, %.2f card jobs/call, %.2f cpu experts/call): per call prep %.1f us, "
+                             "submit %.1f us, cpu %.1f us, sum+wait %.1f us = %.1f us\n", spk ? "verify" : "decode", (long long) sp_n,
+                             (double) sp_jobs / sp_n, sp[4] / sp_n, 1e3 * sp[0] / sp_n, 1e3 * sp[1] / sp_n, 1e3 * sp[2] / sp_n,
+                             1e3 * sp[3] / sp_n, 1e3 * (sp[0] + sp[1] + sp[2] + sp[3]) / sp_n);
         }
         im.st.wall_ms += now_ms() - t0;
         return true;
@@ -1424,6 +1525,10 @@ void Ds41XeTier::close() {
     }
     im.achunks.clear();
     if (im.hsum) { im.hsum_ev.wait(); sycl::free(im.hsum, im.ctx); im.hsum = nullptr; }
+    if (im.tl_tokens % 64) tl_print(im);
+    if (im.tl_mon.joinable()) { im.tl_stop = true; im.tl_mon.join(); }
+    for (auto& rp : im.tl_rings) sycl::free((void*) rp->flag, im.ctx);
+    im.tl_rings.clear();
     im.placed = false;
     im.dense_set.clear();
     im.pool.reset();
