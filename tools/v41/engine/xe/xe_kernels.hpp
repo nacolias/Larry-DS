@@ -97,4 +97,19 @@ sycl::event xe_gather_rows_f16(sycl::queue& q, const float* X, const int32_t* to
 /// Hh[i][r] = silu(min(G[i][r], L)) * clamp(G[i][F + r], -L, L) in fp16 (G: [m][2F] f32 = gate | up).
 sycl::event xe_swiglu_f16(sycl::queue& q, const float* G, int m, int F, float L, sycl::half* Hh);
 
+/// larry (xe_dqgemm.cpp): C[i][n0 + c] = A[i] . W[n0 + c] for one expert matrix W ([N rows][K] packed, planar with NB
+/// blocks or the file layout with row_bytes a row), A: [m][lda] fp16 (rows padded to a multiple of 8 - the tiles
+/// store whole 8-row blocks), C: [m][ldc] f32.  Device-readable.
+struct DqJob {
+    const uint8_t* W = nullptr;
+    const sycl::half* A = nullptr;
+    float* C = nullptr;
+    int64_t NB = 0;
+    int32_t m = 0, lda = 0, ldc = 0, row_bytes = 0;
+};
+/// One work-group's tile: job, its first token row (multiple of 128) and first output row (multiple of 128).
+struct DqTile { int32_t job = 0, m0 = 0, n0 = 0, pad = 0; };
+/// Every tile of `tiles` (all its jobs one quant type, one layout), K values a row (a multiple of 64).
+sycl::event xe_dqgemm(sycl::queue& q, int type, bool planar, const DqJob* jobs, const DqTile* tiles, int ntiles, int K);
+
 }  // namespace strata::v41::xe
