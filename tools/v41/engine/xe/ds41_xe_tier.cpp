@@ -83,6 +83,17 @@ struct XeCard {
     float* dslots = nullptr;        ///< dense card only: [cards + 1][8][n_embd], every card's decode part (+ the CPU's)
     bool busy = false;              ///< this call enqueued work on it
     sycl::event stage_ev;           ///< the last copy out of stage_host (async decode: wait before refilling it)
+    // STRATA_XE_ARM: the call queued ahead of its routing (Ds41XeTier::arm)
+    int* arm_flag = nullptr;        ///< device (this card): releases, written by the dense card's release queue
+    int* arm_src = nullptr;         ///< pinned: a ring of 64 source slots (one cache line each) for those copies
+    int arm_src_i = 0;
+    int* arm_seen = nullptr;        ///< device: releases consumed by the spin kernel
+    int arm_rel = 0;                ///< host copy of *arm_flag
+    bool armed = false;             ///< an armed sequence waits for its release
+    int arm_ng = 0;                 ///< its job count (null-padded)
+    sycl::event arm_ev;             ///< its last command (the part's copy to the dense card)
+    XeJob arm_null{};               ///< a null job (nt 0) on a blob this card holds
+    bool arm_null_ok = false;
     /// decode / verify: the card's command sequence of a call (stage copy, quantise, gate/up, down, copy to the dense
     /// card's slot) recorded once per shape (jobs, tokens, kernel variant) and replayed - one submission, not five
     std::map<uint32_t, std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> dgraphs;
@@ -215,6 +226,13 @@ struct Ds41XeImpl {
     bool planar = true;                ///< STRATA_XE_PLANAR (default 1): experts repacked on the cards, int8 kernels
     bool tier_graphs = true;           ///< STRATA_XE_GRAPH (default 1): decode / verify card work as replayed SYCL graphs
     bool tier_graphs_multi = false;    ///< STRATA_XE_GRAPH_MULTI (default 0): verify calls too (jobs padded to a bucket)
+    bool arm_on = false, arm_multi = false;   ///< STRATA_XE_ARM / STRATA_XE_ARM_MULTI
+    int64_t armed_l = -1;              ///< the layer / width the armed sequences are for
+    int armed_nt = 0;
+    const float* arm_x = nullptr;      ///< the X they read (the dense half's pinned readback mirror)
+    int* arm_err = nullptr;            ///< pinned: a spin kernel gave up waiting (its card ran null jobs)
+    std::unique_ptr<sycl::queue> relq; ///< on the dense card: the releases (copies into the armed cards' flags)
+    int64_t arm_used = 0, arm_disarmed = 0;
     bool x_direct = true;              ///< STRATA_XE_XDIRECT (default 1): the cards read a pinned X straight from the host
     sycl::queue* dense_q = nullptr;    ///< set_dense_queue: decode sums go there, no host wait
     sycl::event last_sum;              ///< the previous decode call's sum on dense_q (its slots / stages are reused)
@@ -437,6 +455,14 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
         if (c.dense) {
             c.dslots = sycl::malloc_device<float>((im.cards.size() + 1) * kMaxJobTok * H, c.q);
             if (!c.dslots) { err = "xe tier: slot allocation failed"; return false; }
+        } else {
+            c.arm_flag = sycl::malloc_device<int>(1, c.q);
+            c.arm_seen = sycl::malloc_device<int>(1, c.q);
+            c.arm_src = sycl::malloc_host<int>(64 * 16, c.q);
+            if (!c.arm_flag || !c.arm_seen || !c.arm_src) { err = "xe tier: arm counters allocation failed"; return false; }
+            c.q.memset(c.arm_flag, 0, sizeof(int)).wait();
+            c.q.memset(c.arm_seen, 0, sizeof(int)).wait();
+            std::memset(c.arm_src, 0, 64 * 16 * sizeof(int));
         }
     }
     const size_t NK = (size_t) geom.n_layers * geom.n_experts;
@@ -644,6 +670,28 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     });
     im.resident_n = 0;
     for (auto& cp : im.cards) im.resident_n += cp->n_experts;
+    for (int64_t k = 0; k < (int64_t) im.card_of.size(); ++k) {   // STRATA_XE_ARM: each card's null job
+        const int c = im.card_of[(size_t) k];
+        if (c < 0 || im.cards[(size_t) c]->arm_null_ok) continue;
+        XeCard& cd = *im.cards[(size_t) c];
+        cd.arm_null = make_job(im, k / im.g.n_experts, k % im.g.n_experts, im.dptr[(size_t) k]);
+        cd.arm_null.nt = 0;
+        cd.arm_null_ok = true;
+    }
+    im.arm_on = env_i("STRATA_XE_ARM", 1) != 0 && im.planar && im.x_direct;
+    im.arm_multi = im.arm_on && env_i("STRATA_XE_ARM_MULTI", 1) != 0;
+    if (im.arm_on && !im.arm_err) {
+        im.arm_err = sycl::malloc_host<int>(1, im.ctx);
+        if (im.arm_err) *im.arm_err = 0; else im.arm_on = im.arm_multi = false;
+    }
+    if (im.arm_on && !im.relq) {
+        if (im.dense < 0) im.arm_on = im.arm_multi = false;
+        else {
+            im.relq = std::make_unique<sycl::queue>(im.ctx, im.cards[(size_t) im.dense]->dev, sycl::property::queue::in_order());
+            for (auto& cp : im.cards)   // warm-up: the first cross-card copy into each card is set up lazily (slow)
+                if (cp->arm_flag && cp->arm_src) im.relq->memcpy(cp->arm_flag, cp->arm_src, sizeof(int)).wait();
+        }
+    }
     im.placed = true;
     std::fprintf(stderr, "xe tier: placed in %.1f s (cards %.1f s, arena %.1f s)\n%s", (now_ms() - t0) / 1000.0,
                  (t1 - t0) / 1000.0, (now_ms() - t1) / 1000.0, report().c_str());
@@ -1018,6 +1066,31 @@ sycl::event card_experts(Ds41XeImpl& im, XeCard& c, int n, int nt, int max_nt, s
     return xe::xe_experts_q8(c.q, jobs, n, nt, c.xq, c.hq, dst, H, F, im.L, false, max_nt);
 }
 
+/// STRATA_XE_ARM: one release of card c - the next count into a ring slot, copied into its flag by the dense card
+void arm_release(Ds41XeImpl& im, XeCard& c) {
+    int* src = c.arm_src + 16 * (c.arm_src_i++ & 63);
+    *src = ++c.arm_rel;
+    im.relq->memcpy(c.arm_flag, src, sizeof(int));   // decode: the only submitting thread (no submit lock needed)
+}
+
+/// STRATA_XE_ARM: releases every armed sequence with null jobs and waits for them (a call they were not armed for, a
+/// prompt chunk, close) - a spin kernel never waits for a release that is not coming.
+void disarm(Ds41XeImpl& im) {
+    bool any = false;
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (!c.armed) continue;
+        for (int k = 0; k < c.arm_ng; ++k) std::memcpy(c.stage_host + (size_t) k * sizeof(XeJob), &c.arm_null, sizeof(XeJob));
+        arm_release(im, c);
+        c.armed = false;
+        any = true;
+    }
+    if (!any) return;
+    for (auto& cp : im.cards) if (cp->arm_flag) cp->arm_ev.wait();
+    im.armed_l = -1;
+    ++im.arm_disarmed;
+}
+
 /// One decode / verify call: nt <= 8 tokens.  out_host (nt x n_embd) or out_dev (the dense card) gets the sum.
 bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const float* w, const float* x, float* out_host,
                void* out_dev) {
@@ -1031,16 +1104,21 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     std::vector<const Ent*> cpu_list;
     const size_t NC = im.cards.size();
     std::vector<int> nj(NC, 0), mnt(NC, 0);
+    // STRATA_XE_ARM: this call takes the armed sequences only if they were armed for it (layer, width, X, the device
+    // output path); anything else releases them with null jobs first
+    const bool take_armed = im.armed_l == l && im.armed_nt == nt && out_dev && im.dense_q && x == im.arm_x;
+    if (!take_armed) disarm(im);
+    if (x && im.x_direct) im.arm_x = x;   // the X the next arm's sequences read
     for (auto& cp : im.cards) {
         cp->busy = false;
-        if (im.dense_q) cp->stage_ev.wait();   // a back-to-back call (no dense sync between): its stage copy is done
+        if (im.dense_q && !cp->armed) cp->stage_ev.wait();   // a back-to-back call (no dense sync between): its stage copy is done
     }
     for (const Ent& en : ents) {
         const size_t key = (size_t) im.key(l, en.e);
         const int c = im.card_of[key];
         if (c < 0) { cpu_list.push_back(&en); continue; }
         XeCard& cd = *im.cards[(size_t) c];
-        if (nj[(size_t) c] >= kMaxDecodeJobs) { cpu_list.push_back(&en); continue; }
+        if (nj[(size_t) c] >= (cd.armed ? cd.arm_ng : kMaxDecodeJobs)) { cpu_list.push_back(&en); continue; }
         XeJob j = make_job(im, l, en.e, im.dptr[key]);
         j.nt = (uint8_t) en.nt;
         for (int s = 0; s < en.nt; ++s) { j.tok[s] = en.tok[s]; j.w[s] = en.w[s]; }
@@ -1141,6 +1219,20 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
             return ev;
         };
+        // the armed cards: their jobs (null-padded to the armed count) are in stage_host - release them; their
+        // sequences are in every sum's dependencies (an unused one must still be done before stage_host is refilled)
+        for (auto& cp : im.cards) {
+            XeCard& c = *cp;
+            if (!c.armed) continue;
+            for (int k = nj[(size_t) c.idx]; k < c.arm_ng; ++k)
+                std::memcpy(c.stage_host + (size_t) k * sizeof(XeJob), &c.arm_null, sizeof(XeJob));
+            arm_release(im, c);
+            c.armed = false;
+            c.stage_ev = c.arm_ev;
+            deps.push_back(c.arm_ev);
+            if (nj[(size_t) c.idx] > 0) { used.push_back(c.idx); c.busy = true; nj[(size_t) c.idx] = 0; ++im.arm_used; }
+        }
+        im.armed_l = -1;
         std::vector<XeCard*> todo;
         for (auto& cp : im.cards) if (nj[(size_t) cp->idx] > 0) todo.push_back(cp.get());
         // one card after another: submitting from a thread per card (2026-10-20) faulted card 0's copy engine once
@@ -1948,8 +2040,64 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
 
 }  // namespace
 
+void Ds41XeTier::arm(int64_t l, int nt) {
+    Ds41XeImpl& im = *im_;
+    disarm(im);   // an earlier arm nobody took
+    if (!im.arm_on || !im.relq || !im.dense_q || !im.arm_x || nt < 1 || nt > kMaxJobTok || (nt > 1 && !im.arm_multi)) return;
+    if (im.arm_err && *(volatile int*) im.arm_err) {   // a spin kernel timed out once: arming stays off
+        std::fprintf(stderr, "xe tier: an armed card waited out its release - STRATA_XE_ARM off\n");
+        im.arm_on = im.arm_multi = false;
+        return;
+    }
+    XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
+    if (!dc || !dc->dslots) return;
+    const int64_t H = im.g.n_embd;
+    const int K = (int) im.g.top_k;
+    static const int kb[] = {2, 4, 6, 8, 12, 16, 24, 32, 48, kMaxDecodeJobs};
+    int ng = kMaxDecodeJobs;
+    for (int b : kb) if (b >= K * nt) { ng = b; break; }
+    const int mv = nt <= 1 ? 1 : nt <= 2 ? 2 : nt <= 4 ? 4 : 8;
+    const size_t xoff = (kMaxDecodeJobs * sizeof(XeJob) + kStageAlign - 1) / kStageAlign * kStageAlign;
+    float* slots = dc->dslots;
+    const sycl::event prev = im.last_sum;   // the previous call's sum reads the slots these sequences write
+    int* errp = im.arm_err;
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (c.dense || !c.arm_flag || !c.arm_null_ok) continue;
+        std::lock_guard<PrioMutex> lk(g_submit);
+        int* flag = c.arm_flag;
+        int* seen = c.arm_seen;
+        c.q.submit([&](sycl::handler& h) {
+            h.depends_on(prev);
+            h.single_task([=] {   // until the host's release count passes the consumed one (bounded: a few seconds)
+                sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                 sycl::access::address_space::global_space> f(*flag);
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> sn(*seen);
+                const int want = sn.load() + 1;
+                int k = 0;
+                for (; k < 0x7fffffff && f.load(sycl::memory_order::acquire) < want; ++k) {}
+                if (k == 0x7fffffff)
+                    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                     sycl::access::address_space::global_space>(*errp).store(1, sycl::memory_order::release);
+                sn.store(want);
+            });
+        });
+        if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 10);   // released: the card starts
+        c.q.memcpy(c.stage_dev, c.stage_host, (size_t) ng * sizeof(XeJob));
+        card_experts(im, c, ng, nt, mv, xoff, c.OUT, im.arm_x);
+        if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
+        c.arm_ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, (size_t) nt * H * 4);
+        c.armed = true;
+        c.arm_ng = ng;
+    }
+    im.armed_l = l;
+    im.armed_nt = nt;
+}
+
 bool Ds41XeTier::run_chunk(int64_t l, int n, const int32_t* ids, const float* w, const float* x, float* out) {
     try {
+        if (n > kMaxJobTok) disarm(*im_);
         if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, out, nullptr);
         return run_big(*im_, l, n, ids, w, x, out, nullptr);
     } catch (const sycl::exception& e) {
@@ -1959,6 +2107,7 @@ bool Ds41XeTier::run_chunk(int64_t l, int n, const int32_t* ids, const float* w,
 }
 bool Ds41XeTier::run_chunk_dev(int64_t l, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
     try {
+        if (n > kMaxJobTok) disarm(*im_);
         if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, nullptr, out_dev);
         return run_big(*im_, l, n, ids, w, x, nullptr, out_dev);
     } catch (const sycl::exception& e) {
@@ -2108,6 +2257,11 @@ void Ds41XeTier::prefetch_end() {
 void Ds41XeTier::close() {
     if (!im_) return;
     Ds41XeImpl& im = *im_;
+    disarm(im);
+    if (im.relq) { im.relq->wait(); im.relq.reset(); }
+    if (im.arm_used || im.arm_disarmed)
+        std::fprintf(stderr, "xe tier: armed card shares used %lld, disarmed calls %lld\n", (long long) im.arm_used,
+                     (long long) im.arm_disarmed);
     if (im.run_thr.joinable()) im.run_thr.join();
     prefetch_end();
     if (!im.pf_thr.empty()) {
@@ -2128,7 +2282,7 @@ void Ds41XeTier::close() {
         XeCard& c = *cp;
         c.free_experts();
         auto fr = [&](void* p) { if (p) sycl::free(p, c.q); };
-        fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host);
+        fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.cH); fr(c.cY); fr(c.stream);
         fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots); fr(c.rstage);
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }

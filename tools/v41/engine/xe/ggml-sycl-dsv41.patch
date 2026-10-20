@@ -1,16 +1,18 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -587,6 +587,8 @@
+@@ -587,6 +587,10 @@
          GGML_OP_DSV4_HC_POST,
          GGML_OP_DSV41_FAKE_QUANT,
          GGML_OP_DSV41_HC_MIXES,
 +        GGML_OP_DSV41_ROUTER,
 +        GGML_OP_DSV41_KGATHER,
++        GGML_OP_DSV41_NORM_MV,
++        GGML_OP_DSV41_SWIGLU_LIM,
  
          GGML_OP_UNARY,
  
-@@ -2751,6 +2753,30 @@
+@@ -2751,6 +2755,54 @@
              struct ggml_tensor  * base,
              float                 eps);
  
@@ -37,6 +39,30 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +            struct ggml_tensor  * comp,
 +            struct ggml_tensor  * sel,
 +            int                   swa);
++    // larry: the same with the result type F16 or F32
++    GGML_API struct ggml_tensor * ggml_dsv41_kgather2(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * win,
++            struct ggml_tensor  * widx,
++            struct ggml_tensor  * comp,
++            struct ggml_tensor  * sel,
++            int                   swa,
++            enum ggml_type        type);
++
++    // larry: an RMS-normed mat-vec in one op: out[r, t] = (w[:, r] . x[:, t]) * rsqrt(mean(x[:, t]^2) + eps).  w F16 /
++    // F32 [C, R] contiguous, x F32 [C, n] contiguous rows; result F32 [R, n] (f32 accumulation)
++    GGML_API struct ggml_tensor * ggml_dsv41_norm_mv(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * x,
++            float                 eps);
++
++    // larry: DeepSeek-V4.1's clamped SwiGLU on a fused gate|up result: y F32 [2N, n] (rows: gate, then up);
++    // out[i, t] = silu(min(gate, lim)) * clamp(up, -lim, lim) (lim <= 0: no clamps); result F32 [N, n]
++    GGML_API struct ggml_tensor * ggml_dsv41_swiglu_lim(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * y,
++            float                 lim);
 +
      // custom operators
  
@@ -66,43 +92,47 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1086,6 +1086,8 @@
+@@ -1086,6 +1086,10 @@
      "DSV4_HC_POST",
      "DSV41_FAKE_QUANT",
      "DSV41_HC_MIXES",
 +    "DSV41_ROUTER",
 +    "DSV41_KGATHER",
++    "DSV41_NORM_MV",
++    "DSV41_SWIGLU_LIM",
  
      "UNARY",
  
-@@ -1103,7 +1105,7 @@
+@@ -1103,7 +1107,7 @@
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1203,6 +1205,8 @@
+@@ -1203,6 +1207,10 @@
      "dsv4_hc_post(x, residual, post, comb)",
      "dsv41_fake_quant(x)",
      "dsv41_hc_mixes(mixes, scale, base)",
 +    "dsv41_router(logits, bias, sel_bias)",
 +    "dsv41_kgather(win, widx, comp, sel)",
++    "dsv41_norm_mv(w, x)",
++    "dsv41_swiglu_lim(y)",
  
      "unary(x)",
  
-@@ -1220,7 +1224,7 @@
+@@ -1220,7 +1228,7 @@
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -6588,6 +6592,58 @@
+@@ -6588,6 +6596,107 @@
      return result;
  }
  
@@ -158,13 +188,62 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    return result;
 +}
 +
++struct ggml_tensor * ggml_dsv41_kgather2(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * win,
++        struct ggml_tensor  * widx,
++        struct ggml_tensor  * comp,
++        struct ggml_tensor  * sel,
++        int                   swa,
++        enum ggml_type        type) {
++    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
++    struct ggml_tensor * r = ggml_dsv41_kgather(ctx, win, widx, comp, sel, swa);
++    if (type == GGML_TYPE_F32) {
++        struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, r->ne[0], r->ne[1], r->ne[2], r->ne[3]);
++        ggml_set_op_params_i32(result, 0, swa);
++        result->op = GGML_OP_DSV41_KGATHER;
++        for (int i = 0; i < 4; ++i) result->src[i] = r->src[i];
++        return result;
++    }
++    return r;
++}
++
++struct ggml_tensor * ggml_dsv41_norm_mv(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * x,
++        float                 eps) {
++    GGML_ASSERT((w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32) && ggml_is_contiguous(w));
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == w->ne[0]);
++    const int64_t n = x->ne[1] * x->ne[2] * x->ne[3];
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[1], n);
++    ggml_set_op_params_f32(result, 0, eps);
++    result->op     = GGML_OP_DSV41_NORM_MV;
++    result->src[0] = w;
++    result->src[1] = x;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_swiglu_lim(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * y,
++        float                 lim) {
++    GGML_ASSERT(y->type == GGML_TYPE_F32 && ggml_is_contiguous(y) && y->ne[0] % 2 == 0);
++    const int64_t n = y->ne[1] * y->ne[2] * y->ne[3];
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, y->ne[0] / 2, n);
++    ggml_set_op_params_f32(result, 0, lim);
++    result->op     = GGML_OP_DSV41_SWIGLU_LIM;
++    result->src[0] = y;
++    return result;
++}
++
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2117,6 +2117,14 @@
+@@ -2117,6 +2117,22 @@
              {
                  ggml_compute_forward_dsv41_hc_mixes(params, tensor);
              } break;
@@ -176,10 +255,18 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 +            {
 +                ggml_compute_forward_dsv41_kgather(params, tensor);
 +            } break;
++        case GGML_OP_DSV41_NORM_MV:
++            {
++                ggml_compute_forward_dsv41_norm_mv(params, tensor);
++            } break;
++        case GGML_OP_DSV41_SWIGLU_LIM:
++            {
++                ggml_compute_forward_dsv41_swiglu_lim(params, tensor);
++            } break;
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2305,6 +2313,14 @@
+@@ -2305,6 +2321,16 @@
              {
                  n_tasks = n_threads;
              } break;
@@ -188,6 +275,8 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 +                n_tasks = 1;
 +            } break;
 +        case GGML_OP_DSV41_KGATHER:
++        case GGML_OP_DSV41_NORM_MV:
++        case GGML_OP_DSV41_SWIGLU_LIM:
 +            {
 +                n_tasks = n_threads;
 +            } break;
@@ -197,7 +286,7 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12293,3 +12293,61 @@
+@@ -12293,3 +12293,100 @@
          y[i] = post ? s * 2.0f : s + eps;
      }
  }
@@ -255,19 +344,60 @@ diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 +            if (comp->type == GGML_TYPE_F32) src = (const float *) s;
 +            else { ggml_get_type_traits(comp->type)->to_float(s, tmp.data(), DH); src = tmp.data(); }
 +        }
++        if (dst->type == GGML_TYPE_F32) {
++            float * of = (float *) dst->data + (size_t) row * DH;
++            for (int64_t d = 0; d < DH; ++d) of[d] = src[d];
++            continue;
++        }
 +        ggml_fp16_t * o = (ggml_fp16_t *) dst->data + (size_t) row * DH;
 +        for (int64_t d = 0; d < DH; ++d) o[d] = GGML_CPU_FP32_TO_FP16(src[d]);
++    }
++}
++
++// ggml_compute_forward_dsv41_norm_mv (larry): the reference of ggml-sycl's RMS-normed mat-vec
++void ggml_compute_forward_dsv41_norm_mv(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * w = dst->src[0];
++    const ggml_tensor * x = dst->src[1];
++    const int64_t C = w->ne[0], R = w->ne[1], n = dst->ne[1];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    for (int64_t j = params->ith; j < R * n; j += params->nth) {
++        const int64_t r = j % R, t = j / R;
++        const float * xt = (const float *) x->data + t * C;
++        double dot = 0, sq = 0;
++        for (int64_t c = 0; c < C; ++c) {
++            const float wv = w->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) w->data)[r * C + c])
++                                                      : ((const float *) w->data)[r * C + c];
++            dot += (double) wv * xt[c];
++            sq += (double) xt[c] * xt[c];
++        }
++        ((float *) dst->data)[t * R + r] = (float) dot * (1.0f / std::sqrt((float) (sq / C) + eps));
++    }
++}
++
++// ggml_compute_forward_dsv41_swiglu_lim (larry): the reference of ggml-sycl's clamped SwiGLU on gate|up rows
++void ggml_compute_forward_dsv41_swiglu_lim(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * y = dst->src[0];
++    const int64_t N = dst->ne[0], n = dst->ne[1];
++    const float lim = ggml_get_op_params_f32(dst, 0);
++    for (int64_t j = params->ith; j < N * n; j += params->nth) {
++        const int64_t i = j % N, t = j / N;
++        const float * yt = (const float *) y->data + t * 2 * N;
++        float g = yt[i], u = yt[N + i];
++        if (lim > 0) { g = g > lim ? lim : g; u = u > lim ? lim : (u < -lim ? -lim : u); }
++        ((float *) dst->data)[t * N + i] = g / (1.0f + std::exp(-g)) * u;
 +    }
 +}
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
-@@ -110,6 +110,8 @@
+@@ -110,6 +110,10 @@
  void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv41_fake_quant(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv41_hc_mixes(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_dsv41_router(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_dsv41_kgather(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_norm_mv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_swiglu_lim(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -324,7 +454,7 @@ diff --git a/ggml/src/ggml-sycl/dsv41-fused.cpp b/ggml/src/ggml-sycl/dsv41-fused
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-fused.cpp
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,361 @@
 +// ggml-sycl/dsv41-fused.cpp - larry (Strata-DS4 on Intel): the two fused DeepSeek-V4.1 ops of Xolotl's ggml patch
 +// (GGML_OP_DSV41_FAKE_QUANT, GGML_OP_DSV41_HC_MIXES) for the SYCL backend.  The CUDA versions (ggml-cuda/dsv4-hc.cu)
 +// reproduce the stock-op composites of tools/v41/engine with float tricks (x + 1.5*2^23 - 1.5*2^23 for round-half-even,
@@ -559,7 +689,10 @@ new file mode 100644
 +    const ggml_tensor * sel = dst->src[3];
 +    const int64_t DH = dst->ne[0], M = dst->ne[1], n = dst->ne[3];
 +    const int64_t SWA = ggml_get_op_params_i32(dst, 0);
-+    GGML_ASSERT(DH % 8 == 0 && win->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16 && ggml_is_contiguous(dst));
++    GGML_ASSERT(DH % 8 == 0 && win->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
++    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
++    const bool out32 = dst->type == GGML_TYPE_F32;
++    float * po32 = (float *) dst->data;
 +    GGML_ASSERT(win->nb[1] % 16 == 0 && (!comp || comp->nb[1] % 16 == 0));
 +    const char * pw = (const char *) win->data;
 +    const size_t wnb = win->nb[1];
@@ -598,17 +731,96 @@ new file mode 100644
 +                f[0] = a.x(); f[1] = a.y(); f[2] = a.z(); f[3] = a.w(); f[4] = b.x(); f[5] = b.y(); f[6] = b.z(); f[7] = b.w();
 +            }
 +        }
++        if (out32) {
++            float * of = po32 + (size_t) row * DH + v * 8;
++            *(sycl::float4 *) of = sycl::float4(f[0], f[1], f[2], f[3]);
++            *(sycl::float4 *) (of + 4) = sycl::float4(f[4], f[5], f[6], f[7]);
++            return;
++        }
 +        sycl::vec<sycl::half, 8> o;
 +#pragma unroll
 +        for (int j = 0; j < 8; ++j) o[j] = (sycl::half) f[j];
 +        *(sycl::vec<sycl::half, 8> *) (po + (size_t) row * DH + v * 8) = o;
 +    });
 +}
++
++// GGML_OP_DSV41_NORM_MV (larry): a work-group per (token, output row): its lanes walk the row 8 values at a time,
++// summing w . x and x . x together; out = dot * rsqrt(mean(x^2) + eps) (the norm folded out of the product)
++void ggml_sycl_op_dsv41_norm_mv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
++    const ggml_tensor * w = dst->src[0];
++    const ggml_tensor * x = dst->src[1];
++    const int64_t C = w->ne[0], R = w->ne[1], n = dst->ne[1];
++    GGML_ASSERT(C % 8 == 0 && x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const bool w16 = w->type == GGML_TYPE_F16;
++    const void * pw = w->data;
++    const float * px = (const float *) x->data;
++    float * pd = (float *) dst->data;
++    constexpr int WG = 256;
++    ctx.stream()->submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> sd(sycl::range<1>(WG / 16), h), ss(sycl::range<1>(WG / 16), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * R) * WG), sycl::range<1>(WG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int64_t g = (int64_t) it.get_group(0), r = g % R, t = g / R;
++            const int lid = (int) it.get_local_id(0);
++            const float * xt = px + t * C;
++            float dot = 0.0f, sq = 0.0f;
++            for (int64_t c = (int64_t) lid * 8; c < C; c += (int64_t) WG * 8) {
++                const sycl::float4 xa = *(const sycl::float4 *) (xt + c), xb = *(const sycl::float4 *) (xt + c + 4);
++                float wv[8];
++                if (w16) {
++                    const sycl::vec<sycl::half, 8> hv = *(const sycl::vec<sycl::half, 8> *) ((const sycl::half *) pw + r * C + c);
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) wv[j] = (float) hv[j];
++                } else {
++                    const float * wr = (const float *) pw + r * C + c;
++                    const sycl::float4 wa = *(const sycl::float4 *) wr, wb = *(const sycl::float4 *) (wr + 4);
++                    wv[0] = wa.x(); wv[1] = wa.y(); wv[2] = wa.z(); wv[3] = wa.w(); wv[4] = wb.x(); wv[5] = wb.y(); wv[6] = wb.z(); wv[7] = wb.w();
++                }
++                const float xv[8] = { xa.x(), xa.y(), xa.z(), xa.w(), xb.x(), xb.y(), xb.z(), xb.w() };
++#pragma unroll
++                for (int j = 0; j < 8; ++j) { dot += wv[j] * xv[j]; sq += xv[j] * xv[j]; }
++            }
++            const sycl::sub_group sg = it.get_sub_group();
++            dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
++            sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
++            const int sgi = (int) sg.get_group_linear_id();
++            if (sg.get_local_linear_id() == 0) { sd[sgi] = dot; ss[sgi] = sq; }
++            it.barrier(sycl::access::fence_space::local_space);
++            if (lid == 0) {
++                float D = 0.0f, Q = 0.0f;
++                for (int k = 0; k < WG / 16; ++k) { D += sd[k]; Q += ss[k]; }
++                pd[t * R + r] = D * sycl::rsqrt(Q / (float) C + eps);
++            }
++        });
++    });
++}
++
++// GGML_OP_DSV41_SWIGLU_LIM (larry): out = silu(min(gate, lim)) * clamp(up, -lim, lim), one work-item an element
++// (op_silu / the clamp of ggml-sycl's own ops, the same arithmetic)
++void ggml_sycl_op_dsv41_swiglu_lim(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
++    const ggml_tensor * y = dst->src[0];
++    const int64_t N = dst->ne[0], n = dst->ne[1];
++    const float lim = ggml_get_op_params_f32(dst, 0);
++    const float * py = (const float *) y->data;
++    float * pd = (float *) dst->data;
++    ctx.stream()->parallel_for(sycl::range<1>((size_t) (N * n)), [=](sycl::id<1> id) {
++        const int64_t i = (int64_t) id[0] % N, t = (int64_t) id[0] / N;
++        float g = py[t * 2 * N + i], u = py[t * 2 * N + N + i];
++        if (lim > 0.0f) {
++            g = g > lim ? lim : g;
++            u = u < -lim ? -lim : (u > lim ? lim : u);
++        }
++        pd[t * N + i] = g / (1.0f + sycl::exp(-g)) * u;
++    });
++}
 diff --git a/ggml/src/ggml-sycl/dsv41-fused.hpp b/ggml/src/ggml-sycl/dsv41-fused.hpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-fused.hpp
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,17 @@
 +#ifndef GGML_SYCL_DSV41_FUSED_HPP
 +#define GGML_SYCL_DSV41_FUSED_HPP
 +
@@ -621,6 +833,9 @@ new file mode 100644
 +void ggml_sycl_op_dsv41_router(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +// larry: DeepSeek-V4.1's per-query attention keys in f16 (GGML_OP_DSV41_KGATHER)
 +void ggml_sycl_op_dsv41_kgather(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// larry: an RMS-normed mat-vec (GGML_OP_DSV41_NORM_MV) and the clamped SwiGLU on gate|up rows (GGML_OP_DSV41_SWIGLU_LIM)
++void ggml_sycl_op_dsv41_norm_mv(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++void ggml_sycl_op_dsv41_swiglu_lim(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +
 +#endif  // GGML_SYCL_DSV41_FUSED_HPP
 diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
@@ -2179,7 +2394,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +5651,18 @@
+@@ -5434,6 +5651,24 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -2195,10 +2410,16 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +        case GGML_OP_DSV41_KGATHER:
 +            ggml_sycl_op_dsv41_kgather(ctx, dst);
 +            break;
++        case GGML_OP_DSV41_NORM_MV:
++            ggml_sycl_op_dsv41_norm_mv(ctx, dst);
++            break;
++        case GGML_OP_DSV41_SWIGLU_LIM:
++            ggml_sycl_op_dsv41_swiglu_lim(ctx, dst);
++            break;
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6205,33 @@
+@@ -5976,6 +6211,33 @@
      return skip;
  }
  
@@ -2232,7 +2453,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6322,29 @@
+@@ -6066,6 +6328,29 @@
              continue;
          }
  
@@ -2262,7 +2483,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6398,64 @@
+@@ -6119,6 +6404,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -2327,7 +2548,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +6566,12 @@
+@@ -6229,6 +6572,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -2340,7 +2561,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +6812,15 @@
+@@ -6469,6 +6818,19 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -2353,6 +2574,10 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
 +        case GGML_OP_DSV41_KGATHER:
 +            return op->ne[0] % 8 == 0 && op->src[0]->nb[1] % 16 == 0 && (!op->src[2] || op->src[2]->nb[1] % 16 == 0);
++        case GGML_OP_DSV41_NORM_MV:
++            return op->src[1]->ne[0] % 8 == 0;
++        case GGML_OP_DSV41_SWIGLU_LIM:
++            return true;
          case GGML_OP_LIGHTNING_INDEXER:
              return op->src[0]->type == GGML_TYPE_F32 &&
                  (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||

@@ -282,6 +282,7 @@ struct Ds41Dense::Impl {
     bool compute(ggml_cgraph * gf, bool cached, bool async = false, bool nosync = false);
     std::mutex * sub_mu = nullptr;            // larry: set_submit_lock
     bool fn_host = true;                      // larry: set_fn_host
+    std::function<void(int, int)> pre_wait;   // larry: set_pre_wait_hook
     std::atomic<int> * sub_prio = nullptr;    // larry: raised while waiting for sub_mu (the tier's threads hold off)
     ggml_backend_event_t rb_ev = nullptr;   // larry: the router readbacks' event (async decode / verify layers)
     // larry: a decode / verify pass's inputs go up through a pinned staging buffer with async copies (each
@@ -474,9 +475,16 @@ struct B {
     void hc_mixes(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * sc, ggml_tensor * bs,
                   ggml_tensor ** pre, ggml_tensor ** post, ggml_tensor ** comb) const {
         const int64_t HC = g->hc, nt = x->ne[2], D = g->n_embd;
-        ggml_tensor * flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(c, fn, flat);                                  // [24, n]
-        ggml_mul_mat_set_prec(mixes, GGML_PREC_F32);
+        // larry, STRATA_DEC_FUSE: decode / verify widths take the norm folded into the mat-vec (one kernel, not two)
+        static const bool dec_fuse = env_on("STRATA_DEC_FUSE", true);
+        ggml_tensor * mixes = nullptr;
+        if (dec_fuse && im->sycl && nt <= 8 && ggml_is_contiguous(x)) {
+            mixes = ggml_dsv41_norm_mv(c, fn, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);   // [24, n]
+        } else {
+            ggml_tensor * flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);
+            mixes = ggml_mul_mat(c, fn, flat);                                                 // [24, n]
+            ggml_mul_mat_set_prec(mixes, GGML_PREC_F32);
+        }
 #if defined(STRATA_DSV41_HC_MIX)
         // -DSTRATA_DSV41_HC_MIX=ON on a llama.cpp tree patched with tools/v41/ggml/dsv41-fuse.patch: the two mixes as
         // ONE op (GGML_OP_DSV41_HC_MIXES), the same mul/add/sigmoid/scale steps bit for bit (test_ds41_hcmix).  It
@@ -587,6 +595,9 @@ static ggml_tensor * shexp_ffn(Ds41Dense::Impl & im, ggml_context * gc, int il, 
     if (igu != im.w.t.end()) {   // larry: one mat-vec for both (rows: gate, then up)
         ggml_tensor * y = ggml_mul_mat(gc, igu->second, fn);                                   // [2N, n]
         const int64_t N = igu->second->ne[1] / 2, n = fn->ne[1];
+        static const bool dec_fuse = env_on("STRATA_DEC_FUSE", true);
+        if (dec_fuse && im.sycl && n <= 8)   // larry: clamp / clamp / swiglu (and the conts) as one kernel
+            return ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_dsv41_swiglu_lim(gc, y, lim));
         gt = ggml_view_2d(gc, y, N, n, y->nb[1], 0);
         up = ggml_view_2d(gc, y, N, n, y->nb[1], (size_t) N * ggml_element_size(y));
         if (n > 1) { gt = ggml_cont(gc, gt); up = ggml_cont(gc, up); }
@@ -794,8 +805,13 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // Kw / Kc / Kall are then unused and drop out of the graph
     static const bool kgather = env_on("STRATA_KGATHER", true);
     ggml_tensor * k4 = nullptr;
+    static const bool dec_fuse = env_on("STRATA_DEC_FUSE", true);
     if (sycl_mqa && kgather) {
         k4 = ggml_dsv41_kgather(gc, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, (int) SWA);
+        GGML_ASSERT(k4->ne[1] == M);
+    } else if (sycl_dec && kgather && dec_fuse && (!Kc || kg_sel->nb[0] == 4)) {
+        // larry: decode / verify: the window rows, the compressed rows and their concat as one f32 gather
+        k4 = ggml_dsv41_kgather2(gc, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, (int) SWA, GGML_TYPE_F32);
         GGML_ASSERT(k4->ne[1] == M);
     } else {
         k4 = ggml_reshape_4d(gc, Kall, DH, M, 1, n);
@@ -890,6 +906,10 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
     outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
     outs.push_back(ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, n, col0)));   // reads of pre_state happen above
+    // larry, STRATA_CPY_LAST (default 1): every output copy's source first, then the copies - consecutive plain copies
+    // run as one batched kernel in ggml-sycl (each used to sit right after its source: its own command)
+    static const bool cpy_last = env_on("STRATA_CPY_LAST", true);
+    if (cpy_last) for (ggml_tensor * t : outs) if (t->op == GGML_OP_CPY && t->src[0]) ggml_build_forward_expand(gf, t->src[0]);
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
     for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
     return gf;
@@ -1761,6 +1781,7 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     return true;
 }
 
+void Ds41Dense::set_pre_wait_hook(std::function<void(int, int)> h) { p_->pre_wait = std::move(h); }
 void Ds41Dense::set_submit_lock(std::mutex * m, std::atomic<int> * prio) { p_->sub_mu = m; p_->sub_prio = m ? prio : nullptr; }
 
 bool Ds41Dense::upload_routed(const float * routed_host, int B) {
@@ -1875,6 +1896,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     if (async && im.rb_ev && !shexp()) return false;
     if (tl) ds41_dense_tl_hook(tlo + 2);
     const double tp2 = g_decprof_on ? dprof_now() : 0;
+    if (async && im.rb_ev && im.pre_wait) im.pre_wait(il, (int) n);   // larry: the tier arms its cards meanwhile
     if (async && im.rb_ev) ggml_backend_event_synchronize(im.rb_ev);
     else ggml_backend_synchronize(im.backend);
     const double tp3 = g_decprof_on ? dprof_now() : 0;

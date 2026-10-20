@@ -419,7 +419,12 @@ int main(int argc, char ** argv) {
 #if defined(DS41_XE)
     if (!tier.init(TG, &src, mc, mc.cpu_only ? nullptr : dense.routed_dev(), err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
     // the decode / verify sums on the dense half's queue: no host wait per layer (STRATA_XE_SYNC=1: the tier waits)
-    if (!mc.cpu_only && !std::getenv("STRATA_XE_SYNC")) tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
+    if (!mc.cpu_only && !std::getenv("STRATA_XE_SYNC")) {
+        tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
+#if defined(DS41_XE)
+        dense.set_pre_wait_hook([&tier](int il, int n) { tier.arm(il, n); });   // larry: STRATA_XE_ARM
+#endif
+    }
     // STRATA_GPU_TL=1: the decode layer's stage boundaries as device timestamps on the dense queue (diagnostic)
     static Ds41XeTier * tl_tier = &tier;
     // STRATA_HEAD_SPLIT (default 1): the LM head (and the DSpark draft's shared head) split over every card

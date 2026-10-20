@@ -108,6 +108,10 @@ public:
     bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// larry, STRATA_XE_ARM: queue the expert cards' share of the coming decode / verify call of `layer` (nt tokens)
+    /// before its routing is known - they wait on a release that run_to_dev / run_multi_to_dev give them once the
+    /// routing is in (anything else releases them with null jobs).  The dense half calls it before its readback wait.
+    void arm(int64_t layer, int nt);
     bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
 
