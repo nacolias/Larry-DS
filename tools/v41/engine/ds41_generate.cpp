@@ -339,6 +339,16 @@ int main(int argc, char ** argv) {
     std::string err;
     const double t_load = now_ms();
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
+#if defined(DS41_XE)
+    // larry: the dense weights' planar reorder now, not inside the first decode token (STRATA_PREREORDER, default 1)
+    if (dense.backend() && !ggml_backend_is_cpu(dense.backend()) && !(std::getenv("STRATA_PREREORDER") && std::getenv("STRATA_PREREORDER")[0] == '0')) {
+        const double t0 = now_ms();
+        int nr = 0;
+        for (ggml_tensor * t : dense.reorder_weights()) nr += ggml_backend_sycl_prereorder(dense.backend(), t) ? 1 : 0;
+        ggml_backend_synchronize(dense.backend());
+        std::fprintf(stderr, "dense: %d Q6_K weights reordered at load (%.2f s)\n", nr, (now_ms() - t0) / 1000.0);
+    }
+#endif
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
@@ -412,6 +422,9 @@ int main(int argc, char ** argv) {
     if (!mc.cpu_only && !std::getenv("STRATA_XE_SYNC")) tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
     // STRATA_GPU_TL=1: the decode layer's stage boundaries as device timestamps on the dense queue (diagnostic)
     static Ds41XeTier * tl_tier = &tier;
+    // STRATA_HEAD_SPLIT (default 1): the LM head (and the DSpark draft's shared head) split over every card
+    if (!mc.cpu_only && !(std::getenv("STRATA_HEAD_SPLIT") && std::getenv("STRATA_HEAD_SPLIT")[0] == '0'))
+        ggml_backend_sycl_set_mv_hook(&Ds41XeTier::mv_hook, &tier, 200.0);
     if (Ds41XeTier::tl_on()) ds41_dense_tl_hook = [](int id) { tl_tier->tl_tag(id); };
 #else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }

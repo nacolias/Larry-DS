@@ -32,12 +32,21 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 --- a/ggml/include/ggml-sycl.h
 +++ b/ggml/include/ggml-sycl.h
-@@ -21,6 +21,9 @@
+@@ -21,6 +21,18 @@
  
  GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
  
 +// larry: the backend's compute queue (a sycl::queue *, in order), so other SYCL code can order work against it
 +GGML_BACKEND_API void * ggml_backend_sycl_get_queue(ggml_backend_t backend);
++// larry: an external launcher for the dense card's largest Q6_K mat-vecs (the LM head): called with the backend's queue,
++// the R8-reordered weight, its shape, the int8 activations (+ per-32 scales) of ncols columns and y (column stride in
++// floats); it returns true if it queued the whole product, ordered on that queue.  Weights under min_mb never reach it.
++typedef bool (*ggml_sycl_larry_mv_hook_t)(void * queue, const void * w, int64_t K, int64_t N, int ncols, const int8_t * xq,
++                                          const float * xd, float * y, int64_t y_col_stride, void * user);
++// larry: reorder a 2-D Q6_K weight into the planar layout now (it happens lazily at its first decode-shaped product
++// otherwise: ~200 dense weights and a host wait each inside the first decode token).  True if it is reordered.
++GGML_BACKEND_API bool ggml_backend_sycl_prereorder(ggml_backend_t backend, struct ggml_tensor * t);
++GGML_BACKEND_API void ggml_backend_sycl_set_mv_hook(ggml_sycl_larry_mv_hook_t fn, void * user, double min_mb);
 +
  // devide buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
@@ -484,7 +493,7 @@ diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fastmv.cpp
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,584 @@
 +// ggml-sycl/fastmv.cpp - see fastmv.hpp.
 +#include "fastmv.hpp"
 +
@@ -962,9 +971,8 @@ new file mode 100644
 +    // in the 256-register mode (5 columns: q_b 86 -> 65 us, o_b 112 -> 73 us; 1 column with long rows: o_b 78 -> 69),
 +    // smaller ones with several columns two rows per group (shexp 32 -> 30), the rest (and kv) the generic kernel
 +    const double mb = (double) a.N * (double) a.K * (double) a.G * (210.0 / 256.0) / 1e6;
-+    if (a.ncols == 1) {
-+        if (mb >= 16 && a.K >= 4096) return r8m_cols<2, true>(q, a);
-+        if (mb >= 16) return r8m_cols<2, false>(q, a);
++    if (a.ncols == 1) {   // DRAM-resident weights (bench/fm2/fastmv_bench_cold): q_b 76 -> 74.5 us, o_b 80 -> 77
++        if (mb >= 16) return r8m_cols<2, true>(q, a);
 +        return false;
 +    }
 +    if (mb >= 16) return r8m_cols<2, true>(q, a);
@@ -1786,7 +1794,26 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #include "ggml-sycl/lightning-indexer.hpp"
  #include "ggml-sycl/conv2d.hpp"
  #include "ggml-sycl/conv2d-dw.hpp"
-@@ -4734,6 +4737,135 @@
+@@ -4667,6 +4670,18 @@
+            dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+ }
+ 
++bool ggml_backend_sycl_prereorder(ggml_backend_t backend, ggml_tensor * t) {
++    if (!backend || !t || t->type != GGML_TYPE_Q6_K || t->ne[2] != 1 || t->ne[3] != 1 || t->view_src) return false;
++    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
++    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) return false;
++    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(t->extra);
++    if (!extra) return false;
++    if (extra->optimized_feature.reorder) return true;
++    if (!reorder_qw(t, ctx->stream())) return false;
++    extra->optimized_feature.reorder = true;
++    return true;
++}
++
+ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
+                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
+     if (!should_reorder_tensor(*ctx, dst)) {
+@@ -4734,6 +4749,185 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -1832,6 +1859,29 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    }
 +    return true;
 +}
++
++// larry: the int8 activations of the last Q6K_R8 mat-vec, per backend context - mat-vecs of one graph that share their
++// input (q_a / kv / the compressor and indexer projections read attn_norm(x); the shared expert's gate and up read
++// ffn_norm(h)) quantise it once (GGML_SYCL_LARRY_QREUSE, default 1).  A graph's tensors do not change once computed;
++// the cache dies with the graph (g_larry_graph_epoch), and in-order execution makes reusing its buffer safe.
++static ggml_sycl_larry_mv_hook_t g_larry_mv_hook = nullptr;
++static void * g_larry_mv_user = nullptr;
++static double g_larry_mv_mb = 0.0;
++void ggml_backend_sycl_set_mv_hook(ggml_sycl_larry_mv_hook_t fn, void * user, double min_mb) {
++    g_larry_mv_hook = fn; g_larry_mv_user = user; g_larry_mv_mb = min_mb;
++}
++
++struct larry_qcache {
++    const ggml_tensor * t = nullptr;
++    const void * data = nullptr;
++    int64_t K = 0, ncols = 0, G = 0, xc = 0, xb = 0;
++    uint64_t epoch = 0;
++    int8_t * xq = nullptr;
++    float * xd = nullptr;
++    size_t cap = 0;   // int8 elements
++};
++static std::unordered_map<const void *, larry_qcache> g_larry_qcache;
++static uint64_t g_larry_graph_epoch = 1;
 +
 +static bool larry_fastmv(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 +    static const int on = ggml_sycl_get_env("GGML_SYCL_LARRY_FASTMV", 1);
@@ -1908,6 +1958,33 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    a.y = (float *) dst->data;
 +    a.y_col_stride = (int64_t) (dst->nb[1] / 4); a.y_batch_stride = (int64_t) (dst->nb[2] / 4);
 +    a.ncols = (int) ncols;
++    static const int qreuse = ggml_sycl_get_env("GGML_SYCL_LARRY_QREUSE", 1);
++    if (t == fastmv::WType::Q6K_R8 && qreuse) {
++        larry_qcache & qc = g_larry_qcache[&ctx];
++        const size_t need = (size_t) G * ncols * K;
++        const bool hit = qc.epoch == g_larry_graph_epoch && qc.t == src1 && qc.data == src1->data && qc.K == K &&
++                         qc.ncols == ncols && qc.G == G && qc.xc == a.x_col_stride && qc.xb == a.x_batch_stride;
++        if (!hit) {
++            if (need > qc.cap) {   // grows a few times early on: queued kernels may still read the old buffer
++                ctx.stream()->wait();
++                if (qc.xq) { sycl::free(qc.xq, *ctx.stream()); sycl::free(qc.xd, *ctx.stream()); }
++                qc.cap = std::max<size_t>(need, (size_t) 8 * 32768);
++                qc.xq = sycl::malloc_device<int8_t>(qc.cap, *ctx.stream());
++                qc.xd = sycl::malloc_device<float>(qc.cap / 32, *ctx.stream());
++                if (!qc.xq || !qc.xd) GGML_ABORT("larry_fastmv: activation cache allocation failed");
++            }
++            fastmv::quant_x(*ctx.stream(), a.x, a.x_col_stride, a.x_batch_stride, (int) ncols, G, K, qc.xq, qc.xd);
++            qc.t = src1; qc.data = src1->data; qc.K = K; qc.ncols = ncols; qc.G = G;
++            qc.xc = a.x_col_stride; qc.xb = a.x_batch_stride; qc.epoch = g_larry_graph_epoch;
++        }
++        a.xq = qc.xq;
++        a.xd = qc.xd;
++        // the activations are the cache's plain device allocation (the pool's are VMM, mapped for this card only)
++        if (g_larry_mv_hook && G == 1 && src0->ne[2] == 1 && (double) N * K * 210.0 / 256.0 >= g_larry_mv_mb * 1e6 &&
++            g_larry_mv_hook(ctx.stream(), src0->data, K, N, (int) ncols, a.xq, a.xd, a.y, a.y_col_stride, g_larry_mv_user))
++            return true;
++        return fastmv::launch(*ctx.stream(), t, a);
++    }
 +    if (t == fastmv::WType::Q6K_R8) {   // the int8 activations: freed back to the pool after this op is queued (in order)
 +        ggml_sycl_pool_alloc<int8_t> xq(ctx.pool(), (size_t) G * ncols * K);
 +        ggml_sycl_pool_alloc<float> xd(ctx.pool(), (size_t) G * ncols * K / 32);
@@ -1922,7 +1999,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +4879,9 @@
+@@ -4747,6 +4941,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -1932,7 +2009,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5134,6 +5269,22 @@
+@@ -5134,6 +5331,22 @@
              return;
          }
      }
@@ -1955,7 +2032,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +5585,15 @@
+@@ -5434,6 +5647,15 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -1971,10 +2048,77 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -6121,6 +6281,63 @@
-     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+@@ -5976,6 +6198,33 @@
+     return skip;
+ }
  
- #ifdef GGML_SYCL_GRAPH
++// larry: a run of plain copies (CPY / DUP / CONT between contiguous tensors of one type: each a queue memcpy) as ONE
++// kernel - DeepSeek-V4.1's attention graph ends with ~7 of them (its outputs into persistent tensors), every one a
++// separate command (GGML_SYCL_LARRY_CPYBATCH, default 1)
++struct larry_cpy_seg { const uint32_t * s; uint32_t * d; uint32_t n; };
++static bool larry_cpy_plain(const ggml_tensor * node, larry_cpy_seg & g) {
++    const ggml_tensor * src = nullptr, * dst = nullptr;
++    if (node->op == GGML_OP_CPY) { src = node->src[0]; dst = node->src[1]; }
++    else if (node->op == GGML_OP_DUP || node->op == GGML_OP_CONT) { src = node->src[0]; dst = node; }
++    else return false;
++    if (!src || !dst || src->type != dst->type || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) return false;
++    const size_t nb = ggml_nbytes(src);
++    if (nb != ggml_nbytes(dst) || nb % 4 || nb == 0 || nb >= ((size_t) 1 << 31) ||
++        ((uintptr_t) src->data) % 4 || ((uintptr_t) dst->data) % 4) return false;
++    g = {(const uint32_t *) src->data, (uint32_t *) dst->data, (uint32_t) (nb / 4)};
++    return true;
++}
++static void larry_cpy_batch(sycl::queue & q, const larry_cpy_seg * seg, int ns) {
++    struct P { const uint32_t * s[8]; uint32_t * d[8]; uint32_t n[8]; } p{};
++    uint32_t mx = 0;
++    for (int k = 0; k < ns; ++k) { p.s[k] = seg[k].s; p.d[k] = seg[k].d; p.n[k] = seg[k].n; mx = std::max(mx, seg[k].n); }
++    const size_t R = std::min<size_t>(((size_t) mx + 255) / 256 * 256, 16384);
++    q.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) ns, R), sycl::range<2>(1, 256)), [=](sycl::nd_item<2> it) {
++        const int k = (int) it.get_global_id(0);
++        for (size_t i = it.get_global_id(1); i < p.n[k]; i += R) p.d[k][i] = p.s[k][i];
++    });
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+ 
+@@ -6066,6 +6315,29 @@
+             continue;
+         }
+ 
++        static const int cpy_batch = ggml_sycl_get_env("GGML_SYCL_LARRY_CPYBATCH", 1);
++        larry_cpy_seg seg[8];
++        if (cpy_batch && larry_cpy_plain(node, seg[0])) {
++            int ns = 1, j = i + 1, last = i;
++            for (; j < cgraph->n_nodes && ns < 8; ++j) {
++                ggml_tensor * nj = cgraph->nodes[j];
++                if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
++                if (!larry_cpy_plain(nj, seg[ns])) break;
++                bool clash = false;   // all run at once: no copy may touch what another one writes
++                auto ov = [](const uint32_t * a, uint32_t na, const uint32_t * b, uint32_t nb) { return a < b + nb && b < a + na; };
++                for (int k = 0; k < ns && !clash; ++k)
++                    clash = ov(seg[ns].s, seg[ns].n, seg[k].d, seg[k].n) || ov(seg[ns].d, seg[ns].n, seg[k].s, seg[k].n) ||
++                            ov(seg[ns].d, seg[ns].n, seg[k].d, seg[k].n);
++                if (clash) break;
++                ++ns;
++                last = j;
++            }
++            if (ns >= 2) {
++                larry_cpy_batch(*sycl_ctx->stream(), seg, ns);
++                i = last;
++                continue;
++            }
++        }
+         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+         if (!ok) {
+             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -6119,6 +6391,64 @@
+ 
+ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
++    ++g_larry_graph_epoch;   // larry: no activation reuse across graphs
++
++#ifdef GGML_SYCL_GRAPH
 +    // larry: a graph its caller keeps (cgraph->uid != 0: allocated once, recomputed every step - DeepSeek-V4.1's
 +    // per-layer decode graphs) is recorded once into a SYCL graph and replayed.  A small kernel costs ~3.4 us
 +    // start-to-start in an in-order queue on the B70 and ~0.85 us inside a replayed graph, and the host submits one
@@ -2030,12 +2174,10 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +        return GGML_STATUS_SUCCESS;
 +    }
 +#endif
-+
-+#ifdef GGML_SYCL_GRAPH
+ 
+ #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-     if (g_ggml_sycl_enable_graph) {
-         use_sycl_graph = check_graph_compatibility(cgraph);
-@@ -6229,6 +6446,12 @@
+@@ -6229,6 +6559,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -2048,7 +2190,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +6692,13 @@
+@@ -6469,6 +6805,13 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -2152,3 +2294,87 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
      const ggml_tensor * q = dst->src[0];
      const ggml_tensor * k = dst->src[1];
+diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
+--- a/ggml/src/ggml-sycl/norm.cpp
++++ b/ggml/src/ggml-sycl/norm.cpp
+@@ -355,7 +355,11 @@
+     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
+ 
+     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
+-    if (ncols < 1024) {
++    // larry: a decode-sized launch (<= 64 rows) of short rows (kv_norm: 512) on one 16-lane sub-group walks 32 values a
++    // lane (~9.7 us); a 256-lane work-group takes the shared-sum path instead (GGML_SYCL_LARRY_NORM_SMALL, default 1)
++    static const int larry_small = ggml_sycl_get_env("GGML_SYCL_LARRY_NORM_SMALL", 1);
++    const bool larry_few = larry_small && (int64_t) nrows * nchannels * nsamples <= 64 && ncols >= 64;
++    if (ncols < 1024 && !larry_few) {
+         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+         stream->submit([&](sycl::handler& cgh) {
+             cgh.parallel_for(
+@@ -370,7 +374,12 @@
+             });
+     }
+     else {
+-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
++        // larry: GGML_SYCL_LARRY_NORM_WG (default 0 = the device maximum): smaller groups measured slower for decode
++        // rows (256: 32.2 -> 30.0 tok/s, 128: 27.4) - every lane walks its values serially
++        static const int larry_wg = ggml_sycl_get_env("GGML_SYCL_LARRY_NORM_WG", 0);
++        const int work_group_size = ncols < 1024 ? 256 :
++                                    larry_wg > 0 ? std::min(larry_wg, ggml_sycl_info().max_work_group_sizes[device])
++                                                 : ggml_sycl_info().max_work_group_sizes[device];
+         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+         const sycl::range<3> block_dims(1, 1, work_group_size);
+         /*
+@@ -402,7 +411,11 @@
+         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
+         const float eps, queue_ptr stream, int device) {
+     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
+-    if (ncols < 1024) {
++    // larry: a decode-sized launch (<= 64 rows) of short rows (kv_norm: 512) on one 16-lane sub-group walks 32 values a
++    // lane (~9.7 us); a 256-lane work-group takes the shared-sum path instead (GGML_SYCL_LARRY_NORM_SMALL, default 1)
++    static const int larry_small = ggml_sycl_get_env("GGML_SYCL_LARRY_NORM_SMALL", 1);
++    const bool larry_few = larry_small && (int64_t) nrows * nchannels * nsamples <= 64 && ncols >= 64;
++    if (ncols < 1024 && !larry_few) {
+         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+         stream->submit([&](sycl::handler& cgh) {
+             cgh.parallel_for(
+@@ -418,7 +431,12 @@
+             });
+     }
+     else {
+-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
++        // larry: GGML_SYCL_LARRY_NORM_WG (default 0 = the device maximum): smaller groups measured slower for decode
++        // rows (256: 32.2 -> 30.0 tok/s, 128: 27.4) - every lane walks its values serially
++        static const int larry_wg = ggml_sycl_get_env("GGML_SYCL_LARRY_NORM_WG", 0);
++        const int work_group_size = ncols < 1024 ? 256 :
++                                    larry_wg > 0 ? std::min(larry_wg, ggml_sycl_info().max_work_group_sizes[device])
++                                                 : ggml_sycl_info().max_work_group_sizes[device];
+         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+         const sycl::range<3> block_dims(1, 1, work_group_size);
+         stream->submit([&](sycl::handler& cgh) {
+@@ -447,7 +465,11 @@
+         const int add_nrows, const int add_nchannels, const int add_nsamples,
+         const float eps, queue_ptr stream, int device) {
+     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
+-    if (ncols < 1024) {
++    // larry: a decode-sized launch (<= 64 rows) of short rows (kv_norm: 512) on one 16-lane sub-group walks 32 values a
++    // lane (~9.7 us); a 256-lane work-group takes the shared-sum path instead (GGML_SYCL_LARRY_NORM_SMALL, default 1)
++    static const int larry_small = ggml_sycl_get_env("GGML_SYCL_LARRY_NORM_SMALL", 1);
++    const bool larry_few = larry_small && (int64_t) nrows * nchannels * nsamples <= 64 && ncols >= 64;
++    if (ncols < 1024 && !larry_few) {
+         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+         stream->submit([&](sycl::handler& cgh) {
+             cgh.parallel_for(
+@@ -464,7 +486,12 @@
+             });
+     }
+     else {
+-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
++        // larry: GGML_SYCL_LARRY_NORM_WG (default 0 = the device maximum): smaller groups measured slower for decode
++        // rows (256: 32.2 -> 30.0 tok/s, 128: 27.4) - every lane walks its values serially
++        static const int larry_wg = ggml_sycl_get_env("GGML_SYCL_LARRY_NORM_WG", 0);
++        const int work_group_size = ncols < 1024 ? 256 :
++                                    larry_wg > 0 ? std::min(larry_wg, ggml_sycl_info().max_work_group_sizes[device])
++                                                 : ggml_sycl_info().max_work_group_sizes[device];
+         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+         const sycl::range<3> block_dims(1, 1, work_group_size);
+         stream->submit([&](sycl::handler& cgh) {

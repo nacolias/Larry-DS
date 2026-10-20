@@ -1,6 +1,7 @@
 // tools/v41/engine/xe/ds41_xe_tier.cpp - see ds41_xe_tier.hpp.
 #include "ds41_xe_tier.hpp"
 #include "xe_kernels.hpp"
+#include "../../../../third_party/llama.cpp/ggml/src/ggml-sycl/fastmv.hpp"   // the head split's mat-vec
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -20,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -173,6 +175,16 @@ struct Ds41XeImpl {
     int64_t resident_n = 0;
     // CPU pool for the arena experts of a decode / verify call
     std::unique_ptr<cpu::ExpertPool> pool;
+    // the LM head split over the cards (mv_hook): per weight, the expert cards' row slices and their scratch
+    struct HeadSplit {
+        bool ok = false;
+        int64_t r[9] = {};              ///< rows [r[i], r[i+1]) on part i (part 0: the dense card)
+        std::vector<XeCard*> c;         ///< part i >= 1
+        std::vector<uint8_t*> w;
+        std::vector<int8_t*> xq;
+        std::vector<float*> xd, y;
+    };
+    std::map<const void*, HeadSplit> heads;
     // STRATA_XE_CPU_ASYNC (default 1): a decode / verify call's CPU-pool experts run on a helper thread (it drives
     // the pool) while the main thread dispatches the cards - they used to start only after every card's submission
     struct CpuTask { int64_t l; const void* ents; const float* x; float* hs; size_t n_out; };   ///< ents: std::vector<const Ent*>
@@ -188,6 +200,8 @@ struct Ds41XeImpl {
     std::vector<int> nact_fmt;             ///< format slots: distinct gu_act values
     std::vector<float> cpart;              ///< [job][8][n_embd] CPU expert outputs
     float* hsum = nullptr;                 ///< [8][n_embd] host-side sum (pinned: its copy to the dense card is async)
+    float* hslots = nullptr;               ///< [cards][8][n_embd] pinned: the expert cards' decode parts (STRATA_XE_HSLOTS)
+    bool host_slots = false;
     std::vector<uint8_t> ftmp;             ///< file-tier reads (decode)
     Ds41MoeStats st;
     std::mutex mu;
@@ -403,6 +417,12 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
     im.nact.assign((size_t) kMaxJobTok * std::max<size_t>(1, im.nact_fmt.size()) * cpu::kNativeActBytes, 0);
     if (!im.hsum) im.hsum = sycl::malloc_host<float>((size_t) kMaxJobTok * H, im.ctx);
     std::memset(im.hsum, 0, (size_t) kMaxJobTok * H * sizeof(float));
+    // STRATA_XE_HSLOTS (default 0): the expert cards write their decode / verify parts into pinned host slots that the
+    // dense card's sum reads over PCIe instead of card-to-card copies - measured slower (decode 33 -> 31 tok/s, verify
+    // 52 -> 62 ms/pass: kernels writing host memory crawl), kept for the record
+    im.host_slots = env_i("STRATA_XE_HSLOTS", 0) != 0;
+    if (im.host_slots && !im.hslots) im.hslots = sycl::malloc_host<float>(im.cards.size() * kMaxJobTok * H, im.ctx);
+    if (!im.hslots) im.host_slots = false;
     std::fprintf(stderr, "xe tier: %zu card(s), dense half on card %d; %lld classes, largest blob %.2f MiB, swiglu limit %g\n",
                  im.cards.size(), im.dense, (long long) NCL, im.blob_max / 1048576.0, (double) im.L);
     return true;
@@ -631,6 +651,80 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
 
 void Ds41XeTier::set_slot_gib(double gib) { im_->slot_gib = gib; }
 void Ds41XeTier::set_dense_queue(void* q) { im_->dense_q = (sycl::queue*) q; }
+
+namespace {
+Ds41XeImpl::HeadSplit head_init(Ds41XeImpl& im, const void* w, int64_t K, int64_t N) {
+    Ds41XeImpl::HeadSplit hs;
+    std::vector<XeCard*> parts;
+    for (auto& cp : im.cards) if (!cp->dense) parts.push_back(cp.get());
+    const int np = (int) std::min<size_t>(parts.size(), 7) + 1;
+    if (np < 2) return hs;
+    for (int i = 0; i <= np; ++i) hs.r[i] = N * i / np;
+    const int64_t bpr = K / 256, nb = N * bpr;
+    const size_t po[4] = {0, 128, 192, 208}, pb[4] = {128, 64, 16, 2};   // R8 planes: offset / bytes per block
+    for (int i = 1; i < np; ++i) {
+        XeCard& c = *parts[(size_t) i - 1];
+        const int64_t rows = hs.r[i + 1] - hs.r[i], b0 = hs.r[i] * bpr, bn = rows * bpr;
+        const size_t need = (size_t) bn * 210 + (size_t) 8 * K * 2 + (size_t) 8 * rows * 4;
+        if (c.free_vram() > 0 && c.free_vram() < (int64_t) (need + ((size_t) 768 << 20))) {
+            std::fprintf(stderr, "xe tier: no room on card %d for the head split (%zu MB) - not split\n", c.idx, need >> 20);
+            return Ds41XeImpl::HeadSplit();
+        }
+        uint8_t* wk = sycl::malloc_device<uint8_t>((size_t) bn * 210, c.q);
+        int8_t* xq = sycl::malloc_device<int8_t>((size_t) 8 * K, c.q);
+        float* xd = sycl::malloc_device<float>((size_t) 8 * K / 32, c.q);
+        float* y = sycl::malloc_device<float>((size_t) 8 * rows, c.q);
+        if (!wk || !xq || !xd || !y) { std::fprintf(stderr, "xe tier: head split allocation failed - not split\n"); return Ds41XeImpl::HeadSplit(); }
+        for (int p = 0; p < 4; ++p) c.q.memcpy(wk + po[p] * bn, (const uint8_t*) w + po[p] * nb + pb[p] * b0, pb[p] * bn);
+        c.q.wait();
+        hs.c.push_back(&c); hs.w.push_back(wk); hs.xq.push_back(xq); hs.xd.push_back(xd); hs.y.push_back(y);
+    }
+    hs.ok = true;
+    std::fprintf(stderr, "xe tier: %lld x %lld LM head split over %d cards\n", (long long) N, (long long) K, np);
+    return hs;
+}
+}  // namespace
+
+bool Ds41XeTier::mv_hook(void* queue, const void* w, int64_t K, int64_t N, int ncols, const int8_t* xq, const float* xd,
+                         float* y, int64_t y_col_stride, void* user) {
+    Ds41XeImpl& im = *static_cast<Ds41XeTier*>(user)->im_;
+    if (!queue || K % 256 || ncols < 1 || ncols > 8 || im.cards.empty()) return false;
+    try {
+        auto it = im.heads.find(w);
+        if (it == im.heads.end()) it = im.heads.emplace(w, head_init(im, w, K, N)).first;
+        Ds41XeImpl::HeadSplit& hs = it->second;
+        if (!hs.ok) return false;
+        sycl::queue& q0 = *static_cast<sycl::queue*>(queue);
+        const int64_t bpr = K / 256;
+        const sycl::event e0 = q0.ext_oneapi_submit_barrier();
+        std::vector<sycl::event> ev;
+        for (size_t i = 0; i < hs.c.size(); ++i) {
+            XeCard& c = *hs.c[i];
+            const int64_t r0 = hs.r[i + 1], rows = hs.r[i + 2] - r0;
+            c.q.submit([&](sycl::handler& h) { h.depends_on(e0); h.memcpy(hs.xq[i], xq, (size_t) ncols * K); });
+            c.q.memcpy(hs.xd[i], xd, (size_t) ncols * K / 32 * sizeof(float));
+            fastmv::Args a;
+            a.w = hs.w[i]; a.K = K; a.N = rows; a.G = 1; a.g_div = 1; a.n_blocks_total = rows * bpr;
+            a.x_col_stride = K; a.x_batch_stride = K * ncols;
+            a.y = hs.y[i]; a.y_col_stride = rows; a.y_batch_stride = rows * ncols; a.ncols = ncols;
+            a.xq = hs.xq[i]; a.xd = hs.xd[i];
+            fastmv::launch(c.q, fastmv::WType::Q6K_R8, a);
+            for (int t = 0; t < ncols; ++t) c.q.memcpy(y + t * y_col_stride + r0, hs.y[i] + t * rows, (size_t) rows * 4);
+            ev.push_back(c.q.ext_oneapi_submit_barrier());
+        }
+        fastmv::Args a0;
+        a0.w = w; a0.K = K; a0.N = hs.r[1]; a0.G = 1; a0.g_div = 1; a0.n_blocks_total = N * bpr;
+        a0.x_col_stride = K; a0.x_batch_stride = K * ncols;
+        a0.y = y; a0.y_col_stride = y_col_stride; a0.y_batch_stride = y_col_stride * ncols; a0.ncols = ncols;
+        a0.xq = xq; a0.xd = xd;
+        fastmv::launch(q0, fastmv::WType::Q6K_R8, a0);
+        q0.ext_oneapi_submit_barrier(ev);
+        return true;
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "xe tier: head split: %s\n", e.what());
+        return false;
+    }
+}
 
 bool Ds41XeTier::tl_on() { static const bool on = env_i("STRATA_GPU_TL", 0) != 0; return on; }
 
@@ -922,10 +1016,8 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         const bool xd = im.x_direct && xd_ok;
         std::vector<sycl::event> deps;
         std::vector<int> used;
-        for (auto& cp : im.cards) {
-            XeCard& c = *cp;
+        auto dispatch = [&](XeCard& c) -> sycl::event {   // one card's share: thread-safe across cards
             const int n = nj[(size_t) c.idx];
-            if (n == 0) continue;
             c.busy = true;
             if (!xd) std::memcpy(c.stage_host + xoff, x, n_out * 4);
             // replayed graph: decode as is; a verify call's jobs padded with null jobs (nt 0: the kernels skip them)
@@ -940,7 +1032,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                 z.nt = 0;
                 for (int k = n; k < ng; ++k) std::memcpy(c.stage_host + (size_t) k * sizeof(XeJob), &z, sizeof(XeJob));
             }
-            float* dst = c.dense ? slots + (size_t) c.idx * kMaxJobTok * H : c.OUT;
+            float* dst = c.dense ? slots + (size_t) c.idx * kMaxJobTok * H : im.host_slots ? im.hslots + (size_t) c.idx * kMaxJobTok * H : c.OUT;
             const int mv = mnt[(size_t) c.idx] <= 1 ? 1 : mnt[(size_t) c.idx] <= 2 ? 2 : mnt[(size_t) c.idx] <= 4 ? 4 : 8;
             // the whole sequence; its first command waits for `prev` (the previous call's sum reads the slots this
             // call's cards write) unless it is being recorded (a replay carries that dependency instead)
@@ -955,7 +1047,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                     c.q.memcpy(c.stage_dev, c.stage_host, cpb);
                 }
                 sycl::event ev = card_experts(im, c, ng, nt, mv, xoff, dst, xd ? x : nullptr);
-                if (!c.dense) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
+                if (!c.dense && !im.host_slots) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
                 return ev;
             };
             sycl::event ev;
@@ -988,9 +1080,15 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                 ev = enqueue(nullptr);
             }
             if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
-            deps.push_back(ev);
-            used.push_back(c.idx);
-        }
+            return ev;
+        };
+        std::vector<XeCard*> todo;
+        for (auto& cp : im.cards) if (nj[(size_t) cp->idx] > 0) todo.push_back(cp.get());
+        // one card after another: submitting from a thread per card (2026-10-20) faulted card 0's copy engine once
+        // ("Engine memory CAT error class=bcs") - not worth ~2 %
+        std::vector<sycl::event> evs(todo.size());
+        for (size_t k = 0; k < todo.size(); ++k) evs[k] = dispatch(*todo[k]);
+        for (size_t k = 0; k < todo.size(); ++k) { deps.push_back(evs[k]); used.push_back(todo[k]->idx); }
         double ts1 = sprof ? now_ms() : 0;
         sycl::queue& qd = im.dense_q ? *im.dense_q : dc->q;
         if (!cpu_list.empty()) {
@@ -1002,8 +1100,10 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                 std::memset(hs, 0, n_out * 4);
                 cpu_ents(im, l, cpu_list, x, hs);
             }
-            im.hsum_ev = qd.memcpy(slots + NC * kMaxJobTok * H, hs, n_out * 4);
-            deps.push_back(im.hsum_ev);
+            if (!im.host_slots) {
+                im.hsum_ev = qd.memcpy(slots + NC * kMaxJobTok * H, hs, n_out * 4);
+                deps.push_back(im.hsum_ev);
+            }
             used.push_back((int) NC);
         }
         double ts2 = sprof ? now_ms() : 0;
@@ -1012,19 +1112,24 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             sycl::event ev = qd.memset(o, 0, n_out * 4);
             if (im.dense_q) im.last_sum = ev; else ev.wait();
         } else {
-            int sl[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-            const int ns = (int) used.size();
-            for (int k = 0; k < ns && k < 8; ++k) sl[k] = used[(size_t) k];
+            struct Src { const float* p[8]; } src{};
+            const int ns = std::min((int) used.size(), 8);
             const size_t stride = (size_t) kMaxJobTok * H;
+            for (int k = 0; k < ns; ++k) {   // each part where it was written: the dense card's slots, host slots, hsum
+                const int u = used[(size_t) k];
+                const bool on_dense = (u < (int) NC && im.cards[(size_t) u]->dense) || !im.host_slots;
+                src.p[k] = on_dense ? slots + (size_t) u * stride : u == (int) NC ? im.hsum : im.hslots + (size_t) u * stride;
+            }
             sycl::event ev = qd.submit([&](sycl::handler& h) {
                 h.depends_on(deps);
                 h.parallel_for(sycl::range<1>(n_out), [=](sycl::id<1> i) {
                     float sum = 0.0f;
-                    for (int k = 0; k < ns; ++k) sum += slots[(size_t) sl[k] * stride + i];
+                    for (int k = 0; k < ns; ++k) sum += src.p[k][i];
                     o[i] = sum;
                 });
             });
             if (im.dense_q) im.last_sum = ev; else ev.wait();
+            if (im.host_slots && !cpu_list.empty()) im.hsum_ev = ev;   // hsum is read in place: its next write waits for this
         }
         if (Ds41XeTier::tl_on() && im.dense_q) tl_stamp(im, 0, *im.dense_q, nt == 1 ? 3 : 11);
         if (sprof) {
@@ -1572,6 +1677,13 @@ bool Ds41XeTier::run_chunk_dev(int64_t l, int n, const int32_t* ids, const float
 void Ds41XeTier::close() {
     if (!im_) return;
     Ds41XeImpl& im = *im_;
+    for (auto& kv : im.heads)   // the head split's slices and scratch, on their cards (before the cards go)
+        for (size_t i = 0; i < kv.second.c.size(); ++i) {
+            sycl::queue& q = kv.second.c[i]->q;
+            q.wait();
+            sycl::free(kv.second.w[i], q); sycl::free(kv.second.xq[i], q); sycl::free(kv.second.xd[i], q); sycl::free(kv.second.y[i], q);
+        }
+    im.heads.clear();
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
         c.free_experts();
@@ -1588,6 +1700,7 @@ void Ds41XeTier::close() {
     }
     im.achunks.clear();
     if (im.hsum) { im.hsum_ev.wait(); sycl::free(im.hsum, im.ctx); im.hsum = nullptr; }
+    if (im.hslots) { for (auto& cp : im.cards) cp->q.wait(); sycl::free(im.hslots, im.ctx); im.hslots = nullptr; }
     if (im.cpu_thr.joinable()) {
         { std::lock_guard<std::mutex> lk(im.cpu_mu); im.cpu_state.store(3, std::memory_order_release); }
         im.cpu_cv.notify_one();

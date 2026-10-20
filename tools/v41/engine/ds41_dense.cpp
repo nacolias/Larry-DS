@@ -407,6 +407,29 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB\n", rq_n, ggml_type_name(rq),
                                rq_from / 1e9, rq_to / 1e9);
         if (pq_n) std::fprintf(stderr, "prediction routers: %zu F32 copies as %s\n", pq_n, ggml_type_name(pq));
+        // larry (SYCL): the shared expert's gate and up as ONE [K, 2N] weight over their bytes - the file stores them back
+        // to back and the buffer keeps them so - one mat-vec instead of two (STRATA_SHEXP_GU, default 1).  shexp_ffn is
+        // their only user: the halves alone must never reach ggml-sycl's reorder (it would reorder the bytes twice).
+        if (im.sycl && env_on("STRATA_SHEXP_GU", true)) {
+            static const std::string suf = "ffn_gate_shexp.weight";
+            std::vector<std::pair<std::string, ggml_tensor *>> add;
+            for (const auto & kv : w.t) {
+                const std::string & n = kv.first;
+                if (n.size() <= suf.size() || n.compare(n.size() - suf.size(), suf.size(), suf) != 0) continue;
+                const std::string pre = n.substr(0, n.size() - suf.size());
+                auto iu = w.t.find(pre + "ffn_up_shexp.weight");
+                if (iu == w.t.end()) continue;
+                ggml_tensor * g = kv.second, * u = iu->second;
+                if (g->type != u->type || g->ne[0] != u->ne[0] || g->ne[1] != u->ne[1] || g->buffer != u->buffer ||
+                    (const char *) u->data != (const char *) g->data + ggml_nbytes(g)) continue;
+                ggml_tensor * gu = ggml_new_tensor_2d(w.ctx, g->type, g->ne[0], 2 * g->ne[1]);
+                ggml_set_name(gu, (pre + "ffn_gate_up_shexp.weight").c_str());
+                if (ggml_backend_tensor_alloc(g->buffer, gu, g->data) != GGML_STATUS_SUCCESS) continue;
+                add.emplace_back(gu->name, gu);
+            }
+            for (auto & a : add) w.t[a.first] = a.second;
+            std::fprintf(stderr, "shared expert: %zu gate+up pairs as one weight\n", add.size());
+        }
     }
     size_t si = 0;
     const TensorInfo * te = model.find("token_embd.weight", &si);
@@ -548,8 +571,18 @@ static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mo
 // the shared expert (model.py Expert, clamped SwiGLU) on the routed experts' input
 static ggml_tensor * shexp_ffn(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor * fn) {
     const float lim = (float) im.g.swiglu_limit;
-    ggml_tensor * up = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
-    ggml_tensor * gt = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
+    ggml_tensor * up = nullptr, * gt = nullptr;
+    auto igu = im.w.t.find("blk." + std::to_string(il) + ".ffn_gate_up_shexp.weight");
+    if (igu != im.w.t.end()) {   // larry: one mat-vec for both (rows: gate, then up)
+        ggml_tensor * y = ggml_mul_mat(gc, igu->second, fn);                                   // [2N, n]
+        const int64_t N = igu->second->ne[1] / 2, n = fn->ne[1];
+        gt = ggml_view_2d(gc, y, N, n, y->nb[1], 0);
+        up = ggml_view_2d(gc, y, N, n, y->nb[1], (size_t) N * ggml_element_size(y));
+        if (n > 1) { gt = ggml_cont(gc, gt); up = ggml_cont(gc, up); }
+    } else {
+        up = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
+        gt = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
+    }
     if (lim > 0) {
         up = ggml_clamp(gc, up, -lim, lim);
         gt = ggml_clamp(gc, gt, NEG_INF, lim);
@@ -1028,6 +1061,23 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
 Ds41Dense::Ds41Dense() : p_(new Impl()) {}
 Ds41Dense::~Ds41Dense() = default;
 const Ds41Geometry & Ds41Dense::geom() const { return p_->g; }
+std::vector<ggml_tensor *> Ds41Dense::reorder_weights() const {
+    std::vector<ggml_tensor *> v;
+    auto ends = [](const std::string & n, const char * suf) { const size_t k = std::strlen(suf); return n.size() > k && n.compare(n.size() - k, k, suf) == 0; };
+    for (const auto & kv : p_->w.t) {
+        ggml_tensor * t = kv.second;
+        if (t->type != GGML_TYPE_Q6_K || t->ne[2] != 1 || t->ne[3] != 1 || !t->buffer) continue;
+        // wo_a is read through 3-D views only: decode reorders it per slice, the prompt reads its standard layout - never whole
+        if (ends(kv.first, "attn_output_a.weight")) continue;
+        if (ends(kv.first, "ffn_gate_shexp.weight") || ends(kv.first, "ffn_up_shexp.weight")) {
+            const std::string pre = kv.first.substr(0, kv.first.size() - (ends(kv.first, "ffn_gate_shexp.weight") ? 21 : 19));
+            if (p_->w.t.count(pre + "ffn_gate_up_shexp.weight")) continue;
+        }
+        v.push_back(t);
+    }
+    return v;
+}
+
 ggml_tensor * Ds41Dense::weight(const std::string & name) const { return p_->w.get(name); }
 int64_t Ds41Dense::n_layer() const { return p_->nl; }
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
@@ -1194,8 +1244,12 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     const int64_t D = im.D, NCM = im.NCmax;
     for (int64_t l = 0; l < im.nl; ++l) {
         auto & L = im.ly[(size_t) l];
-        L.raw = T(kvt, { im.DH, im.RAW });
-        L.raw_snap = T(kvt, { im.DH, im.RAW });
+        // larry: the window ring in F32 on SYCL (STRATA_RAW_F32, default 1): its rows are FP8-rounded, exact in either
+        // type, and attention reads it as F32 every layer of every token (a bf16 ring costs a cast kernel each time)
+        static const bool raw_f32 = env_on("STRATA_RAW_F32", true);
+        const ggml_type rawt = im.sycl && raw_f32 && cfg.kv_type < 0 ? GGML_TYPE_F32 : kvt;
+        L.raw = T(rawt, { im.DH, im.RAW });
+        L.raw_snap = T(rawt, { im.DH, im.RAW });
         L.rbias = T(GGML_TYPE_F32, { im.NE });   // zeroed with the buffer
         if (L.kv_src) {
             // STRATA_KV_FP4_ONLY=comp|idx (bisect tap): pack only one of the two caches
@@ -1297,8 +1351,8 @@ static bool engram_ready(Ds41Dense::Impl & im) {
     if (!im.eng_batch) return true;
     if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
     im.eng_batch.reset();
-    for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
-        ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+    for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e) im.up_set(im.i_eng[e], im.eng_rows[e].data(), im.eng_rows[e].size() * 4);
+    if (im.up_async) ggml_backend_event_record(im.up_ev, im.backend);   // the staging buffer's reuse waits for these too
     return true;
 }
 
@@ -1398,7 +1452,12 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     if (im.engram.enabled()) {
         if (!engram_ready(im)) return false;    // flush a still-pending batch from a previous pass first
         for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
-        if (n <= 64) {   // decode / verify: the rows are needed at layer 1 - read them now (synchronously)
+        static const bool eng_async = env_on("STRATA_ENG_ASYNC", true);
+        if (n <= 8 && im.up_async && eng_async) {   // larry: decode / verify - start the reads (worker threads) now and
+            // wait at the first Engram layer (engram_ready); layer 0 runs meanwhile.  Synchronous, they cost ~0.66 ms a token
+            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            if (!im.eng_batch) return false;
+        } else if (n <= 64) {   // decode / verify: the rows are needed at layer 1 - read them now (synchronously)
             static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
             static double eng_ms = 0; static long eng_n = 0;
             const auto te = std::chrono::steady_clock::now();

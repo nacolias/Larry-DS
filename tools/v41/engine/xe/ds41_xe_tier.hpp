@@ -59,6 +59,11 @@ public:
     /// tier tags 3 after its sum) and on each card around its share; tl_flush (once per token) folds them into
     /// per-transition averages, printed every 64 tokens
     static bool tl_on();
+    /// larry (ggml-sycl's mat-vec hook, STRATA_HEAD_SPLIT): the LM head split by rows over every card - each expert card
+    /// keeps its rows' R8 planes, gets the int8 activations by a card-to-card copy and sends its rows of y back the same
+    /// way; the dense card computes the first rows.  `user` is the tier.
+    static bool mv_hook(void* queue, const void* w, int64_t K, int64_t N, int ncols, const int8_t* xq, const float* xd,
+                        float* y, int64_t y_col_stride, void* user);
     void tl_tag(int id);
     void tl_flush();
     void set_cache_enabled(bool on);

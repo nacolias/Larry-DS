@@ -16,7 +16,10 @@
 //   PTQ1_0 (QK 128): trits[0..15] x NB | trits[16..23] x NB | (trits[24..25], d) x NB
 #include "xe_kernels.hpp"
 
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::v41::xe {
 namespace {
@@ -304,33 +307,34 @@ constexpr int qk_c() { return TYPE == kQ3K ? 256 : TYPE == kQ20 ? 64 : 128; }
 
 // ---- gate/up + SwiGLU + int8 quantisation of H.  A work-group (8 sub-groups) owns 32 consecutive rows of one job;
 // a sub-group 4 rows, 4 lanes per row (every 4th block); each lane does the gate AND the up row (shared x loads).
-template <int TYPE, int NT>
+template <int TYPE, int NT, int LPR>   // LPR lanes per row (4 or 16)
 inline void gu_rows(const XeJob& jb, const XSet& xs, const int* rows, int row, int bl, int n_ff, int nt, float (&acc)[2][NT]) {
     const uint8_t* mats[2] = {jb.blob, jb.blob + jb.up_off};
     const int nbr = xs.n / qk_c<TYPE>();
     const size_t NB = (size_t) n_ff * nbr;
-    if constexpr (TYPE == kQ3K) {   // 4 lanes per block (chunk bl): a row's 4 lanes read whole cache lines
+    if constexpr (TYPE == kQ3K) {   // 4 lanes per block (chunk bl % 4): a row's lanes read whole cache lines
 #pragma unroll 2
-        for (int b = 0; b < nbr; ++b) blk_dot<TYPE, NT, 2>(mats, NB, (size_t) row * nbr + b, bl, xs, rows, b, nt, acc);
-    } else {                        // a block per lane: 4 consecutive blocks per row per load
+        for (int b = bl >> 2; b < nbr; b += LPR / 4) blk_dot<TYPE, NT, 2>(mats, NB, (size_t) row * nbr + b, bl & 3, xs, rows, b, nt, acc);
+    } else {                        // a block per lane: LPR consecutive blocks per row per load
 #pragma unroll 2
-        for (int b = bl; b < nbr; b += 4) blk_dot<TYPE, NT, 2>(mats, NB, (size_t) row * nbr + b, 0, xs, rows, b, nt, acc);
+        for (int b = bl; b < nbr; b += LPR) blk_dot<TYPE, NT, 2>(mats, NB, (size_t) row * nbr + b, 0, xs, rows, b, nt, acc);
     }
 }
 
-template <int NT>
+template <int NT, int LPR = 4>   // LPR 16: one row per sub-group, 4x the sub-groups (decode: few jobs fill the card)
 sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 Hq, int n_embd, int n_ff, float L) {
     const int rb = n_ff / 32;
-    const sycl::nd_range<1> nr(sycl::range<1>((size_t) nj * rb * 128), sycl::range<1>(128));
+    constexpr int RPS = SG / LPR, WG = 32 / RPS * SG;   // rows per sub-group, lanes per work-group (32 rows)
+    const sycl::nd_range<1> nr(sycl::range<1>((size_t) nj * rb * WG), sycl::range<1>(WG));
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(NT * 32), h);
-        h.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto kern = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int wg = (int) it.get_group(0);
             const int j = wg / rb, r0 = (wg % rb) * 32;
             const sycl::sub_group sg = it.get_sub_group();
             const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
-            const int rg = lane >> 2, bl = lane & 3;
-            const int row = r0 + s * 4 + rg;
+            const int rg = lane / LPR, bl = lane % LPR;
+            const int row = r0 + s * RPS + rg;
             const XeJob& jb = jobs[j];
             const int nt = jb.nt;
             if (nt == 0) return;   // a null job (a replayed graph's padding): the whole work-group leaves together
@@ -344,16 +348,16 @@ sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H
 #pragma unroll
                 for (int t = 0; t < NT; ++t) acc[i][t] = 0.f;
             const int type = jb.gu_type;
-            if (type == kQ3K) gu_rows<kQ3K, NT>(jb, xs, rows, row, bl, n_ff, nt, acc);
-            else if (type == kQ20) gu_rows<kQ20, NT>(jb, xs, rows, row, bl, n_ff, nt, acc);
-            else gu_rows<kPtq1, NT>(jb, xs, rows, row, bl, n_ff, nt, acc);
+            if (type == kQ3K) gu_rows<kQ3K, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+            else if (type == kQ20) gu_rows<kQ20, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+            else gu_rows<kPtq1, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
 #pragma unroll
             for (int i = 0; i < 2; ++i)
 #pragma unroll
                 for (int t = 0; t < NT; ++t) {
                     float v = acc[i][t];
-                    v += sycl::permute_group_by_xor(sg, v, 1);
-                    v += sycl::permute_group_by_xor(sg, v, 2);
+#pragma unroll
+                    for (int o = 1; o < LPR; o <<= 1) v += sycl::permute_group_by_xor(sg, v, o);
                     acc[i][t] = v;
                 }
             if (bl == 0) {
@@ -362,7 +366,7 @@ sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H
                     if (t < nt) {
                         const float g = sycl::fmin(acc[0][t], L);
                         const float u = sycl::fmax(-L, sycl::fmin(acc[1][t], L));
-                        sh[t * 32 + s * 4 + rg] = g / (1.0f + sycl::exp(-g)) * u;
+                        sh[t * 32 + s * RPS + rg] = g / (1.0f + sycl::exp(-g)) * u;
                     }
                 }
             }
@@ -384,7 +388,18 @@ sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H
                     Hq.s[hrow * (n_ff / 16) + r0 / 16 + 1] = shi;
                 }
             }
-        });
+        };
+        // 4 / 8 tokens a job spill at 128 registers (71 / ~300): the 256-register mode (STRATA_XE_GU_BIG, default 1)
+        static const bool big = [] { const char* e = std::getenv("STRATA_XE_GU_BIG"); return !(e && e[0] == '0'); }();
+        if constexpr (NT >= 4) {
+            namespace sxo = sycl::ext::oneapi::experimental;
+            if (big) {   // its own lambda type: one kernel name per register mode
+                auto kern_big = [kern](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] { kern(it); };
+                h.parallel_for(nr, sxo::properties{sycl::ext::intel::experimental::grf_size<256>}, kern_big);
+                return;
+            }
+        }
+        h.parallel_for(nr, kern);
     });
 }
 
@@ -392,7 +407,7 @@ sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H
 // layout: Q3_K a block's 4 chunks, the others every 4th block), loops over the jobs and writes its rows.
 constexpr int kDownSgPerWg = 8;
 
-template <int TYPE, int NT, int NTOK>
+template <int TYPE, int NT, int NTOK, int LPR>
 inline void down_job(const XeJob& jb, const XSet& hs, const int* rows, int row, int bl, int n_embd, int nt,
                      const sycl::sub_group& sg, float (&o)[NTOK]) {
     const uint8_t* mm[1] = {jb.blob + jb.down_off};
@@ -403,16 +418,16 @@ inline void down_job(const XeJob& jb, const XSet& hs, const int* rows, int row, 
     for (int t = 0; t < NT; ++t) a[0][t] = 0.f;
     if constexpr (TYPE == kQ3K) {
 #pragma unroll 3
-        for (int b = 0; b < nbr; ++b) blk_dot<TYPE, NT, 1>(mm, NB, (size_t) row * nbr + b, bl, hs, rows, b, nt, a);
+        for (int b = bl >> 2; b < nbr; b += LPR / 4) blk_dot<TYPE, NT, 1>(mm, NB, (size_t) row * nbr + b, bl & 3, hs, rows, b, nt, a);
     } else {
 #pragma unroll 3
-        for (int b = bl; b < nbr; b += 4) blk_dot<TYPE, NT, 1>(mm, NB, (size_t) row * nbr + b, 0, hs, rows, b, nt, a);
+        for (int b = bl; b < nbr; b += LPR) blk_dot<TYPE, NT, 1>(mm, NB, (size_t) row * nbr + b, 0, hs, rows, b, nt, a);
     }
 #pragma unroll
     for (int s = 0; s < NT; ++s) {
         float v = a[0][s];
-        v += sycl::permute_group_by_xor(sg, v, 1);
-        v += sycl::permute_group_by_xor(sg, v, 2);
+#pragma unroll
+        for (int ox = 1; ox < LPR; ox <<= 1) v += sycl::permute_group_by_xor(sg, v, ox);
         if (s < nt) {
             v *= jb.w[s];
             const int tk = jb.tok[s];
@@ -422,16 +437,16 @@ inline void down_job(const XeJob& jb, const XSet& hs, const int* rows, int row, 
     }
 }
 
-template <int NT, int NTOK>   // NT: tokens per job (bound), NTOK: tokens of the call (bound)
+template <int NT, int NTOK, int LPR = 4>   // NT: tokens per job (bound), NTOK: tokens of the call (bound)
 sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq, float* OUT, int n_embd, int n_ff,
                     bool accumulate) {
-    const int rows_wg = kDownSgPerWg * 4;
+    const int rows_wg = kDownSgPerWg * (SG / LPR);
     const sycl::nd_range<1> nr(sycl::range<1>((size_t) (n_embd / rows_wg) * kDownSgPerWg * SG), sycl::range<1>(kDownSgPerWg * SG));
     return q.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
-        const int rg = lane >> 2, bl = lane & 3;
-        const int row = (int) it.get_group(0) * rows_wg + (int) sg.get_group_linear_id() * 4 + rg;
+        const int rg = lane / LPR, bl = lane % LPR;
+        const int row = (int) it.get_group(0) * rows_wg + (int) sg.get_group_linear_id() * (SG / LPR) + rg;
         const XSet hs{Hq.q, Hq.d, Hq.s, n_ff};
         float o[NTOK];
 #pragma unroll
@@ -444,9 +459,9 @@ sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq
 #pragma unroll
             for (int t = 0; t < NT; ++t) rows[t] = j * kMaxJobTok + (t < nt ? t : 0);
             const int type = jb.d_type;
-            if (type == kQ3K) down_job<kQ3K, NT, NTOK>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
-            else if (type == kPtq1) down_job<kPtq1, NT, NTOK>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
-            else down_job<kQ20, NT, NTOK>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+            if (type == kQ3K) down_job<kQ3K, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+            else if (type == kPtq1) down_job<kPtq1, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+            else down_job<kQ20, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
         }
         if (bl == 0) {
 #pragma unroll
@@ -660,7 +675,12 @@ sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, X
                           int n_ff, float swiglu_limit, bool accumulate, int max_nt) {
     if (max_nt <= 0) max_nt = ntok;   // the most tokens any job has: the kernels' register footprint follows it
     const float Lm = swiglu_limit;
-    if (ntok <= 1) {
+    if (ntok <= 1) {   // STRATA_XE_LPR (default 4; 16 measured slower: cards busy 75 -> 82 us a layer)
+        static const int lpr = [] { const char* e = std::getenv("STRATA_XE_LPR"); return e ? std::atoi(e) : 4; }();
+        if (lpr == 16) {
+            gate_up_q8<1, 16>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+            return down_q8<1, 1, 16>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+        }
         gate_up_q8<1>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
         return down_q8<1, 1>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
     }

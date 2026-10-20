@@ -178,6 +178,9 @@ public:
     const std::string & last_error() const;
     /// A loaded weight on the backend (nullptr if absent) - for sharing the trunk head with the DSpark draft stack.
     ggml_tensor * weight(const std::string & name) const;
+    /// larry: every 2-D Q6_K weight a decode reads through the reordered layout - for ggml_backend_sycl_prereorder at load
+    /// (the shared expert's gate / up halves are left out when they are fused: only the fused weight may be reordered)
+    std::vector<ggml_tensor *> reorder_weights() const;
 
 private:
     std::unique_ptr<Impl> p_;
