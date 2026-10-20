@@ -109,6 +109,10 @@ public:
     /// batch spans read them back into batch_fn() at all (set_fn_host(false): a GPU tier copies them card-to-card)
     const float * batch_fn_dev() const;
     void set_fn_host(bool on);
+    /// larry (pipelined batch, with the submit lock set): span graphs alternate two allocators guarded by events, so
+    /// a span no longer waits for the device; pass_sync() waits for everything (the tier reads the spans' outputs)
+    void set_pass_ring(bool on);
+    void pass_sync();
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.

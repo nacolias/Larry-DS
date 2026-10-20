@@ -969,6 +969,8 @@ int main(int argc, char ** argv) {
                     static const bool xp2p = !(std::getenv("STRATA_XE_XP2P") && std::getenv("STRATA_XE_XP2P")[0] == '0');
                     const float * fn_dev = xp2p ? dense.batch_fn_dev() : nullptr;
                     if (fn_dev) dense.set_fn_host(false);
+                    static const bool ring_env = !(std::getenv("STRATA_PASS_RING") && std::getenv("STRATA_PASS_RING")[0] == '0');
+                    dense.set_pass_ring(ring_env);
                     bool inflight = false;
                     int fl = -1, fa = 0, fb = 0;   // the part whose finish waits for the tier call in flight
                     auto PD = [&](int l, int a0, int a1) -> bool {
@@ -1022,6 +1024,7 @@ int main(int argc, char ** argv) {
                         return PF(fl, fa, fb) && (fb < B || PC(fl));
                     };
                     auto PT = [&](int l, int a0, int a1, bool last) -> bool {
+                        dense.pass_sync();   // the part's ids / weights / fn are final (the pass ring does not wait)
                         inflight = tier.run_chunk_dev_async(l, a1 - a0, dense.batch_ids() + (size_t) a0 * top_k,
                                                             dense.batch_wts() + (size_t) a0 * top_k,
                                                             dense.batch_fn() + (size_t) a0 * n_embd, prdev + (size_t) a0 * n_embd, last,
@@ -1054,6 +1057,7 @@ int main(int argc, char ** argv) {
                     }
                     okp = okp && PJ();
                     if (!okp) tier.run_chunk_wait();   // never leave the tier thread running
+                    dense.set_pass_ring(false);
                     dense.set_submit_lock(nullptr);
                     dense.set_fn_host(true);
                     if (!okp) { tier.prefetch_end(); return false; }

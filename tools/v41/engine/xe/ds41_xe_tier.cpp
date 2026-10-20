@@ -1315,6 +1315,7 @@ struct BigProf {
     double prep = 0, cards = 0, combine = 0, total = 0;
     std::atomic<int64_t> lk_gemm_us{0}, lk_jobs_us{0}, lk_n{0};   ///< submit-lock hold time of the GEMM / job sites
     std::atomic<int64_t> st_us{0}, st_bytes{0}, pfw_us{0}, dma_us{0}, dma_wait_us{0}, dma_bytes{0}, dma_n{0};   ///< prefetch
+    std::atomic<int64_t> min_free[8] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}};   ///< per card, bytes
     std::atomic<int64_t> stream_us{0}, gemm_us{0}, small_us{0};
     std::atomic<int64_t> streamed{0}, gemm_e{0}, small_j{0};
     int64_t calls = 0;
@@ -1345,11 +1346,12 @@ void pf_plan(Ds41XeImpl& im, int s, int64_t l) {
         const bool pin = im.apin[key] != 0;
         if (!pin && sused + b > im.pf_stage_cap) continue;
         int best = -1;
-        for (auto& cp : im.cards) {
-            const XeCard& c = *cp;
-            if (c.dense || !c.pbuf[s] || used[(size_t) c.idx] + b > c.pbuf_cap) continue;
-            if (best < 0 || used[(size_t) c.idx] < used[(size_t) best]) best = c.idx;
-        }
+        for (int pass = 0; pass < 2 && best < 0; ++pass)   // the expert cards first; the dense card takes the overflow
+            for (auto& cp : im.cards) {
+                const XeCard& c = *cp;
+                if (c.dense != (pass == 1) || !c.pbuf[s] || used[(size_t) c.idx] + b > c.pbuf_cap) continue;
+                if (best < 0 || used[(size_t) c.idx] < used[(size_t) best]) best = c.idx;
+            }
         if (best < 0) continue;
         ps.card[(size_t) e] = (int8_t) best;
         ps.off[(size_t) e] = used[(size_t) best];
@@ -1783,6 +1785,12 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             c.q.memcpy(c.cOUT_host, c.cOUT, (size_t) n * H * 4);
         }
         c.q.wait();
+        if (prof) {   // the lowest free VRAM at the end of a call (every buffer of the call allocated)
+            const int64_t fr = c.free_vram();
+            std::atomic<int64_t>& mf = g_bp.min_free[c.idx & 7];
+            int64_t cur = mf.load();
+            while (fr >= 0 && (cur < 0 || fr < cur) && !mf.compare_exchange_weak(cur, fr)) {}
+        }
         return true;
     };
     {
@@ -1875,6 +1883,9 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                          (long long) g_bp.streamed.load(), g_bp.gemm_us / 1000.0, (long long) g_bp.gemm_e.load(),
                          g_bp.small_us / 1000.0, (long long) g_bp.small_j.load());
         if (prof && g_bp.calls % 40 == 0) {
+            std::fprintf(stderr, "xe prof: lowest free VRAM after a call:");
+            for (int k = 0; k < 4; ++k) std::fprintf(stderr, " %.2f", g_bp.min_free[k].load() / kGiB);
+            std::fprintf(stderr, " GiB\n");
             std::fprintf(stderr, "xe prof: submit-lock holds: GEMM experts %.0f ms (%lld), job batches %.0f ms\n",
                          g_bp.lk_gemm_us / 1000.0, (long long) g_bp.lk_n.load(), g_bp.lk_jobs_us / 1000.0);
             std::fprintf(stderr, "xe prof: prefetch: staging %.1f GB in %.0f thread-ms (%.1f GB/s a thread), enqueue waits %.0f ms; "
@@ -1959,6 +1970,22 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         }
         c.pbuf_cap = cap;
     }
+    static const int pf_dense = env_i("STRATA_XE_PREFETCH_DENSE", 0);   // measured no gain (8.5K: 13.4-13.8 vs 12.7-13.1 s)
+    if (pf_dense && im.dense >= 0) {
+        XeCard& c = *im.cards[(size_t) im.dense];
+        size_t ex = 0;
+        for (auto& cp : im.cards) if (!cp->dense) ex += cp->pbuf_cap;
+        const int64_t want = need + 4 * (int64_t) im.blob_max - (int64_t) ex;
+        const int64_t fr = c.free_vram();
+        const int64_t room = fr > 0 ? (fr - (int64_t) (env_d("STRATA_XE_PREFETCH_DENSE_RESERVE_GIB", 6.0) * kGiB) - rb) / 2 : 0;
+        const size_t cap = (size_t) std::max<int64_t>(0, std::min<int64_t>(want, room)) & ~(size_t) 255;
+        if (cap >= (size_t) im.blob_max && !c.pbuf[0]) {
+            c.pbuf[0] = sycl::malloc_device<uint8_t>(cap, c.q);
+            c.pbuf[1] = c.pbuf[0] ? sycl::malloc_device<uint8_t>(cap, c.q) : nullptr;
+            if (c.pbuf[1]) c.pbuf_cap = cap;
+            else { if (c.pbuf[0]) sycl::free(c.pbuf[0], c.q); c.pbuf[0] = nullptr; c.pbuf_cap = 0; }
+        }
+    }
     if (im.pf_thr.empty()) {
         im.pf_stop = false;
         const int ns = std::max(1, env_i("STRATA_XE_STAGERS", 4));
@@ -1970,6 +1997,7 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         std::fprintf(stderr, "xe prefetch: layers %lld..%lld, %d tokens a call, largest layer %.2f GiB; buffers per card 2 x", (long long) first,
                      (long long) last, n_call, need / kGiB);
         for (auto& cp : im.cards) if (!cp->dense) std::fprintf(stderr, " %.2f", cp->pbuf_cap / kGiB);
+        for (auto& cp : im.cards) if (cp->dense && cp->pbuf_cap) std::fprintf(stderr, " + dense card %.2f", cp->pbuf_cap / kGiB);
         std::fprintf(stderr, " GiB\n");
     }
     im.pf_on = true;

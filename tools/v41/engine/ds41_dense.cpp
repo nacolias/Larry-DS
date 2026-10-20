@@ -289,6 +289,11 @@ struct Ds41Dense::Impl {
     HostRows<uint8_t> up_stage;
     HostRows<uint8_t> span_stage;             // larry: upload_span's index maps (pinned; async copies)
     bool eng_waited = false;                  // larry: engram_wait_host ran for eng_batch
+    Allo allo_pass2;                          // larry: set_pass_ring - the span graphs' second allocator
+    bool pass_ring = false;
+    int pass_turn = 0, pass_k = 0;
+    ggml_backend_event_t pass_ev[2] = { nullptr, nullptr };
+    bool pass_ev_rec[2] = { false, false };
     size_t up_off = 0;
     bool up_async = false;                    // this pass stages (set by upload_inputs)
     ggml_backend_event_t up_ev = nullptr;     // after the last staged copy: the buffer's reuse waits for it
@@ -541,7 +546,7 @@ void (*ds41_dense_tl_hook)(int id) = nullptr;
 static bool dense_async_on() { static const bool on = env_on("STRATA_DENSE_ASYNC", true); return on; }
 
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async, bool nosync) {
-    Allo & a = cached ? allo_dec : allo_pass;
+    Allo & a = cached ? allo_dec : pass_ring && pass_k == 1 ? allo_pass2 : allo_pass;
     const double tq0 = g_dprof_on ? dprof_now() : 0;
     const bool reuse = cached && env_on("DS41_GRAPH_REUSE", true);
     async = async && cached && dense_async_on();
@@ -1170,7 +1175,7 @@ bool Ds41Dense::set_columns(int nc) {
     im.predict_out_n.clear();
     im.fpredict_out.clear();
     im.fpredict_ahead.clear();
-    for (Allo * al : { &im.allo_dec, &im.allo_pass }) {
+    for (Allo * al : { &im.allo_dec, &im.allo_pass, &im.allo_pass2 }) {
         if (al->a) ggml_gallocr_free(al->a);
         al->a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
         al->graph_epoch.clear();
@@ -1315,6 +1320,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+    im.allo_pass2.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     if (!alloc_cols(im, im.NC, err)) return false;
     // the host mirrors are sized for the largest batch once (pinned registrations must not move)
     ggml_backend_t pin_be = im.sycl ? im.backend : nullptr;   // SYCL: pinned through the device's host buffer type
@@ -1352,6 +1358,13 @@ void Ds41Dense::release_pass() {
     im.allo_pass.graph_epoch.clear();
     im.allo_pass.compute_bufs.clear();
     ++im.allo_pass.epoch;
+    if (im.allo_pass2.a) {   // larry: the pass ring's second allocator
+        ggml_gallocr_free(im.allo_pass2.a);
+        im.allo_pass2.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+        im.allo_pass2.graph_epoch.clear();
+        im.allo_pass2.compute_bufs.clear();
+        ++im.allo_pass2.epoch;
+    }
 }
 
 // pass_cap (per ratio) of a pass of n tokens ending at pos0+n: the visible compressed rows it ranks over.
@@ -1519,7 +1532,7 @@ static void reset_kept_graphs(Ds41Dense::Impl & im) {
     im.predict_out_n.clear();
     im.fpredict_out.clear();
     im.fpredict_ahead.clear();
-    for (Allo * al : { &im.allo_dec, &im.allo_pass }) {
+    for (Allo * al : { &im.allo_dec, &im.allo_pass, &im.allo_pass2 }) {
         al->graph_epoch.clear();
         al->compute_bufs.clear();
         ++al->epoch;
@@ -1608,14 +1621,24 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     // larry: with a submit lock (pipelined batch) the maps go up through a pinned buffer, async - a pageable
     // ggml_backend_tensor_set is a blocking copy, and it held the lock ~2 ms a span under the tier's PCIe traffic.
     // The span ends with a full synchronize, so the buffer is free again by the next span.
-    const size_t need = (size_t) (im.SWA * n + 2 * n + im.RAW + 2) * 4 + 4 * 64;
+    // pass ring: half pass_k (each half sized for S columns; resized only once, after a full wait)
+    const size_t half = ((size_t) (im.SWA * im.S + 2 * im.S + im.RAW + 2) * 4 + 4 * 64 + 63) & ~(size_t) 63;
     const bool staged = im.sub_mu && !im.cpu;
-    if (staged && im.span_stage.size() < need) im.span_stage.resize(need, im.backend);
-    size_t soff = 0;
+    if (staged && im.span_stage.size() < 2 * half) { ggml_backend_synchronize(im.backend); im.span_stage.resize(2 * half, im.backend); }
+    size_t soff = im.pass_ring ? (size_t) im.pass_k * half : 0;
     auto put = [&](ggml_tensor * t, const void * data, size_t off, size_t size) {
-        if (!staged || im.span_stage.size() < soff + size) { ggml_backend_tensor_set(t, data, off, size); return; }
+        if (!staged || (im.pass_ring ? (size_t) (im.pass_k + 1) * half : im.span_stage.size()) < soff + size) {
+            ggml_backend_tensor_set(t, data, off, size);
+            return;
+        }
         std::memcpy(im.span_stage.data() + soff, data, size);
+        const double tq = g_dprof_on ? dprof_now() : 0;
         ggml_backend_tensor_set_async(im.backend, t, im.span_stage.data() + soff, off, size);
+        if (g_dprof_on) {   // larry (diagnostic): a slow async upload
+            static int nslow = 0;
+            const double dt = dprof_now() - tq;
+            if (dt > 1.0 && nslow++ < 12) std::fprintf(stderr, "dense prof: tensor_set_async %s %zu bytes took %.2f ms (ring %d k %d)\n", t->name, size, dt, (int) im.pass_ring, im.pass_k);
+        }
         soff = (soff + size + 63) & ~(size_t) 63;
     };
     {
@@ -1654,9 +1677,36 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     return true;
 }
 
+// larry, pass ring: the next allocator / staging half - after the graph that used it last (2 spans back) is done -
+// and, under the submit lock after the span's last enqueue, the event that marks this span's end
+static void ring_take(Ds41Dense::Impl & im) {
+    if (!im.pass_ring) return;
+    const int k = im.pass_turn;
+    im.pass_turn ^= 1;
+    im.pass_k = k;
+    if (!im.pass_ev[k]) im.pass_ev[k] = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+    else if (im.pass_ev_rec[k]) ggml_backend_event_synchronize(im.pass_ev[k]);
+    im.pass_ev_rec[k] = false;
+}
+static void ring_mark(Ds41Dense::Impl & im) {
+    if (!im.pass_ring || !im.pass_ev[im.pass_k]) return;
+    ggml_backend_event_record(im.pass_ev[im.pass_k], im.backend);
+    im.pass_ev_rec[im.pass_k] = true;
+}
+
+void Ds41Dense::set_pass_ring(bool on) {
+    Impl & im = *p_;
+    ggml_backend_synchronize(im.backend);
+    im.pass_ring = on && !im.cpu && im.sub_mu;
+    im.pass_turn = 0;
+    im.pass_ev_rec[0] = im.pass_ev_rec[1] = false;
+}
+void Ds41Dense::pass_sync() { ggml_backend_synchronize(p_->backend); }
+
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
     if (im.sub_mu && im.ly[(size_t) il].eslot >= 0 && !engram_wait_host(im)) return false;
+    ring_take(im);
     std::unique_lock<std::mutex> sl;
     if (im.sub_mu) { if (im.sub_prio) im.sub_prio->fetch_add(1); sl = std::unique_lock<std::mutex>(*im.sub_mu); if (im.sub_prio) im.sub_prio->fetch_sub(1); }
     if (!upload_span(im, col0, n)) return false;
@@ -1667,13 +1717,15 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     ggml_cgraph * gk = build_attn_kv_only(im, gck, il, n, col0);
     const bool okk = im.compute(gk, false, false, sl.owns_lock());
     ggml_free(gck);
-    if (sl.owns_lock()) { sl.unlock(); ggml_backend_synchronize(im.backend); }
+    ring_mark(im);
+    if (sl.owns_lock()) { sl.unlock(); if (!im.pass_ring) ggml_backend_synchronize(im.backend); }
     return okk;
 }
 
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
     if (im.sub_mu && im.ly[(size_t) il].eslot >= 0 && !engram_wait_host(im)) return false;
+    ring_take(im);
     std::unique_lock<std::mutex> sl;
     if (im.sub_mu) {
         const double tl = g_dprof_on ? dprof_now() : 0;
@@ -1702,8 +1754,9 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     if (im.fn_host) ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ring_mark(im);
     if (sl.owns_lock()) sl.unlock();
-    ggml_backend_synchronize(im.backend);
+    if (!im.pass_ring) ggml_backend_synchronize(im.backend);
     lap(4);
     return true;
 }
@@ -1723,6 +1776,7 @@ bool Ds41Dense::finish_span(int il, int col0, int n) {
     Impl & im = *p_;
     (void) il;
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
+    ring_take(im);
     const double tf0 = g_dprof_on ? dprof_now() : 0;
     std::unique_lock<std::mutex> sl;
     if (im.sub_mu) {
@@ -1738,7 +1792,8 @@ bool Ds41Dense::finish_span(int il, int col0, int n) {
     const bool ok = im.compute(gf, false, false, sl.owns_lock());
     g_dprof_slot = -1;
     ggml_free(gc);
-    if (sl.owns_lock()) { sl.unlock(); ggml_backend_synchronize(im.backend); }
+    ring_mark(im);
+    if (sl.owns_lock()) { sl.unlock(); if (!im.pass_ring) ggml_backend_synchronize(im.backend); }
     if (g_dprof_on) g_dfin += dprof_now() - tf0;
     return ok;
 }
