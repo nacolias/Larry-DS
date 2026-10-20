@@ -58,6 +58,10 @@ struct Ds41DenseConfig {
     bool    elastic_cols = false;
 };
 
+// larry, STRATA_GPU_TL: called at a decode layer's stage boundaries (0 attention queued, 1 readbacks done, 2 shared
+// expert done, 4 finish done) - the generator points it at the Xe tier's profiling tags
+extern void (*ds41_dense_tl_hook)(int id);
+
 class Ds41Dense {
 public:
     struct Impl;

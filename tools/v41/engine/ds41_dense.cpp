@@ -51,6 +51,11 @@ struct Allo {
     std::map<const ggml_cgraph *, uint64_t> graph_epoch;
     std::set<const void *> compute_bufs;
     ~Allo() { if (a) ggml_gallocr_free(a); }
+    // alloc() returns at once (the graph keeps its addresses): nothing is (re)allocated under in-flight kernels
+    bool kept(const ggml_cgraph * g, bool reuse) const {
+        auto it = graph_epoch.find(g);
+        return reuse && g->uid != 0 && it != graph_epoch.end() && it->second == epoch;
+    }
     bool alloc(ggml_cgraph * g, bool reuse) {
         auto it = graph_epoch.find(g);
         if (reuse && g->uid != 0 && it != graph_epoch.end() && it->second == epoch) return true;
@@ -109,6 +114,37 @@ bool is_routed(const std::string & n) {
 }  // namespace
 
 // ================================================================== Impl
+
+// larry: a host mirror the dense card's rows are read back into - pinned (the device's host buffer type: SYCL
+// malloc_host) when a backend is given, so the async readbacks really are async (a device -> host copy into pageable
+// memory is staged and blocks the host until the card reaches it); a plain vector otherwise
+template <typename T> struct HostRows {
+    std::vector<T> v;
+    ggml_backend_buffer_t buf = nullptr;
+    T * p = nullptr;
+    size_t n = 0;
+    HostRows() = default;
+    HostRows(const HostRows &) = delete;
+    HostRows & operator=(const HostRows &) = delete;
+    ~HostRows() { if (buf) ggml_backend_buffer_free(buf); }
+    void resize(size_t count, ggml_backend_t be = nullptr) {
+        if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
+        n = count;
+        ggml_backend_buffer_type_t hbt = be && count ? ggml_backend_dev_host_buffer_type(ggml_backend_get_device(be)) : nullptr;
+        if (hbt && (buf = ggml_backend_buft_alloc_buffer(hbt, count * sizeof(T))) != nullptr) {
+            p = (T *) ggml_backend_buffer_get_base(buf);
+            std::memset(p, 0, count * sizeof(T));
+            v.clear();
+            return;
+        }
+        v.assign(count, T());
+        p = v.data();
+    }
+    T * data() { return p; }
+    const T * data() const { return p; }
+    size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+};
 
 struct Ds41Dense::Impl {
     std::function<bool()> oom_hook;       // set_oom_hook: frees device memory when a graph buffer does not fit
@@ -200,8 +236,9 @@ struct Ds41Dense::Impl {
     int64_t S = 1, batch = 0, col0 = 0;
     int batch_pos0 = 0;                             // the batch's first position
     std::vector<std::array<int64_t, 3>> span_cap;   // [sub-batch][ratio] pass_cap
-    std::vector<float> host_fn, host_wts, host_logits, host_emb;
-    std::vector<int32_t> host_ids;
+    HostRows<float> host_fn, host_wts;
+    std::vector<float> host_logits, host_emb;
+    HostRows<int32_t> host_ids;
     const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap
     std::vector<std::vector<float>> eng_rows;
     // The pass's Engram reads, started (async) by upload_inputs and waited at the first Engram layer's span /
@@ -223,6 +260,8 @@ struct Ds41Dense::Impl {
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
     ~Impl() {
+        if (backend) ggml_backend_synchronize(backend);   // async decode graphs may still be queued
+        if (rb_ev) ggml_backend_event_free(rb_ev);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -239,7 +278,8 @@ struct Ds41Dense::Impl {
         const auto it = w.t.find("blk." + std::to_string(il) + ".ffn_gate_inp_pred.weight");
         return it != w.t.end() ? it->second : BL(il, "ffn_gate_inp.weight");
     }
-    bool compute(ggml_cgraph * gf, bool cached);
+    bool compute(ggml_cgraph * gf, bool cached, bool async = false);
+    ggml_backend_event_t rb_ev = nullptr;   // larry: the router readbacks' event (async decode / verify layers)
     bool upload_inputs(const int * tids, int n, int pos0);
 };
 
@@ -444,17 +484,40 @@ static double g_dprof[8] = {};   // build, alloc, compute, engram, readback, fin
 static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static int g_dprof_slot = -1;    // which of build/alloc/compute buckets compute() charges: set by the span callers
 
-bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
+// STRATA_DEC_PROF=1 (larry, diagnostic): host time per decode layer in attn_router / finish - the attention graph's
+// submission, the readbacks' wait (the card finishing everything queued), the shared expert's submission, finish's
+static const bool g_decprof_on = std::getenv("STRATA_DEC_PROF") != nullptr;
+static double g_decprof[6] = {};   // attn submit, get enqueue, sync wait, shexp submit, finish submit, calls
+static void decprof_report() {
+    const double n = g_decprof[5];
+    std::fprintf(stderr, "dec prof (%.0f layer calls): attn submit %.1f us, get enqueue %.1f us, sync wait %.1f us, "
+                 "shexp submit %.1f us, finish submit %.1f us\n", n, 1e3 * g_decprof[0] / n, 1e3 * g_decprof[1] / n,
+                 1e3 * g_decprof[2] / n, 1e3 * g_decprof[3] / n, 1e3 * g_decprof[4] / n);
+}
+
+// larry: async = the kept decode / verify graphs (STRATA_DENSE_ASYNC, default on) are queued without ggml's
+// end-of-graph synchronize - the card runs attention, shared expert, routed sum and finish back to back while the host
+// queues ahead; it waits only for the router readbacks.  A graph whose allocation is not the kept fast path syncs
+// first (gallocr may free a buffer that queued kernels still use).
+void (*ds41_dense_tl_hook)(int id) = nullptr;
+
+static bool dense_async_on() { static const bool on = env_on("STRATA_DENSE_ASYNC", true); return on; }
+
+bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async) {
     Allo & a = cached ? allo_dec : allo_pass;
     const double tq0 = g_dprof_on ? dprof_now() : 0;
-    bool ok_alloc = a.alloc(gf, cached && env_on("DS41_GRAPH_REUSE", true));
+    const bool reuse = cached && env_on("DS41_GRAPH_REUSE", true);
+    async = async && cached && dense_async_on();
+    if (async && !a.kept(gf, reuse)) ggml_backend_synchronize(backend);
+    bool ok_alloc = a.alloc(gf, reuse);
     const double tq1 = g_dprof_on ? dprof_now() : 0;
     if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
         std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
         ok_alloc = a.alloc(gf, false);
     }
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
+    const ggml_status st = async ? ggml_backend_graph_compute_async(backend, gf) : ggml_backend_graph_compute(backend, gf);
+    if (st != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
     if (g_dprof_on && g_dprof_slot >= 0) { g_dprof[1] += tq1 - tq0; g_dprof[2] += dprof_now() - tq1; }
     return true;
 }
@@ -1168,13 +1231,14 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     if (!alloc_cols(im, im.NC, err)) return false;
     // the host mirrors are sized for the largest batch once (pinned registrations must not move)
-    im.host_fn.resize((size_t) (D * NCM));
+    ggml_backend_t pin_be = im.sycl ? im.backend : nullptr;   // SYCL: pinned through the device's host buffer type
+    im.host_fn.resize((size_t) (D * NCM), pin_be);
 #ifdef DS41_HAVE_CUDA
     // pinned: the fn rows go device -> host -> the tier's device input every layer (pageable copies ran at ~2 GB/s)
     if (!im.cpu && !im.host_fn.empty()) ggml_backend_cuda_register_host_buffer(im.host_fn.data(), im.host_fn.size() * 4);
 #endif
-    im.host_ids.resize((size_t) (im.NU * NCM));
-    im.host_wts.resize((size_t) (im.NU * NCM));
+    im.host_ids.resize((size_t) (im.NU * NCM), pin_be);
+    im.host_wts.resize((size_t) (im.NU * NCM), pin_be);
 #ifdef DS41_HAVE_CUDA
     // pinned too: attn_router reads fn / ids / wts back with three async copies and one sync (truly async only from
     // pinned memory)
@@ -1373,7 +1437,7 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
         gc = ggml_init(p);
         gf = build_init(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached, im.sycl);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1567,23 +1631,48 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n);
     }
-    const bool ok = im.compute(gf, cached);
+    // async (kept graphs): the readbacks get their own event and the shared expert is queued BEFORE the host waits,
+    // so the host's wait ends when the router's rows land, not when this card is idle
+    const bool async = cached && dense_async_on() && im.sycl;
+    if (async && !im.rb_ev) im.rb_ev = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+    const bool tl = ds41_dense_tl_hook && n == 1 && async;
+    if (tl) ds41_dense_tl_hook(0);
+    const double tp0 = g_decprof_on ? dprof_now() : 0;
+    const bool ok = im.compute(gf, cached, async);
     if (gc) ggml_free(gc);
     if (!ok) return false;
+    const double tp1 = g_decprof_on ? dprof_now() : 0;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
     ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_synchronize(im.backend);
+    if (async && im.rb_ev) ggml_backend_event_record(im.rb_ev, im.backend);
+    if (tl) ds41_dense_tl_hook(1);
+    double ts = 0;
+    auto shexp = [&]() -> bool {   // queued now: it runs on this card while the tier's cards run the routed experts
+        if (!(cached && split_shexp)) return true;
+        const Impl::GKey key { il, 7, 0, (int64_t) n };
+        auto it = im.graphs.find(key);
+        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_shexp(im, im.gctx, il, n)).first;
+        const double ts0 = g_decprof_on ? dprof_now() : 0;
+        if (!im.compute(it->second, true, async)) return false;
+        if (g_decprof_on) ts += dprof_now() - ts0;
+        return true;
+    };
+    if (async && im.rb_ev && !shexp()) return false;
+    if (tl) ds41_dense_tl_hook(2);
+    const double tp2 = g_decprof_on ? dprof_now() : 0;
+    if (async && im.rb_ev) ggml_backend_event_synchronize(im.rb_ev);
+    else ggml_backend_synchronize(im.backend);
+    const double tp3 = g_decprof_on ? dprof_now() : 0;
     std::memcpy(ids, im.host_ids.data(), (size_t) (im.NU * n) * 4);
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
     *fn_host = im.host_fn.data();
     if (fn_dev) *fn_dev = im.o_fn;
-    if (cached && split_shexp) {   // queued now: it runs on this card while the tier's cards run the routed experts
-        const Impl::GKey key { il, 7, 0, (int64_t) n };
-        auto it = im.graphs.find(key);
-        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_shexp(im, im.gctx, il, n)).first;
-        if (!im.compute(it->second, true)) return false;
+    if (!(async && im.rb_ev) && !shexp()) return false;
+    if (g_decprof_on && n == 1) {
+        g_decprof[0] += tp1 - tp0; g_decprof[1] += tp2 - tp1 - ts; g_decprof[2] += tp3 - tp2; g_decprof[3] += ts;
+        if ((long) ++g_decprof[5] % 2560 == 0) decprof_report();
     }
     return true;
 }
@@ -1646,7 +1735,10 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const double tf0 = g_decprof_on ? dprof_now() : 0;
+    const bool ok = im.compute(gf, cached, im.sycl);
+    if (g_decprof_on && n == 1) g_decprof[4] += dprof_now() - tf0;
+    if (ds41_dense_tl_hook && n == 1 && im.sycl && dense_async_on()) ds41_dense_tl_hook(4);
     if (gc) ggml_free(gc);
     return ok;
 }

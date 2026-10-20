@@ -128,6 +128,14 @@ struct XeCard {
 };
 
 struct Ds41XeImpl {
+    // STRATA_GPU_TL: the decode timeline's profiling tags - (id, event) on the dense queue; per card (start, end)
+    std::vector<std::pair<int, sycl::event>> tl;
+    std::vector<std::vector<std::pair<sycl::event, sycl::event>>> tl_card;
+    double tl_sum[8][8] = {};   // [from id][to id] device us
+    long tl_n[8][8] = {};
+    std::vector<double> tl_csum;
+    std::vector<long> tl_cn;
+    long tl_tokens = 0;
     Ds41MoeGeom g;
     Ds41MoeConfig cfg;
     Ds41BlobSource* blobs = nullptr;
@@ -158,7 +166,7 @@ struct Ds41XeImpl {
     std::vector<uint8_t> nact;             ///< [token][format slot][kNativeActBytes]
     std::vector<int> nact_fmt;             ///< format slots: distinct gu_act values
     std::vector<float> cpart;              ///< [job][8][n_embd] CPU expert outputs
-    std::vector<float> hsum;               ///< [8][n_embd] host-side sum
+    float* hsum = nullptr;                 ///< [8][n_embd] host-side sum (pinned: its copy to the dense card is async)
     std::vector<uint8_t> ftmp;             ///< file-tier reads (decode)
     Ds41MoeStats st;
     std::mutex mu;
@@ -367,7 +375,8 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
             std::find(im.nact_fmt.begin(), im.nact_fmt.end(), f.gu_act) == im.nact_fmt.end())
             im.nact_fmt.push_back(f.gu_act);
     im.nact.assign((size_t) kMaxJobTok * std::max<size_t>(1, im.nact_fmt.size()) * cpu::kNativeActBytes, 0);
-    im.hsum.assign((size_t) kMaxJobTok * H, 0.f);
+    if (!im.hsum) im.hsum = sycl::malloc_host<float>((size_t) kMaxJobTok * H, im.ctx);
+    std::memset(im.hsum, 0, (size_t) kMaxJobTok * H * sizeof(float));
     std::fprintf(stderr, "xe tier: %zu card(s), dense half on card %d; %lld classes, largest blob %.2f MiB, swiglu limit %g\n",
                  im.cards.size(), im.dense, (long long) NCL, im.blob_max / 1048576.0, (double) im.L);
     return true;
@@ -596,6 +605,48 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
 
 void Ds41XeTier::set_slot_gib(double gib) { im_->slot_gib = gib; }
 void Ds41XeTier::set_dense_queue(void* q) { im_->dense_q = (sycl::queue*) q; }
+
+bool Ds41XeTier::tl_on() { static const bool on = env_i("STRATA_GPU_TL", 0) != 0; return on; }
+
+void Ds41XeTier::tl_tag(int id) {
+    Ds41XeImpl& im = *im_;
+    if (!tl_on() || !im.dense_q) return;
+    im.tl.emplace_back(id, sycl::ext::oneapi::experimental::submit_profiling_tag(*im.dense_q));
+}
+
+void Ds41XeTier::tl_flush() {
+    Ds41XeImpl& im = *im_;
+    if (!tl_on()) return;
+    auto ns = [](const sycl::event& e) { return (double) e.get_profiling_info<sycl::info::event_profiling::command_end>(); };
+    if (!im.tl.empty()) im.tl.back().second.wait();
+    for (size_t i = 1; i < im.tl.size(); ++i) {
+        const int a = im.tl[i - 1].first, b = im.tl[i].first;
+        if (a < 0 || a > 7 || b < 0 || b > 7) continue;
+        im.tl_sum[a][b] += 1e-3 * (ns(im.tl[i].second) - ns(im.tl[i - 1].second));
+        ++im.tl_n[a][b];
+    }
+    im.tl.clear();
+    im.tl_csum.resize(im.cards.size(), 0.0);
+    im.tl_cn.resize(im.cards.size(), 0);
+    im.tl_card.resize(im.cards.size());
+    for (size_t c = 0; c < im.tl_card.size(); ++c) {
+        for (auto& se : im.tl_card[c]) {
+            se.second.wait();
+            im.tl_csum[c] += 1e-3 * (ns(se.second) - ns(se.first));
+            ++im.tl_cn[c];
+        }
+        im.tl_card[c].clear();
+    }
+    if (++im.tl_tokens % 64) return;
+    std::fprintf(stderr, "gpu timeline (%ld tokens), dense card us per step:", im.tl_tokens);
+    for (int a = 0; a < 8; ++a)
+        for (int b = 0; b < 8; ++b)
+            if (im.tl_n[a][b]) std::fprintf(stderr, " %d->%d %.1f (x%ld)", a, b, im.tl_sum[a][b] / im.tl_n[a][b], im.tl_n[a][b]);
+    std::fprintf(stderr, "; cards (dispatch -> copy done):");
+    for (size_t c = 0; c < im.tl_csum.size(); ++c)
+        if (im.tl_cn[c]) std::fprintf(stderr, " %zu: %.1f (x%ld)", c, im.tl_csum[c] / im.tl_cn[c], im.tl_cn[c]);
+    std::fprintf(stderr, "\n");
+}
 void Ds41XeTier::set_cache_enabled(bool on) { im_->cache_enabled = on; }
 
 void Ds41XeTier::release_cache() {
@@ -750,7 +801,8 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                 if (!c.dense) ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, n_out * 4);
                 return ev;
             };
-            sycl::event ev;
+            sycl::event ev, tl_start;
+            if (Ds41XeTier::tl_on()) tl_start = sycl::ext::oneapi::experimental::submit_profiling_tag(c.q);
             if (im.dense_q && im.planar && im.tier_graphs && nt == 1) {   // decode; verify shapes vary too much to amortise a recording
                 namespace sx = sycl::ext::oneapi::experimental;
                 const uint32_t key = (uint32_t) n | ((uint32_t) nt << 8) | ((uint32_t) mv << 12);
@@ -776,13 +828,17 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             } else {
                 ev = enqueue(nullptr);
             }
+            if (Ds41XeTier::tl_on()) {
+                if (im.tl_card.size() < NC) im.tl_card.resize(NC);
+                im.tl_card[(size_t) c.idx].emplace_back(tl_start, sycl::ext::oneapi::experimental::submit_profiling_tag(c.q));
+            }
             deps.push_back(ev);
             used.push_back(c.idx);
         }
         double ts1 = sprof ? now_ms() : 0;
         sycl::queue& qd = im.dense_q ? *im.dense_q : dc->q;
         if (!cpu_list.empty()) {
-            float* hs = im.hsum.data();
+            float* hs = im.hsum;
             im.hsum_ev.wait();   // the previous call's copy of hsum has been made
             std::memset(hs, 0, n_out * 4);
             cpu_ents(im, l, cpu_list, x, hs);
@@ -810,6 +866,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             });
             if (im.dense_q) im.last_sum = ev; else ev.wait();
         }
+        if (Ds41XeTier::tl_on() && im.dense_q) im.tl.emplace_back(3, sycl::ext::oneapi::experimental::submit_profiling_tag(*im.dense_q));
         if (sprof) {
             const double ts3 = now_ms();
             sp[0] += ts0 - t0;      // grouping + job building (before the cards' submissions)
@@ -835,7 +892,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         card_experts(im, c, n, nt, mnt[(size_t) c.idx], xoff, c.OUT);
         c.q.memcpy(c.part_host, c.OUT, n_out * 4);
     }
-    float* hs = im.hsum.data();
+    float* hs = im.hsum;
     std::memset(hs, 0, n_out * 4);
     cpu_ents(im, l, cpu_list, x, hs);
     for (auto& cp : im.cards) {
@@ -1366,6 +1423,7 @@ void Ds41XeTier::close() {
         else std::free(p);
     }
     im.achunks.clear();
+    if (im.hsum) { im.hsum_ev.wait(); sycl::free(im.hsum, im.ctx); im.hsum = nullptr; }
     im.placed = false;
     im.dense_set.clear();
     im.pool.reset();

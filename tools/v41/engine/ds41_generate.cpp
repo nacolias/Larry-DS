@@ -410,6 +410,9 @@ int main(int argc, char ** argv) {
     if (!tier.init(TG, &src, mc, mc.cpu_only ? nullptr : dense.routed_dev(), err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
     // the decode / verify sums on the dense half's queue: no host wait per layer (STRATA_XE_SYNC=1: the tier waits)
     if (!mc.cpu_only && !std::getenv("STRATA_XE_SYNC")) tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
+    // STRATA_GPU_TL=1: the decode layer's stage boundaries as device timestamps on the dense queue (diagnostic)
+    static Ds41XeTier * tl_tier = &tier;
+    if (Ds41XeTier::tl_on()) ds41_dense_tl_hook = [](int id) { tl_tier->tl_tag(id); };
 #else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
 #endif
@@ -520,6 +523,9 @@ int main(int argc, char ** argv) {
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
         double ta = dprof ? now_ms() : 0;
+#if defined(DS41_XE)
+        tier.tl_flush();   // the previous token's timeline (its logits were read: all of it has run)
+#endif
         if (dump_main) {
             dm_tok = tok;
             dm_pos = pos;

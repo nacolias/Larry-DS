@@ -54,6 +54,13 @@ public:
     /// final sum runs on it and the call returns without waiting: the dense half's next graph (on that queue) orders
     /// after it, and the host goes on submitting while the cards compute.
     void set_dense_queue(void* q);
+    /// larry, STRATA_GPU_TL=1 (diagnostic): device timestamps (profiling tags) on the dense queue at the decode layer's
+    /// stage boundaries (tl_tag ids: 0 attention queued, 1 readbacks done, 2 shared expert done, 4 finish done; the
+    /// tier tags 3 after its sum) and on each card around its share; tl_flush (once per token) folds them into
+    /// per-transition averages, printed every 64 tokens
+    static bool tl_on();
+    void tl_tag(int id);
+    void tl_flush();
     void set_cache_enabled(bool on);
     void release_cache();
     int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
