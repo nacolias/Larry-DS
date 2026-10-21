@@ -364,11 +364,39 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 n.compare(n.size() - suf.size(), suf.size(), suf) != 0) return std::string();
             return n.substr(0, n.size() - suf.size()) + "ffn_gate_inp_pred.weight";
         };
+        // larry, STRATA_ROUTER_F16 (default 1): each layer's F32 router (ffn_gate_inp, 7.9 MB read whole by every decode
+        // step) stored F16 - its values are bf16, exact in F16 above 6.1e-5 (~0.1% of them are smaller: absolute error
+        // <= 3e-8).  The decode mat-vec reads half the bytes; the routing GEMM asks GGML_PREC_F32 and stays on f32 math.
+        // STRATA_ENGRAM_REQUANT=<ggml type> (q6_K, q8_0; off unless set): the Engram KV projections (F16 [6144 x 25600],
+        // 315 MB, read whole every token on the two Engram layers) re-quantized at load like the dense matrices.
+        const bool router_f16 = env_on("STRATA_ROUTER_F16", true);
+        ggml_type eq = GGML_TYPE_COUNT;
+        if (const char * e = std::getenv("STRATA_ENGRAM_REQUANT"); e && *e)
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+                if (ggml_get_type_traits((ggml_type) t)->type_name && strcasecmp(ggml_type_name((ggml_type) t), e) == 0) eq = (ggml_type) t;
+        auto ends_with = [](const std::string & n, const char * suf) {
+            const size_t k = std::strlen(suf);
+            return n.size() > k && n.compare(n.size() - k, k, suf) == 0;
+        };
+        size_t cv_router = 0, cv_engram = 0;
+        auto mem_type = [&](const TensorInfo & ti) -> int {   // the in-memory type, -1 = the file's
+            if (requant(ti)) return (int) rq;
+            if (router_f16 && (ggml_type) ti.type == GGML_TYPE_F32 && ti.shape.size() == 2 && ends_with(ti.name, ".ffn_gate_inp.weight")) {
+                ++cv_router;
+                return GGML_TYPE_F16;
+            }
+            if (eq != GGML_TYPE_COUNT && eq != (ggml_type) ti.type && (ggml_type) ti.type == GGML_TYPE_F16 && ti.shape.size() == 2 &&
+                ends_with(ti.name, ".engram_kv.weight") && (int64_t) ti.shape[0] % ggml_blck_size(eq) == 0) {
+                ++cv_engram;
+                return (int) eq;
+            }
+            return -1;
+        };
         size_t rq_n = 0, rq_from = 0, rq_to = 0, pq_n = 0;
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
-                w.t[ti.name] = make(ti, requant(ti) ? (int) rq : -1);
+                w.t[ti.name] = make(ti, mem_type(ti));
                 if (const std::string pn = pred_name(ti); !pn.empty()) {
                     ggml_tensor * tp = make(ti, (int) pq);
                     ggml_set_name(tp, pn.c_str());
@@ -415,8 +443,9 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 ++rq_n;
                 rq_from += (size_t) ggml_nrows(t) * ggml_row_size((ggml_type) ti.type, t->ne[0]);
             }
-        if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB\n", rq_n, ggml_type_name(rq),
-                               rq_from / 1e9, rq_to / 1e9);
+        if (rq_n) std::fprintf(stderr, "dense requant: %zu matrices converted (%s for Q8_0; %zu routers F16, %zu Engram KV %s), %.2f -> %.2f GB\n",
+                               rq_n, rq != GGML_TYPE_COUNT ? ggml_type_name(rq) : "-", cv_router, cv_engram,
+                               eq != GGML_TYPE_COUNT ? ggml_type_name(eq) : "-", rq_from / 1e9, rq_to / 1e9);
         if (pq_n) std::fprintf(stderr, "prediction routers: %zu F32 copies as %s\n", pq_n, ggml_type_name(pq));
         // larry (SYCL): the shared expert's gate and up as ONE [K, 2N] weight over their bytes - the file stores them back
         // to back and the buffer keeps them so - one mat-vec instead of two (STRATA_SHEXP_GU, default 1).  shexp_ffn is

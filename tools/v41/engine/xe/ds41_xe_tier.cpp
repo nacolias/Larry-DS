@@ -967,7 +967,8 @@ namespace {
 /// The CPU pool's share of a call: `ents` (all in the arena / file tier), outputs weighted into `hs` [8][n_embd].
 void cpu_ents(Ds41XeImpl& im, int64_t l, const std::vector<const Ent*>& ents, const float* x, float* hs) {
     const int64_t H = im.g.n_embd;
-    if (ents.empty()) return;
+    static const bool skip_dbg = env_i("STRATA_XE_CPU_SKIP", 0) != 0;   // DEBUG: timing bound only (wrong output)
+    if (ents.empty() || skip_dbg) return;
     const double t0 = now_ms();
     if (im.cpart.size() < (size_t) ents.size() * kMaxJobTok * H) im.cpart.resize((size_t) ents.size() * kMaxJobTok * H);
     // the activation of every token the CPU experts need, once per format
@@ -1104,6 +1105,13 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     static thread_local std::vector<Ent> ents;
     static thread_local std::vector<int32_t> first;
     group(ids, w, nt, K, im.g.n_experts, ents, first);
+    static const bool cpu_stats = env_i("STRATA_XE_CPU_STATS", 0) != 0;
+    struct CpuStats { std::vector<uint8_t> seen; int64_t uses = 0, repeats = 0, distinct = 0, calls = 0, tok_uses = 0; };
+    static CpuStats cst;
+    if (cpu_stats && ++cst.calls % 4000 == 0)
+        std::fprintf(stderr, "xe cpu stats (%lld calls): %lld CPU expert uses (%lld token-uses), %lld repeats of an expert already run on the "
+                     "CPU, %lld distinct\n", (long long) cst.calls, (long long) cst.uses, (long long) cst.tok_uses, (long long) cst.repeats,
+                     (long long) cst.distinct);
     // per card: its jobs; the rest: the CPU pool
     std::vector<const Ent*> cpu_list;
     const size_t NC = im.cards.size();
@@ -1120,6 +1128,13 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     for (const Ent& en : ents) {
         const size_t key = (size_t) im.key(l, en.e);
         const int c = im.card_of[key];
+        if (c < 0 && cpu_stats) {
+            if (cst.seen.size() < im.card_of.size()) cst.seen.resize(im.card_of.size(), 0);
+            ++cst.uses;
+            cst.tok_uses += en.nt;
+            if (cst.seen[key]) ++cst.repeats;
+            else { cst.seen[key] = 1; ++cst.distinct; }
+        }
         if (c < 0) { cpu_list.push_back(&en); continue; }
         XeCard& cd = *im.cards[(size_t) c];
         if (nj[(size_t) c] >= (cd.armed ? cd.arm_ng : kMaxDecodeJobs)) { cpu_list.push_back(&en); continue; }

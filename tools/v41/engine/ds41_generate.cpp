@@ -427,9 +427,11 @@ int main(int argc, char ** argv) {
     }
     // STRATA_GPU_TL=1: the decode layer's stage boundaries as device timestamps on the dense queue (diagnostic)
     static Ds41XeTier * tl_tier = &tier;
-    // STRATA_HEAD_SPLIT (default 1): the LM head (and the DSpark draft's shared head) split over every card
+    // STRATA_HEAD_SPLIT (default 1): the LM head (and the DSpark draft's shared head) split over every card; also any
+    // other Q6_K mat-vec of >= STRATA_HEAD_SPLIT_MB (100): the Engram KV projections once re-quantized (129 MB)
     if (!mc.cpu_only && !(std::getenv("STRATA_HEAD_SPLIT") && std::getenv("STRATA_HEAD_SPLIT")[0] == '0'))
-        ggml_backend_sycl_set_mv_hook(&Ds41XeTier::mv_hook, &tier, 200.0);
+        ggml_backend_sycl_set_mv_hook(&Ds41XeTier::mv_hook, &tier,
+                                      std::getenv("STRATA_HEAD_SPLIT_MB") ? std::atof(std::getenv("STRATA_HEAD_SPLIT_MB")) : 100.0);
     if (Ds41XeTier::tl_on()) ds41_dense_tl_hook = [](int id) { tl_tier->tl_tag(id); };
 #else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
