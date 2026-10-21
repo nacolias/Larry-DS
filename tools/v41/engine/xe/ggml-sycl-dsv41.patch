@@ -114,7 +114,7 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 --- a/ggml/include/ggml-sycl.h
 +++ b/ggml/include/ggml-sycl.h
-@@ -21,6 +21,18 @@
+@@ -21,6 +21,23 @@
  
  GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
  
@@ -128,7 +128,12 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 +// larry: reorder a 2-D Q6_K weight into the planar layout now (it happens lazily at its first decode-shaped product
 +// otherwise: ~200 dense weights and a host wait each inside the first decode token).  True if it is reordered.
 +GGML_BACKEND_API bool ggml_backend_sycl_prereorder(ggml_backend_t backend, struct ggml_tensor * t);
++// larry: a 2-D Q6_K weight read only through n_slices 3-D slice views (wo_a) reordered per slice now - the planar layout
++// decode's mat-vec and the prompt's per-slice GEMM read - instead of by the first decode-shaped product
++GGML_BACKEND_API bool ggml_backend_sycl_prereorder_slices(ggml_backend_t backend, struct ggml_tensor * t, int64_t n_slices);
 +GGML_BACKEND_API void ggml_backend_sycl_set_mv_hook(ggml_sycl_larry_mv_hook_t fn, void * user, double min_mb);
++// larry: free the fp16 weight copies the prompt GEMMs keep (GGML_SYCL_LARRY_F16CACHE_MB) - their VRAM back for decode
++GGML_BACKEND_API void ggml_backend_sycl_larry_f16cache_release(void);
 +
  // devide buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
@@ -2721,7 +2726,81 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #include "ggml-sycl/lightning-indexer.hpp"
  #include "ggml-sycl/conv2d.hpp"
  #include "ggml-sycl/conv2d-dw.hpp"
-@@ -2918,7 +2921,11 @@
+@@ -2888,6 +2891,73 @@
+   std::exit(1);
+ }
+ 
++// larry, GGML_SYCL_LARRY_F16CACHE_MB: fp16 copies of quantized weights for the prompt GEMMs, kept across calls
++struct larry_f16c_entry { const void * src; size_t ne; sycl::half * f16; size_t cap; uint64_t tick; };
++static std::vector<larry_f16c_entry> g_larry_f16c;
++static size_t g_larry_f16c_bytes = 0;
++static uint64_t g_larry_f16c_tick = 0;
++static sycl::queue * g_larry_f16c_q = nullptr;
++
++// native device memory, resident on this card only (no UR/UMF peer residency); nullptr on failure
++static sycl::half * larry_f16c_alloc(queue_ptr stream, size_t ne) {
++    ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(stream->get_context());
++    ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(stream->get_device());
++    ze_device_mem_alloc_desc_t d = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, nullptr, 0, 0};
++    void * p = nullptr;
++    const size_t bytes = ne * sizeof(sycl::half);
++    if (zeMemAllocDevice(zc, &d, bytes, 4096, zd, &p) != ZE_RESULT_SUCCESS || !p) return nullptr;
++    if (zeContextMakeMemoryResident(zc, zd, p, bytes) != ZE_RESULT_SUCCESS) { zeMemFree(zc, p); return nullptr; }
++    return (sycl::half *) p;
++}
++
++// the fp16 copy of the weight data at src (ne values), conv(y) writing it if it is not cached; nullptr = over budget
++template <typename F>
++static const sycl::half * larry_f16cache_core(const void * src, size_t ne, F && conv, queue_ptr stream) {
++    static const double mb = [] { const char * e = std::getenv("GGML_SYCL_LARRY_F16CACHE_MB"); return e ? std::atof(e) : 768.0; }();
++    const size_t budget = (size_t) (mb * 1048576.0);
++    if (budget == 0 || ne * 2 > budget) return nullptr;
++    for (auto & e : g_larry_f16c)
++        if (e.src == src && e.ne == ne) { e.tick = ++g_larry_f16c_tick; return e.f16; }
++    larry_f16c_entry * slot = nullptr;   // the least recently used entry big enough (reused in place, in queue order)
++    if (g_larry_f16c_bytes + ne * 2 > budget)
++        for (auto & e : g_larry_f16c)
++            if (e.cap >= ne && (!slot || e.tick < slot->tick)) slot = &e;
++    if (!slot) {
++        if (g_larry_f16c_bytes + ne * 2 > budget) return nullptr;   // nothing fits: the pool path, as before
++        static const double keep_mb = [] { const char * e = std::getenv("GGML_SYCL_LARRY_F16CACHE_FREE_MB"); return e ? std::atof(e) : 3072.0; }();
++        size_t free_b = 0;
++        try { free_b = stream->get_device().get_info<sycl::ext::intel::info::device::free_memory>(); } catch (...) { return nullptr; }
++        if ((double) free_b < (double) (ne * 2) + keep_mb * 1048576.0) return nullptr;   // the prompt's own buffers first
++        sycl::half * p = larry_f16c_alloc(stream, ne);
++        if (!p) return nullptr;
++        g_larry_f16c.push_back({nullptr, 0, p, ne, 0});
++        g_larry_f16c_bytes += ne * 2;
++        g_larry_f16c_q = stream;
++        slot = &g_larry_f16c.back();
++    }
++    conv(slot->f16);
++    slot->src = src;
++    slot->ne = ne;
++    slot->tick = ++g_larry_f16c_tick;
++    return slot->f16;
++}
++
++// the fp16 copy of weight src0 (a leaf, not a view; its data at src, ne values); nullptr = not cacheable / over budget
++static const sycl::half * larry_f16cache_get(const ggml_tensor * src0, const void * src, size_t ne, to_fp16_sycl_t conv,
++                                             queue_ptr stream) {
++    if (src0->op != GGML_OP_NONE || src0->view_src != nullptr) return nullptr;
++    return larry_f16cache_core(src, ne, [&](sycl::half * y) { conv(src, y, (int64_t) ne, stream); }, stream);
++}
++
++void ggml_backend_sycl_larry_f16cache_release(void) {
++    if (g_larry_f16c.empty()) return;
++    if (g_larry_f16c_q) g_larry_f16c_q->wait();
++    ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(g_larry_f16c_q->get_context());
++    for (auto & e : g_larry_f16c) zeMemFree(zc, e.f16);
++    g_larry_f16c.clear();
++    g_larry_f16c_bytes = 0;
++}
++
+ inline void ggml_sycl_op_mul_mat_sycl(
+     ggml_backend_sycl_context & ctx,
+     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
+@@ -2918,7 +2988,11 @@
  #ifdef GGML_SYCL_F16
      bool use_fp16 = true;  // TODO(Yu) SYCL capability check
  #else
@@ -2734,7 +2813,33 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #endif
  
  #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
-@@ -4667,6 +4674,18 @@
+@@ -2948,18 +3022,22 @@
+     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
+         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
++        const sycl::half * src0_cached = nullptr;   // larry: GGML_SYCL_LARRY_F16CACHE_MB
+         if (src0->type != GGML_TYPE_F16) {
+             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+                                                  " : converting src0 to fp16");
+             const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+             GGML_ASSERT(to_fp16_sycl != nullptr);
+             size_t ne = row_diff*ne00;
+-            src0_as_f16.alloc(ne);
+-            to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
++            src0_cached = larry_f16cache_get(src0, src0_dd_i, ne, to_fp16_sycl, stream);
++            if (!src0_cached) {
++                src0_as_f16.alloc(ne);
++                to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
++            }
+         }
+         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
+                                          ? (const sycl::half *)src0_dd_i
+-                                         : src0_as_f16.get();
++                                         : src0_cached ? src0_cached : src0_as_f16.get();
+ 
+         ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
+         if (src1->type != GGML_TYPE_F16) {
+@@ -4667,6 +4745,18 @@
             dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
  }
  
@@ -2753,7 +2858,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4753,195 @@
+@@ -4734,6 +4824,219 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -2778,6 +2883,21 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +           !static_cast<const ggml_tensor_extra_gpu *>(par->extra)->optimized_feature.reorder;
 +}
 +
++bool ggml_backend_sycl_prereorder_slices(ggml_backend_t backend, ggml_tensor * t, int64_t n_slices) {
++    // the knobs larry_fastmv reads a planar slice through: without them a reorder here would leave it unreadable
++    static const int on = ggml_sycl_get_env("GGML_SYCL_LARRY_FASTMV", 1);
++    static const int q6r8 = ggml_sycl_get_env("GGML_SYCL_LARRY_Q6R8", 1);
++    static const int woa = ggml_sycl_get_env("GGML_SYCL_LARRY_WOA", 1);
++    if (!on || !q6r8 || !woa || !backend || !t || t->type != GGML_TYPE_Q6_K || t->view_src || t->ne[2] != 1 ||
++        t->ne[3] != 1 || n_slices < 2 || t->ne[1] % n_slices || t->ne[0] % QK_K || !t->extra) return false;
++    if (g_larry_slice_planar.count(t->data)) return true;
++    if (static_cast<const ggml_tensor_extra_gpu *>(t->extra)->optimized_feature.reorder) return false;   // reordered whole
++    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
++    if (!reorder_qw_q6_k_moe((uint8_t *) t->data, ggml_nbytes(t) / n_slices, n_slices, ctx->stream())) return false;
++    g_larry_slice_planar.insert(t->data);
++    return true;
++}
++
 +// prompt chunks against a per-slice planar Q6_K weight: per slice, W (f16) and the slice's columns (f16), one GEMM
 +static bool larry_slices_gemm(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 +    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[3] != 1 || dst->ne[3] != 1) return false;
@@ -2785,16 +2905,25 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    if (src1->ne[0] != K || G % src0->ne[2] || dst->ne[0] != N || dst->ne[1] != ncols || dst->ne[2] != G) return false;
 +    if (src1->nb[0] != 4 || dst->nb[0] != 4) return false;
 +    dpct::queue_ptr st = ctx.stream();
-+    ggml_sycl_pool_alloc<sycl::half> wf(ctx.pool(), (size_t) N * K);
 +    ggml_sycl_pool_alloc<sycl::half> xf(ctx.pool(), (size_t) ncols * K);
++    // only when the fp16 weight cache cannot hold the slice; declared after xf: the pool frees in stack order
++    ggml_sycl_pool_alloc<sycl::half> wf(ctx.pool());
 +    const int64_t g_div = G / src0->ne[2];
++    const sycl::half * w = nullptr;
 +    for (int64_t g = 0; g < G; ++g) {
-+        if (g % g_div == 0)
-+            fastmv::dequant_q6k_planar_f16(*st, (const char *) src0->data + (g / g_div) * src0->nb[2], N, K, wf.get());
++        if (g % g_div == 0) {
++            const char * sl = (const char *) src0->data + (g / g_div) * src0->nb[2];
++            w = larry_f16cache_core(sl, (size_t) (N * K), [&](sycl::half * y) { fastmv::dequant_q6k_planar_f16(*st, sl, N, K, y); }, st);
++            if (!w) {
++                if (!wf.get()) wf.alloc((size_t) N * K);
++                fastmv::dequant_q6k_planar_f16(*st, sl, N, K, wf.get());
++                w = wf.get();
++            }
++        }
 +        fastmv::cols_to_f16(*st, (const float *) ((const char *) src1->data + g * src1->nb[2]), (int64_t) (src1->nb[1] / 4), ncols, K, xf.get());
 +        // dst slice g, row-major [ncols][N] (ld = nb1 / 4) = X [ncols x K] . W^T
 +        oneapi::mkl::blas::row_major::gemm(*st, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans, ncols, N, K, 1.0f,
-+                                           xf.get(), K, wf.get(), K, 0.0f,
++                                           xf.get(), K, w, K, 0.0f,
 +                                           (float *) ((char *) dst->data + g * dst->nb[2]), (int64_t) (dst->nb[1] / 4));
 +    }
 +    return true;
@@ -2949,7 +3078,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +4955,9 @@
+@@ -4747,6 +5050,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -2959,7 +3088,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5134,6 +5345,22 @@
+@@ -5134,6 +5440,22 @@
              return;
          }
      }
@@ -2982,7 +3111,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +5661,33 @@
+@@ -5434,6 +5756,33 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -3016,7 +3145,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6230,33 @@
+@@ -5976,6 +6325,33 @@
      return skip;
  }
  
@@ -3050,7 +3179,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6347,29 @@
+@@ -6066,6 +6442,29 @@
              continue;
          }
  
@@ -3080,7 +3209,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6423,64 @@
+@@ -6119,6 +6518,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -3145,7 +3274,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +6591,12 @@
+@@ -6229,6 +6686,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -3158,7 +3287,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +6837,24 @@
+@@ -6469,6 +6932,24 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

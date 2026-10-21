@@ -345,8 +345,14 @@ int main(int argc, char ** argv) {
         const double t0 = now_ms();
         int nr = 0;
         for (ggml_tensor * t : dense.reorder_weights()) nr += ggml_backend_sycl_prereorder(dense.backend(), t) ? 1 : 0;
+        // wo_a per group slice: every prompt span then takes the per-slice GEMM, from the first prompt on
+        // (STRATA_PREREORDER_SLICES, default 1)
+        int ns = 0;
+        if (!(std::getenv("STRATA_PREREORDER_SLICES") && std::getenv("STRATA_PREREORDER_SLICES")[0] == '0'))
+            for (ggml_tensor * t : dense.slice_reorder_weights())
+                ns += ggml_backend_sycl_prereorder_slices(dense.backend(), t, dense.geom().o_groups) ? 1 : 0;
         ggml_backend_synchronize(dense.backend());
-        std::fprintf(stderr, "dense: %d Q6_K weights reordered at load (%.2f s)\n", nr, (now_ms() - t0) / 1000.0);
+        std::fprintf(stderr, "dense: %d Q6_K weights reordered at load, %d per slice (%.2f s)\n", nr, ns, (now_ms() - t0) / 1000.0);
     }
 #endif
     const Ds41Geometry & G = dense.geom();
@@ -812,6 +818,9 @@ int main(int argc, char ** argv) {
 #endif
     auto open_cache = [&]() -> bool {
         dense.release_pass();
+#if defined(DS41_XE)
+        ggml_backend_sycl_larry_f16cache_release();   // the prompt GEMMs' fp16 weight copies: VRAM for the expert cache
+#endif
 #if defined(DS41_HAVE_DSPARK)
         if (dsp_path && !dsp) {
             Ds41DSparkConfig sc;
@@ -928,6 +937,8 @@ int main(int argc, char ** argv) {
                     ferr = dense.last_error();
                     return false;
                 }
+                // larry: the next batch's Engram rows go into the row cache while this one computes
+                if (c0 + B < n) dense.engram_prefetch(ids + c0 + B, std::min(pb_cap, n - c0 - B), pos0 + c0 + B);
                 // enc-skip: columns whose global position is before `pos0 + n - ER` are phase A (layers past layer 20
                 // are never read for them), rounded DOWN to a sub-batch boundary so a straddling sub-batch still runs
                 // the full path (more work, never wrong); the last sub-batches holding the final token are always full.

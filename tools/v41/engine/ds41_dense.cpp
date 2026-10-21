@@ -245,6 +245,15 @@ struct Ds41Dense::Impl {
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
+    std::shared_ptr<Ds41Engram::Batch> eng_pf;   // larry: the next batch's rows being read into the row cache
+    // larry, STRATA_ENG_PIN: a prompt batch's rows in pinned memory, uploaded async (eng_pin_n floats a slot; 0 = the
+    // batch used eng_rows), the next batch's writes waiting on eng_pin_ev
+    ggml_backend_buffer_t eng_pin_buf = nullptr;
+    float * eng_pin[2] = {};
+    size_t eng_pin_n = 0;
+    ggml_backend_event_t eng_pin_ev = nullptr;
+    std::vector<int> eng_pf_tids;                // larry: a prefetch request waiting for this batch's own reads
+    int eng_pf_pos0 = -1;
 
     // ---- graphs
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
@@ -263,6 +272,8 @@ struct Ds41Dense::Impl {
         if (backend) ggml_backend_synchronize(backend);   // async decode graphs may still be queued
         if (rb_ev) ggml_backend_event_free(rb_ev);
         if (up_ev) ggml_backend_event_free(up_ev);
+        if (eng_pin_ev) ggml_backend_event_free(eng_pin_ev);
+        if (eng_pin_buf) ggml_backend_buffer_free(eng_pin_buf);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -535,12 +546,15 @@ struct B {
         *post = ggml_scale(c, ggml_sigmoid(c, *post), 2.0f);
         *comb = ggml_dsv4_hc_comb(c, mixes, sc, bs, (float) g->hc_eps, (int32_t) g->hc_iters);
     }
-    // larry, STRATA_HC_FUSE (default 1): decode / verify widths (n <= 8) run each sub-layer's hc step as two fused ops
+    // larry, STRATA_HC_FUSE (default 1): decode / verify widths run each sub-layer's hc step as two fused ops
     // (ggml_dsv41_hc_fa + _hc_fb: the composite's hc_post, norm_mv, hc_mixes, hc_comb, hc_pre and rms_norm * w) and
     // the finish as one (ggml_dsv41_hc_post2: add, hc_post and the state write) - 14 tiny kernels a layer -> 5
     bool hc_fused(int64_t nt) const {
         static const bool on = env_on("STRATA_HC_FUSE", true);
-        return on && im->sycl && nt <= 8;
+        // STRATA_HC_FUSE_MAXN (default 8 = decode / verify): wider is slower - at 512-token spans the per-token mixes
+        // dots lose to the composite GEMM (31.6K prompt 26.2 -> 27.7 s)
+        static const int64_t maxn = std::getenv("STRATA_HC_FUSE_MAXN") ? std::atoll(std::getenv("STRATA_HC_FUSE_MAXN")) : 8;
+        return on && im->sycl && nt <= maxn;
     }
     // the views of a ggml_dsv41_hc_fb result: xn [D, n] | pre [HC, n] | post [HC, n] | comb [HC, HC, n]
     void hc_fb_views(ggml_tensor * fb, int64_t nt, ggml_tensor ** xn, ggml_tensor ** pre, ggml_tensor ** post,
@@ -1176,6 +1190,17 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
 
 // ================================================================== public API
 
+std::vector<ggml_tensor *> Ds41Dense::slice_reorder_weights() const {
+    std::vector<ggml_tensor *> v;
+    const std::string suf = "attn_output_a.weight";
+    for (const auto & kv : p_->w.t) {
+        ggml_tensor * t = kv.second;
+        if (t->type != GGML_TYPE_Q6_K || t->ne[2] != 1 || t->ne[3] != 1 || !t->buffer) continue;
+        if (kv.first.size() > suf.size() && kv.first.compare(kv.first.size() - suf.size(), suf.size(), suf) == 0) v.push_back(t);
+    }
+    return v;
+}
+
 Ds41Dense::Ds41Dense() : p_(new Impl()) {}
 Ds41Dense::~Ds41Dense() = default;
 const Ds41Geometry & Ds41Dense::geom() const { return p_->g; }
@@ -1469,6 +1494,46 @@ static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t 
     }
 }
 
+// STRATA_ENG_PROF: a prompt batch's Engram phases (start on the caller, the host wait, the rows' upload), per batch
+static const bool g_eng_prof = std::getenv("STRATA_ENG_PROF") != nullptr;
+static double eng_t_start = 0, eng_t_wait = 0;
+static int eng_t_n = 0;
+static double eng_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// larry: the deferred next-batch prefetch (Ds41Dense::engram_prefetch), launched once this batch's own reads are done
+static void eng_pf_launch(Ds41Dense::Impl & im) {
+    if (im.eng_pf_pos0 < 0 || im.eng_pf) return;
+    const int n = (int) im.eng_pf_tids.size();
+    for (int t = 0; t < n; ++t) im.engram.set_token(im.eng_pf_pos0 + t, im.eng_pf_tids[(size_t) t]);
+    std::string e2;
+    im.eng_pf = im.engram.prefetch(im.eng_pf_pos0, n, e2);
+    im.eng_pf_pos0 = -1;
+    im.eng_pf_tids.clear();
+}
+
+// larry: the pinned rows of a prompt batch of `per` floats a slot (sized once for the widest batch); false = the
+// pageable eng_rows path (off, not SYCL, or the allocation failed)
+static bool eng_pin_ok(Ds41Dense::Impl & im, size_t per) {
+    static const bool on = env_on("STRATA_ENG_PIN", true);
+    const int ns = im.engram.n_slots();
+    if (!on || !im.sycl || ns < 1 || ns > 2) return false;
+    if (im.eng_pin_ev) ggml_backend_event_synchronize(im.eng_pin_ev);   // the previous batch's rows are up
+    const size_t per_max = std::max(per, (size_t) im.cfg.prompt_batch * (size_t) (im.EC * im.ED));
+    if (!im.eng_pin_buf || ggml_backend_buffer_get_size(im.eng_pin_buf) < (size_t) ns * per * sizeof(float)) {
+        if (im.eng_pin_buf) { ggml_backend_buffer_free(im.eng_pin_buf); im.eng_pin_buf = nullptr; }
+        ggml_backend_buffer_type_t ht = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend));
+        if (!ht) return false;
+        im.eng_pin_buf = ggml_backend_buft_alloc_buffer(ht, (size_t) ns * per_max * sizeof(float));
+        if (!im.eng_pin_buf) { std::fprintf(stderr, "dense: Engram pinned rows (%.0f MB) not allocated - pageable\n", ns * per_max * 4 / 1e6); return false; }
+        if (!im.eng_pin_ev) im.eng_pin_ev = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+        if (!im.eng_pin_ev) { ggml_backend_buffer_free(im.eng_pin_buf); im.eng_pin_buf = nullptr; return false; }
+    }
+    float * base = (float *) ggml_backend_buffer_get_base(im.eng_pin_buf);
+    const size_t stride = ggml_backend_buffer_get_size(im.eng_pin_buf) / sizeof(float) / (size_t) ns;
+    for (int e = 0; e < ns; ++e) im.eng_pin[e] = base + (size_t) e * stride;
+    return true;
+}
+
 // Wait for the pass's Engram reads (started by upload_inputs) and push the rows into the state tensor's columns.  A
 // no-op once done (eng_batch is null), so it is safe to call at every layer - but the caller gates it on L.eslot >= 0
 // so the layers BELOW the first Engram layer run while the disk is still reading.  The whole pass's rows (both Engram
@@ -1476,17 +1541,36 @@ static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t 
 // larry: the Engram batch's host-side wait alone (no device work: a pipelined span runs it before the submit lock)
 static bool engram_wait_host(Ds41Dense::Impl & im) {
     if (!im.eng_batch || im.eng_waited) return true;
+    const double t0 = g_eng_prof ? eng_now() : 0;
     if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
+    if (g_eng_prof) eng_t_wait += eng_now() - t0;
     im.eng_waited = true;
+    eng_pf_launch(im);   // outside the submit lock
     return true;
 }
 
 static bool engram_ready(Ds41Dense::Impl & im) {
     if (!im.eng_batch) return true;
+    const double t0 = g_eng_prof ? eng_now() : 0;
     if (!im.eng_waited && !im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
+    const double t1 = g_eng_prof ? eng_now() : 0;
     im.eng_waited = false;
     im.eng_batch.reset();
-    for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e) im.up_set(im.i_eng[e], im.eng_rows[e].data(), im.eng_rows[e].size() * 4);
+    eng_pf_launch(im);
+    if (im.eng_pin_n) {   // larry: pinned rows - async copies in queue order (before this layer's graph)
+        for (int e = 0; e < im.engram.n_slots() && e < 2; ++e)
+            ggml_backend_tensor_set_async(im.backend, im.i_eng[e], im.eng_pin[e], 0, im.eng_pin_n * sizeof(float));
+        ggml_backend_event_record(im.eng_pin_ev, im.backend);
+        im.eng_pin_n = 0;
+    } else {
+        for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e) im.up_set(im.i_eng[e], im.eng_rows[e].data(), im.eng_rows[e].size() * 4);
+    }
+    if (g_eng_prof && eng_t_n > 64) {
+        std::fprintf(stderr, "engram prompt batch: %d tokens, start %.1f ms, host wait %.1f ms, upload %.1f ms\n", eng_t_n,
+                     eng_t_start, eng_t_wait + (t1 - t0), eng_now() - t1);
+        eng_t_start = eng_t_wait = 0;
+        eng_t_n = 0;
+    }
     if (im.up_async) ggml_backend_event_record(im.up_ev, im.backend);   // the staging buffer's reuse waits for these too
     return true;
 }
@@ -1586,6 +1670,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     // embeddings upload, the init graph and the layers below it.  A tiny batch (decode) still runs on the caller.
     if (im.engram.enabled()) {
         if (!engram_ready(im)) return false;    // flush a still-pending batch from a previous pass first
+        im.eng_pf_pos0 = -1;   // larry: a prefetch request never launched is dropped (this pass reads its own rows)
+        im.eng_pf_tids.clear();
+        if (im.eng_pf) {   // larry: the prefetched rows are in the cache once it is done (start() reads the cache)
+            std::string e2;
+            im.engram.wait(im.eng_pf, e2);   // best effort: a failed read is read again below
+            im.eng_pf.reset();
+        }
         for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
         static const bool eng_async = env_on("STRATA_ENG_ASYNC", true);
         if (n <= 8 && im.up_async && eng_async) {   // larry: decode / verify - start the reads (worker threads) now and
@@ -1605,7 +1696,15 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
                 im.up_set(im.i_eng[e], im.eng_rows[e].data(), im.eng_rows[e].size() * 4);
         } else {
-            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            const double t0 = g_eng_prof ? eng_now() : 0;
+            const size_t per = (size_t) n * (size_t) (im.EC * im.ED);
+            if (eng_pin_ok(im, per)) {
+                im.eng_batch = im.engram.start_into(pos0, n, im.eng_pin, im.err);
+                im.eng_pin_n = im.eng_batch ? per : 0;
+            } else {
+                im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            }
+            if (g_eng_prof) { eng_t_start = eng_now() - t0; eng_t_wait = 0; eng_t_n = n; }
             im.eng_waited = false;
             if (!im.eng_batch) return false;
         }
@@ -1668,6 +1767,17 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
 }
 
 // ================================================================== the layer-major prompt batch
+
+void Ds41Dense::engram_prefetch(const int * tids, int n, int pos0) {
+    Impl & im = *p_;
+    static const bool on = env_on("STRATA_ENG_PREFETCH", true);
+    if (!on || !im.engram.enabled() || n <= 64 || im.eng_pf || pos0 < 0 || pos0 + n > im.cfg.ctx_max) return;
+    // launched once this batch's own reads are done (eng_pf_launch); the tokens are set then (that batch's own
+    // inputs rewrite them)
+    im.eng_pf_tids.assign(tids, tids + n);
+    im.eng_pf_pos0 = pos0;
+    if (!im.eng_batch) eng_pf_launch(im);
+}
 
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;

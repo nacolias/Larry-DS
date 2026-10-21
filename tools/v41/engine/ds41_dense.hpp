@@ -88,6 +88,9 @@ public:
     /// chunk path (the per-layer KV ring / compressed rows / indexer state advances in sub-batch order; layer l's
     /// residual and pre-mix are the columns the sub-batch used) is preserved, so the outputs match --prefill-chunk.
     bool begin_batch(const int * tids, int B, int pos0);
+    /// larry: the NEXT layer-major batch's Engram rows (tokens tids[0..n) at positions pos0..) read into the Engram row
+    /// cache while this batch computes (STRATA_ENG_PREFETCH, default 1); the next pass's inputs wait for it first.
+    void engram_prefetch(const int * tids, int n, int pos0);
     /// Dense half of layer il for the batch's sub-batch starting at column col0 (n tokens, col0 % max_pass == 0):
     /// attention, hc, router, shared expert + the Engram add.  ids / wts / fn land in the batch buffers (batch_ids /
     /// batch_wts / batch_fn) at column col0.  Uses (and advances) layer il's own KV state in sub-batch order.
@@ -197,6 +200,8 @@ public:
     /// larry: every 2-D Q6_K weight a decode reads through the reordered layout - for ggml_backend_sycl_prereorder at load
     /// (the shared expert's gate / up halves are left out when they are fused: only the fused weight may be reordered)
     std::vector<ggml_tensor *> reorder_weights() const;
+    /// larry: the 2-D Q6_K weights read only through per-group slice views (wo_a) - for ggml_backend_sycl_prereorder_slices
+    std::vector<ggml_tensor *> slice_reorder_weights() const;
 
 private:
     std::unique_ptr<Impl> p_;

@@ -33,6 +33,7 @@ public:
     /// dirs: where the shards are (the index json is looked up in each, the shard files too).
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
     bool enabled() const { return !tables_.empty(); }
+    int n_slots() const { return (int) tables_.size(); }        ///< Engram layers (2)
     int64_t n_cols() const { return cols_; }                    ///< hash columns per token per layer (24)
     int64_t row_dim() const { return dim_; }                    ///< 256
     /// Record token `tid` at position `pos` (history for the hashes; positions may be rewritten).
@@ -50,7 +51,14 @@ public:
     /// a copy.  Lets a caller overlap a pass's reads with unrelated work (the dense half knows all hashes at begin()).
     struct Batch;
     std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
+    /// larry: start() into caller storage: outp[e] holds n * cols * dim floats for slot e (e.g. pinned memory); it is
+    /// not cleared first (every slot of a good batch is written) and must stay untouched until wait() returns.
+    std::shared_ptr<Batch> start_into(int64_t pos0, int n, float * const * outp, std::string & err);
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
+    /// larry: warm the row cache with the rows of positions pos0..pos0+n-1 (every slot; their tokens set): the reads
+    /// queue on the I/O pool behind any batch already started, fill the cache (until full; past that they still warm
+    /// the page cache) and write no output.  Null when nothing is left to read.  wait() it before the next start().
+    std::shared_ptr<Batch> prefetch(int64_t pos0, int n, std::string & err);
     /// Drop this module's tables from the page cache (posix_fadvise DONTNEED on our own fds; not a global drop).
     void drop_cache();
     /// bytes read so far (stats)
@@ -94,6 +102,7 @@ private:
         void done() { std::lock_guard<std::mutex> lk(mu); if (--pending == 0) cv.notify_all(); }
     };
     void pump();
+    void prefetch_run(Batch * b, int64_t pos0, int n);   // larry: prefetch()'s planning + reads, on its own thread
     void task_run(const std::shared_ptr<Task> & t);
     void fire(const std::shared_ptr<Task> & t, int64_t parts);
     void run_sync(const std::shared_ptr<Task> & t, int64_t parts);

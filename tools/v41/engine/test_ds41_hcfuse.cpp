@@ -33,7 +33,7 @@ int main(int argc, char ** argv) {
         return v;
     };
     double worst = 0;
-    for (int64_t n : { (int64_t) 1, (int64_t) 3, (int64_t) 8 }) {
+    for (int64_t n : { (int64_t) 1, (int64_t) 3, (int64_t) 8, (int64_t) 512 }) {
         for (int w16 = 0; w16 < 2; ++w16) {
             ggml_init_params ip = { ggml_tensor_overhead() * 256 + ggml_graph_overhead(), nullptr, true };
             ggml_context * c = ggml_init(ip);
