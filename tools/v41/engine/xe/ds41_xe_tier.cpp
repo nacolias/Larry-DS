@@ -210,8 +210,8 @@ struct Ds41XeImpl {
     std::vector<std::unique_ptr<TlRing>> tl_rings;
     std::thread tl_mon;
     std::atomic<bool> tl_stop{false};
-    double tl_sum[16][16] = {};   // dense: [from id][to id] us
-    long tl_n[16][16] = {};
+    double tl_sum[17][17] = {};   // dense: [from id][to id] us
+    long tl_n[17][17] = {};
     std::vector<double> tl_cbusy, tl_clag, tl_csum_lag;   // per card: start->end, dense 1->start, end->dense 3
     std::vector<double> tl_chunk, tl_chunk_max;          // per card: promotion chunks' device time (stamps 12 -> 13)
     std::vector<long> tl_chunk_n, tl_chunk_late;         // ... how many, how many ended after the next readback
@@ -1067,7 +1067,7 @@ void Ds41XeTier::tl_flush() {
         if (b == 3 || b == 11) t3.push_back(d.t[k % C]);
         if (k == d.done) continue;
         const int a = d.id[(k - 1) % C];
-        if (a < 0 || a > 15 || b < 0 || b > 15) continue;
+        if (a < 0 || a > 16 || b < 0 || b > 16) continue;
         im.tl_sum[a][b] += d.t[k % C] - d.t[(k - 1) % C];
         ++im.tl_n[a][b];
     }
@@ -1118,8 +1118,8 @@ namespace {
 void tl_print(Ds41XeImpl& im) {
     const size_t NC = im.tl_cn.size();
     std::fprintf(stderr, "gpu timeline (%ld flushes, host-clock stamps) dense us:", im.tl_tokens);
-    for (int a = 0; a < 16; ++a)
-        for (int b = 0; b < 16; ++b)
+    for (int a = 0; a < 17; ++a)
+        for (int b = 0; b < 17; ++b)
             if (im.tl_n[a][b]) std::fprintf(stderr, " %d->%d %.1f (x%ld)", a, b, im.tl_sum[a][b] / im.tl_n[a][b], im.tl_n[a][b]);
     if (im.tl_h_n) std::fprintf(stderr, "; host after readback: tier entry %.1f us, sum submitted %.1f us (x%ld)",
                                 im.tl_h_entry / im.tl_h_n, im.tl_h_sum / im.tl_h_n, im.tl_h_n);
@@ -1773,6 +1773,10 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                 src.p[k] = on_dense ? slots + (size_t) u * stride : u == (int) NC ? im.hsum : im.hslots + (size_t) u * stride;
             }
             if (Ds41XeTier::tl_on() && nt == 1 && im.dense_q) tl_stamp(im, 0, qd, 15);   // the dense queue is free
+            if (Ds41XeTier::tl_on() && im.dense_q) {   // stamp 16: the sum's dependencies are met
+                qd.submit([&](sycl::handler& h) { h.depends_on(deps); h.single_task([] {}); });
+                tl_stamp(im, 0, qd, 16);
+            }
             sycl::event ev = qd.submit([&](sycl::handler& h) {
                 h.depends_on(deps);
                 h.parallel_for(sycl::range<1>(n_out), [=](sycl::id<1> i) {
@@ -2104,6 +2108,19 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
     }
     for (int64_t e = 0; e < E; ++e) {
         if (by_e[(size_t) e].empty() || im.card_of[(size_t) im.key(l, e)] >= 0) continue;
+        if (prof) {   // STRATA_XE_PROF: the arena experts by token count (would the CPU beat streaming them?)
+            static int64_t hist[8] = {}, hbytes[8] = {}, hcalls = 0;
+            const size_t nt_e = by_e[(size_t) e].size();
+            const int b = nt_e <= 1 ? 0 : nt_e <= 2 ? 1 : nt_e <= 4 ? 2 : nt_e <= 8 ? 3 : nt_e <= 16 ? 4 : nt_e <= 32 ? 5 : nt_e <= 64 ? 6 : 7;
+            ++hist[b];
+            hbytes[b] += (int64_t) im.bbytes(l, e);
+            if (++hcalls % 2000 == 0)
+                std::fprintf(stderr, "xe prof: arena experts by tokens (1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+): %lld %lld %lld %lld %lld %lld %lld %lld"
+                             " (GB %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f)\n", (long long) hist[0], (long long) hist[1], (long long) hist[2],
+                             (long long) hist[3], (long long) hist[4], (long long) hist[5], (long long) hist[6], (long long) hist[7],
+                             hbytes[0] / 1e9, hbytes[1] / 1e9, hbytes[2] / 1e9, hbytes[3] / 1e9, hbytes[4] / 1e9, hbytes[5] / 1e9,
+                             hbytes[6] / 1e9, hbytes[7] / 1e9);
+        }
         if (ps && ps->card[(size_t) e] >= 0) { cl[(size_t) ps->card[(size_t) e]].push_back((int32_t) e); ++n_pf; continue; }
         if (keep_on && kept_card[(size_t) e] >= 0) {
             const int kc = kept_card[(size_t) e];
@@ -2794,12 +2811,12 @@ void Ds41XeTier::arm(int64_t l, int nt) {
                 sn.store(want);
             });
         });
-        if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 10);   // released: the card starts
+        if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 10);   // released: the card starts
         c.q.memcpy(c.stage_dev, c.stage_host, (size_t) ng * sizeof(XeJob));
         card_experts(im, c, ng, nt, mv, xoff, c.OUT, im.arm_x);
-        if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
+        if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
         c.arm_ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, (size_t) nt * H * 4);
-        if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 14);   // its copy is done
+        if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 14);   // its copy is done
         c.armed = true;
         c.arm_ng = ng;
     }
