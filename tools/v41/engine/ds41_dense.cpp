@@ -535,6 +535,26 @@ struct B {
         *post = ggml_scale(c, ggml_sigmoid(c, *post), 2.0f);
         *comb = ggml_dsv4_hc_comb(c, mixes, sc, bs, (float) g->hc_eps, (int32_t) g->hc_iters);
     }
+    // larry, STRATA_HC_FUSE (default 1): decode / verify widths (n <= 8) run each sub-layer's hc step as two fused ops
+    // (ggml_dsv41_hc_fa + _hc_fb: the composite's hc_post, norm_mv, hc_mixes, hc_comb, hc_pre and rms_norm * w) and
+    // the finish as one (ggml_dsv41_hc_post2: add, hc_post and the state write) - 14 tiny kernels a layer -> 5
+    bool hc_fused(int64_t nt) const {
+        static const bool on = env_on("STRATA_HC_FUSE", true);
+        return on && im->sycl && nt <= 8;
+    }
+    // the views of a ggml_dsv41_hc_fb result: xn [D, n] | pre [HC, n] | post [HC, n] | comb [HC, HC, n]
+    void hc_fb_views(ggml_tensor * fb, int64_t nt, ggml_tensor ** xn, ggml_tensor ** pre, ggml_tensor ** post,
+                     ggml_tensor ** comb) const {
+        const int64_t D = g->n_embd, HC = g->hc;
+        size_t o = 0;
+        *xn = ggml_view_2d(c, fb, D, nt, (size_t) D * 4, o);
+        o += (size_t) (D * nt) * 4;
+        *pre = ggml_view_2d(c, fb, HC, nt, (size_t) HC * 4, o);
+        o += (size_t) (HC * nt) * 4;
+        *post = ggml_view_2d(c, fb, HC, nt, (size_t) HC * 4, o);
+        o += (size_t) (HC * nt) * 4;
+        *comb = ggml_view_3d(c, fb, HC, HC, nt, (size_t) HC * 4, (size_t) (HC * HC) * 4, o);
+    }
     // RoPE over the last `nd` dims of each `ne0` row (model.py apply_rotary_emb: adjacent pairs = NORMAL mode).
     // ratio > 0: compress_rope_theta with YaRN; ratio 0: rope_theta, no YaRN (model.py Attention.__init__)
     ggml_tensor * rope(ggml_tensor * a, ggml_tensor * pos, int64_t ratio, bool back = false) const {
@@ -677,11 +697,20 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
 
     // ---- attention hc: mixes of the block input; its pre-mix is the previous FFN's (pre_state)
-    ggml_tensor * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr;
-    b.hc_mixes(x, im.BL(il, "hc_attn_fn.weight"), im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
-               &a_pre, &a_post, &a_comb);
-    ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));             // [D, n]
-    ggml_tensor * xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
+    ggml_tensor * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr, * xn = nullptr;
+    const bool hcf = b.hc_fused(n);
+    if (hcf) {
+        ggml_tensor * fa = ggml_dsv41_hc_fa(gc, x, im.BL(il, "hc_attn_fn.weight"), b.cols2(im.pre_state, HC, n, col0),
+                                            nullptr, nullptr, nullptr);
+        ggml_tensor * fb = ggml_dsv41_hc_fb(gc, fa, im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
+                                            im.BL(il, "attn_norm.weight"), (float) G.rms_eps, (float) G.hc_eps, (int) G.hc_iters);
+        b.hc_fb_views(fb, n, &xn, &a_pre, &a_post, &a_comb);
+    } else {
+        b.hc_mixes(x, im.BL(il, "hc_attn_fn.weight"), im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
+                   &a_pre, &a_post, &a_comb);
+        ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));         // [D, n]
+        xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
+    }
 
     // ---- q (no per-head norm in V4.1)
     ggml_tensor * qr = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_q_a.weight"), xn), im.BL(il, "attn_q_a_norm.weight"));
@@ -860,11 +889,20 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
 
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
-    ggml_tensor * h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_comb);                       // [D, HC, n]
+    ggml_tensor * h = nullptr, * fn = nullptr;                                              // [D, HC, n], [D, n]
     ggml_tensor * f_pre = nullptr, * f_post = nullptr, * f_comb = nullptr;
-    b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
-               &f_pre, &f_post, &f_comb);
-    ggml_tensor * fn = b.rms_w(ggml_dsv4_hc_pre(gc, h, a_pre), im.BL(il, "ffn_norm.weight"));   // [D, n]
+    if (hcf) {
+        ggml_tensor * fa = ggml_dsv41_hc_fa(gc, x, im.BL(il, "hc_ffn_fn.weight"), a_pre, attn, a_post, a_comb);
+        h = ggml_view_3d(gc, fa, D, HC, n, (size_t) D * 4, (size_t) (HC * D) * 4, 0);
+        ggml_tensor * fb = ggml_dsv41_hc_fb(gc, fa, im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
+                                            im.BL(il, "ffn_norm.weight"), (float) G.rms_eps, (float) G.hc_eps, (int) G.hc_iters);
+        b.hc_fb_views(fb, n, &fn, &f_pre, &f_post, &f_comb);
+    } else {
+        h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_comb);
+        b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
+                   &f_pre, &f_post, &f_comb);
+        fn = b.rms_w(ggml_dsv4_hc_pre(gc, h, a_pre), im.BL(il, "ffn_norm.weight"));
+    }
 
     // ---- router (model.py Gate): sqrt(softplus), top-k on score + bias, weights from the raw scores
     ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), fn);
@@ -1061,6 +1099,12 @@ static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
+    if (b.hc_fused(n)) {   // larry: the add, the hc_post and the state write in one kernel
+        ggml_build_forward_expand(gf, ggml_dsv41_hc_post2(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0),
+                                                          b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
+                                                          b.cols3(im.comb_f, HC, HC, n, col0), b.cols3(im.x_state, D, HC, n, col0)));
+        return gf;
+    }
     ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0));
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
                                         b.cols3(im.comb_f, HC, HC, n, col0));

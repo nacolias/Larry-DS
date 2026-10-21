@@ -56,6 +56,9 @@ if(TARGET ds41_dense)
     if(STRATA_DSV41_HC_MIX)
         add_executable(test_ds41_hcmix ${_v41_dir}/test_ds41_hcmix.cpp)
         target_link_libraries(test_ds41_hcmix PRIVATE ds41_dense)
+        # larry: the fused hyper-connection ops (ggml_dsv41_hc_post2 / _hc_fa / _hc_fb) vs the composite
+        add_executable(test_ds41_hcfuse ${_v41_dir}/test_ds41_hcfuse.cpp)
+        target_link_libraries(test_ds41_hcfuse PRIVATE ds41_dense)
     endif()
 endif()
 # the Engram row-read bench (CPU + disk only): it compiles the module straight in, so it builds without ggml or CUDA
