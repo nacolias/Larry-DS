@@ -169,17 +169,7 @@ struct XeCard {
     xe::XeQ8 cxq; size_t cxq_rows = 0;   ///< prompt chunks: X [n][n_embd]
     xe::XeQ8 chq; int chq_jobs = 0;      ///< prompt chunks: H [jobs][8][n_ff]
 
-    int pre_slab = -1;           ///< DEBUG (STRATA_XE_SEED_PREALLOC): the preallocated slab being filled, -1 none
     uint8_t* alloc_expert(size_t bytes) {
-        if (pre_slab >= 0) {   // preallocated slabs: the next one when this is full
-            if (slab_used + bytes > kSlab) { ++pre_slab; slab_used = 0; }
-            if (pre_slab >= (int) slabs.size()) return nullptr;
-            uint8_t* p = slabs[(size_t) pre_slab] + slab_used;
-            slab_used += (bytes + 255) & ~(size_t) 255;
-            used += (int64_t) bytes;
-            ++n_experts;
-            return p;
-        }
         if (slabs.empty() || slab_used + bytes > kSlab) {
             uint8_t* p = local_alloc(q, kSlab);
             if (!p) return nullptr;
@@ -194,7 +184,6 @@ struct XeCard {
     }
     void free_experts() {
         q.wait();
-        pre_slab = -1;
         for (uint8_t* p : slabs) local_free(q, p);
         slabs.clear();
         slab_used = 0;
@@ -249,7 +238,8 @@ struct Ds41XeImpl {
     bool placed = false;
     bool cache_enabled = true;
     double slot_gib = 0.0;
-    std::vector<std::pair<int32_t, int32_t>> dense_set;   ///< experts currently on the dense card
+    std::vector<std::pair<int32_t, int32_t>> dense_set;   ///< experts currently on the dense card (seeded in ranked order)
+    std::vector<std::pair<int32_t, int32_t>> seed_ranked; ///< the ranked list of the last seed (regrow_cache continues it)
     int64_t resident_n = 0;
     // CPU pool for the arena experts of a decode / verify call
     std::unique_ptr<cpu::ExpertPool> pool;
@@ -811,71 +801,25 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     return true;
 }
 
-bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
-    Ds41XeImpl& im = *im_;
-    if (!im.placed && !build_arena_ranked(ranked, err)) return false;
-    if (im.dense < 0 || !im.cache_enabled || !im.dense_set.empty()) return true;
-    XeCard& c = *im.cards[(size_t) im.dense];
-    // the dense card's share stays small: ggml-sycl's pools are virtual (VMM) and commit while decode runs, so "free
-    // VRAM" right after a prompt overstates what is left, and the xe driver does not refuse an over-commit - it
-    // spills buffers into host RAM (2026-10-19: card 0 at 98 % with 15 GiB of experts, 12 GiB spilled)
-    const double cap = env_d("STRATA_XE_DENSE_GIB", 10.0);
-    double gib = im.slot_gib;
-    if (cap >= 0) gib = std::min(gib, cap);
-    // whatever the engine measured, leave the dense half's graphs a reserve of what is free NOW
-    const int64_t fr = c.free_vram();
-    if (fr > 0) gib = std::min(gib, fr / kGiB - env_d("STRATA_XE_DENSE_RESERVE_GIB", 8.0));
-    if (gib < 0.5) return true;
-    c.budget = (int64_t) (gib * kGiB);
+namespace {
+/// The dense card's next experts in ranked order that live in the arena only, while c.budget allows (resident ones are
+/// skipped: a regrow continues where the cache ends).  Pageable arena experts go through a pinned bounce: a DMA straight
+/// from pageable memory makes the driver pin the source pages, and 15 GiB queued at once pushed larry's driver-held RAM
+/// past the watchdog (58 GiB, 2026-10-19; TTM's cap for all of it is ~60.7 GiB).  Returns the experts added, -1 on error.
+int64_t seed_dense(Ds41XeImpl& im, XeCard& c, const std::vector<std::pair<int32_t, int32_t>>& ranked, const char* what, std::string& err) {
     const double t0 = now_ms();
-    // the next experts in ranked order that live in the arena only.  Pageable arena experts go through a pinned
-    // bounce: a DMA straight from pageable memory makes the driver pin the source pages, and 15 GiB queued at once
-    // pushed larry's driver-held RAM past the watchdog (58 GiB, 2026-10-19; TTM's cap for all of it is ~60.7 GiB).
     const size_t half = std::max<size_t>((size_t) im.blob_max, (size_t) 64 << 20);
     if (c.bounce_cap < 2 * half) {
         if (c.bounce) sycl::free(c.bounce, c.q);
         c.bounce = sycl::malloc_host<uint8_t>(2 * half, c.q);
         c.bounce_cap = c.bounce ? 2 * half : 0;
-        if (!c.bounce) { err = "xe tier: bounce allocation failed"; return false; }
+        if (!c.bounce) { err = "xe tier: bounce allocation failed"; return -1; }
     }
     sycl::event hev[2];
     int hcur = 0;
     size_t hused = 0;
-    double t_alloc = 0, t_copy = 0, t_wait = 0;   // the seed's split (printed below)
+    double t_alloc = 0;
     int64_t n_pin = 0, n_page = 0;
-    auto hidden_mib = [] {
-        std::ifstream f("/proc/meminfo");
-        std::string k, u; long v, t = 0, a = 0, p = 0;
-        while (f >> k >> v >> u) { if (k == "MemTotal:") t = v; if (k == "MemAvailable:") a = v; if (k == "AnonPages:") p = v; }
-        return (t - a - p) / 1024;
-    };
-    const long h0 = hidden_mib();
-    long h1 = h0;
-    if (env_i("STRATA_XE_SEED_PREALLOC", 0)) {   // DEBUG: every slab first
-        const double ta = now_ms();
-        const int ns = (int) ((c.budget + (int64_t) kSlab - 1) / (int64_t) kSlab);
-        auto vram_used_mib = [] {   // card 0 (the dense card here): the xe VRAM manager's usage
-            std::ifstream f("/sys/kernel/debug/dri/0000:15:00.0/tile0/vram_mm");
-            std::string k; long long v = -1;
-            while (f >> k) if (k == "usage:") { f >> v; break; }
-            return v >= 0 ? v / 1048576 : -1;
-        };
-        for (int i = 0; i < ns; ++i) {
-            const double t1 = now_ms();
-            uint8_t* sp = local_alloc(c.q, kSlab);
-            const double t2 = now_ms();
-            if (!sp) break;
-            c.slabs.push_back(sp);
-            const auto pt = sycl::get_pointer_type(sp, im.ctx);
-            std::fprintf(stderr, "xe seed slab %d: %.0f ms, type %s, card-0 VRAM used %lld MiB, hidden %ld MiB\n", i, t2 - t1,
-                         pt == sycl::usm::alloc::device ? "device" : pt == sycl::usm::alloc::host ? "host" : pt == sycl::usm::alloc::shared ? "shared" : "unknown",
-                         (long long) vram_used_mib(), hidden_mib());
-        }
-        c.slab_used = 0;
-        c.pre_slab = 0;
-        t_alloc += now_ms() - ta;
-        h1 = hidden_mib();
-    }
     for (const auto& le : ranked) {
         if (le.first < 0 || le.first >= im.g.n_layers || le.second < 0 || le.second >= im.g.n_experts) continue;
         const size_t key = (size_t) im.key(le.first, le.second);
@@ -886,37 +830,95 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         uint8_t* p = c.alloc_expert(b);
         t_alloc += now_ms() - ta;
         if (!p) break;
-        static const bool bounce_all = env_i("STRATA_XE_SEED_BOUNCE_ALL", 0) != 0;   // DEBUG
-        if (!bounce_all && sycl::get_pointer_type(im.aptr[key], im.ctx) == sycl::usm::alloc::host) {
+        if (im.apin[key]) {
             upload_planar(im, c, le.first, le.second, im.aptr[key], p);
             ++n_pin;
         } else {
-            ++n_page;
-            const double tw = now_ms();
             if (hused + b > half) { hcur ^= 1; hused = 0; hev[hcur].wait(); }
-            t_wait += now_ms() - tw;
-            const double tc = now_ms();
             std::memcpy(c.bounce + (size_t) hcur * half + hused, im.aptr[key], b);
-            t_copy += now_ms() - tc;
             hev[hcur] = upload_planar(im, c, le.first, le.second, c.bounce + (size_t) hcur * half + hused, p);
             hused += (b + 255) & ~(size_t) 255;
+            ++n_page;
         }
         im.card_of[key] = (int8_t) c.idx;
         im.dptr[key] = p;
         im.dense_set.push_back(le);
     }
-    const double tq = now_ms();
     c.q.wait();
-    const double t_final = now_ms() - tq;
-    c.pre_slab = -1;
-    std::fprintf(stderr, "xe tier: seed hidden memory %ld -> %ld (slabs) -> %ld MiB (uploads)\n", h0, h1, hidden_mib());
     im.resident_n = 0;
     for (auto& cp : im.cards) im.resident_n += cp->n_experts;
-    std::fprintf(stderr, "xe tier: dense card %d seeded with %zu experts (%.2f GiB) in %.2f s (slabs %.0f ms, %lld pinned / %lld "
-                 "pageable experts: bounce copies %.0f ms, bounce waits %.0f ms, final queue wait %.0f ms)\n", c.idx,
-                 im.dense_set.size(), c.used / kGiB, (now_ms() - t0) / 1000.0, t_alloc, (long long) n_pin, (long long) n_page,
-                 t_copy, t_wait, t_final);
-    return true;
+    std::fprintf(stderr, "xe tier: dense card %d %s: %lld experts (%lld pinned / %lld pageable) in %.2f s (slabs %.0f ms); %zu experts "
+                 "(%.2f GiB) on it\n", c.idx, what, (long long) (n_pin + n_page), (long long) n_pin, (long long) n_page,
+                 (now_ms() - t0) / 1000.0, t_alloc, im.dense_set.size(), c.used / kGiB);
+    return n_pin + n_page;
+}
+
+/// The dense card's expert budget now: STRATA_XE_DENSE_GIB (and the engine's slot budget), with
+/// STRATA_XE_DENSE_RESERVE_GIB of what is free NOW left to the dense half's graphs.  The dense card's share stays small:
+/// ggml-sycl's pools are virtual (VMM) and commit while decode runs, so "free VRAM" right after a prompt overstates what
+/// is left (2026-10-19: card 0 at 98 % with 15 GiB of experts, 12 GiB spilled into host RAM).
+int64_t dense_budget(Ds41XeImpl& im, XeCard& c) {
+    const double cap = env_d("STRATA_XE_DENSE_GIB", 10.0);
+    double gib = im.slot_gib;
+    if (cap >= 0) gib = std::min(gib, cap);
+    const int64_t fr = c.free_vram();
+    if (fr > 0) gib = std::min(gib, (fr + c.used) / kGiB - env_d("STRATA_XE_DENSE_RESERVE_GIB", 8.0));
+    return gib < 0.5 ? 0 : (int64_t) (gib * kGiB);
+}
+}  // namespace
+
+bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    Ds41XeImpl& im = *im_;
+    if (!im.placed && !build_arena_ranked(ranked, err)) return false;
+    if (im.dense < 0 || !im.cache_enabled || !im.dense_set.empty()) return true;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    im.seed_ranked = ranked;
+    c.budget = dense_budget(im, c);
+    if (c.budget <= 0) return true;
+    return seed_dense(im, c, ranked, "seeded", err) >= 0;
+}
+
+/// larry (serve keep-cache): a prompt batch of a few thousand tokens needs `need_bytes` free on the dense card - the
+/// cache's tail (its lowest-ranked experts, the last slabs) goes back to the arena slab by slab until that is free.
+/// Returns the experts released, -1 when even an empty cache would not make the room (the caller releases it all).
+int64_t Ds41XeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
+    Ds41XeImpl& im = *im_;
+    if (im.dense < 0 || im.dense_set.empty()) return -1;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    c.q.wait();
+    if (c.free_vram() + c.used < need_bytes) { err = "the dense card has no room for the batch even without its experts"; return -1; }
+    int64_t released = 0;
+    while (c.free_vram() < need_bytes && !c.slabs.empty()) {
+        uint8_t* last = c.slabs.back();
+        while (!im.dense_set.empty()) {   // the slab's experts: a suffix of dense_set (slabs fill in seeding order)
+            const auto& le = im.dense_set.back();
+            const size_t key = (size_t) im.key(le.first, le.second);
+            const uint8_t* p = im.dptr[key];
+            if (p < last || p >= last + kSlab) break;
+            im.card_of[key] = -1;
+            im.dptr[key] = nullptr;
+            c.used -= (int64_t) im.bbytes(le.first, le.second);
+            --c.n_experts;
+            im.dense_set.pop_back();
+            ++released;
+        }
+        local_free(c.q, last);
+        c.slabs.pop_back();
+        c.slab_used = kSlab;   // the slabs left are full: the next expert opens a new one
+    }
+    im.resident_n = 0;
+    for (auto& cp : im.cards) im.resident_n += cp->n_experts;
+    return released;
+}
+
+/// larry (serve keep-cache): after the batch, the tail back - the seed continued within what is free now.
+int64_t Ds41XeTier::regrow_cache(std::string& err) {
+    Ds41XeImpl& im = *im_;
+    if (im.dense < 0 || !im.cache_enabled || im.seed_ranked.empty()) return 0;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    c.budget = dense_budget(im, c);
+    if (c.used >= c.budget) return 0;
+    return seed_dense(im, c, im.seed_ranked, "regrown", err);
 }
 
 void Ds41XeTier::set_slot_gib(double gib) { im_->slot_gib = gib; }
@@ -1130,8 +1132,6 @@ void Ds41XeTier::release_cache() {
     for (auto& cp : im.cards) im.resident_n += cp->n_experts;
 }
 
-int64_t Ds41XeTier::shrink_cache_for(int64_t, std::string&) { return -1; }
-int64_t Ds41XeTier::regrow_cache(std::string&) { return 0; }
 
 // ================================ decode / verify ================================
 

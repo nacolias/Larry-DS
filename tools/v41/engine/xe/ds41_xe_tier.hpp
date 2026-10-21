@@ -21,6 +21,8 @@
 // CPU pool's 8-bit activation rounding for the experts it computes (the cards compute in F32 activations).
 #pragma once
 
+#include <cstdlib>
+
 #include "ds41_moe.hpp"
 
 #include <memory>
@@ -72,7 +74,9 @@ public:
     void release_cache();
     int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
     int64_t regrow_cache(std::string& err);
-    static bool keep_cache_mode() { return false; }
+    /// larry, STRATA_SERVE_KEEP_CACHE (default 1): a prompt batch of <= STRATA_SERVE_KEEP_MAX tokens gives back only the
+    /// dense card's tail slabs it needs (shrink_cache_for); the decode after it refills just those (regrow_cache)
+    static bool keep_cache_mode() { const char* e = std::getenv("STRATA_SERVE_KEEP_CACHE"); return !e || std::atoi(e) != 0; }
     bool release_prestage() { return false; }
     void release_chunk() {}
     /// larry, STRATA_XE_PREFETCH (default 1): a layer-major prompt batch whose layers first..last each run one
