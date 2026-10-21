@@ -11,6 +11,7 @@
 #include <oneapi/mkl/blas.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -21,9 +22,14 @@
 #include <limits>
 #include <map>
 #include <condition_variable>
+#include <deque>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <thread>
+
+#include <pthread.h>
+#include <sched.h>
 
 namespace strata::v41 {
 
@@ -60,6 +66,7 @@ constexpr double kGiB = 1073741824.0;
 constexpr size_t kSlab = (size_t) 1 << 30;       ///< device expert storage is bump-allocated in 1 GiB slabs
 constexpr int kMaxDecodeJobs = 64;               ///< a verify pass of 8 tokens routes at most 48 distinct experts
 constexpr size_t kStageAlign = 256;
+constexpr int kPcBounce = 3;                     ///< STRATA_XE_PROMOTE: pinned bounces (promotions in flight)
 
 }  // namespace
 
@@ -94,6 +101,12 @@ struct XeCard {
     sycl::event arm_ev;             ///< its last command (the part's copy to the dense card)
     XeJob arm_null{};               ///< a null job (nt 0) on a blob this card holds
     bool arm_null_ok = false;
+    // larry, STRATA_XE_PROMOTE: this card's share of the decode-time cache of promoted experts (Ds41XeImpl::pc_*)
+    uint8_t* pc_mem = nullptr;      ///< pc_n slots of Ds41XeImpl::pc_slot bytes (planar experts)
+    int pc_n = 0;
+    std::vector<int64_t> pc_key;    ///< slot -> expert key; -1 free, -2 being filled
+    std::vector<uint64_t> pc_tick;  ///< slot -> the decode call that last used it
+    bool pc_busy = false;           ///< a promotion of this card is in flight
     /// decode / verify: the card's command sequence of a call (stage copy, quantise, gate/up, down, copy to the dense
     /// card's slot) recorded once per shape (jobs, tokens, kernel variant) and replayed - one submission, not five
     std::map<uint32_t, std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> dgraphs;
@@ -118,6 +131,10 @@ struct XeCard {
     sycl::queue oq;                 ///< prompt calls: the overflow experts' DMAs (STRATA_XE_OVERLAP)
     uint8_t* pbuf[2] = {nullptr, nullptr};
     size_t pbuf_cap = 0;
+    /// larry: device memory kept for the card's lifetime (allocated at load): a prompt's prefetch buffers (pbuf), the
+    /// decode promotion cache's slots (pc_mem) - allocating either on the way costs 100s of ms
+    uint8_t* flex = nullptr;
+    size_t flex_cap = 0;
     sycl::event pev[2];             ///< the last prefetch copy into pbuf[s]
     // the planar int8 path (xe_planar.cpp): every expert a card holds is stored repacked
     uint8_t* rstage = nullptr;      ///< [blob_max]: a file-layout blob on its way to its planar slot
@@ -170,6 +187,8 @@ struct Ds41XeImpl {
     double tl_sum[16][16] = {};   // dense: [from id][to id] us
     long tl_n[16][16] = {};
     std::vector<double> tl_cbusy, tl_clag, tl_csum_lag;   // per card: start->end, dense 1->start, end->dense 3
+    std::vector<double> tl_chunk, tl_chunk_max;          // per card: promotion chunks' device time (stamps 12 -> 13)
+    std::vector<long> tl_chunk_n, tl_chunk_late;         // ... how many, how many ended after the next readback
     std::vector<long> tl_cn;
     long tl_tokens = 0;
     Ds41MoeGeom g;
@@ -225,6 +244,43 @@ struct Ds41XeImpl {
     float* hslots = nullptr;               ///< [cards][8][n_embd] pinned: the expert cards' decode parts (STRATA_XE_HSLOTS)
     bool host_slots = false;
     std::vector<uint8_t> ftmp;             ///< file-tier reads (decode)
+    // larry, STRATA_XE_PROMOTE (default 1): a decode / verify expert the CPU pool ran (it is on no card) is copied into
+    // a slot cache on an expert card and runs there from then on: a helper thread repacks its arena copy planar into a
+    // pinned bounce (the card's own repack of a Q3_K expert took 739 us and held up its next call) -> the card's queue
+    // copies it into the slot, STRATA_XE_PROMOTE_CHUNK_MB (1) a call, after that call's experts (the card idles there;
+    // a second queue of a spinning card does not run, and the dense card's copy engine writing 11 MB into a card took
+    // ~1 s and held up the dense card's own copies) -> resident.  LRU over the slots; dropped when a prompt's prefetch
+    // begins (its buffers want the VRAM).  Every submission is the main thread's (submitting from several threads
+    // faulted a copy engine once).
+    struct PcJob {
+        int64_t key = -1;
+        int card = -1, slot = -1, bounce = -1;
+        int stage = 0;                 ///< 0 bounce being filled (helper), 1 copying (chunks), 3 last chunk queued
+        const uint8_t* src = nullptr;
+        size_t sent = 0;               ///< bytes of the copy queued so far
+        std::atomic<int> filled{0};
+        sycl::event ev;
+    };
+    int pc_mode = -1;                  ///< -1 not read yet, 0 off, 1 on
+    bool pc_ready = false;             ///< the slots exist (allocated a few calls into a decode)
+    int64_t pc_calls = 0;              ///< decode calls since the last drop
+    bool pc_tried = false;             ///< pc_setup ran since the last drop
+    size_t pc_slot = 0;                ///< bytes a slot
+    std::vector<int32_t> pc_where;     ///< key -> card << 16 | slot (published); -1; -2 in flight
+    std::vector<uint8_t> pc_uses;      ///< key -> its CPU-pool uses (saturating; STRATA_XE_PROMOTE_MIN)
+    uint8_t* pc_bounce = nullptr;      ///< pinned: kPcBounce x pc_slot
+    std::vector<int> pc_bfree;
+    std::list<PcJob> pc_jobs;          ///< in flight (stable addresses: the helper holds pointers)
+    std::thread pc_thr;
+    std::mutex pc_mu;
+    std::condition_variable pc_cv;
+    std::deque<PcJob*> pc_fill;        ///< bounces for the helper to fill (under pc_mu)
+    bool pc_stop = false;
+    uint64_t pc_clock = 0;
+    int pc_rr = 0;
+    int64_t pc_done = 0, pc_evicted = 0, pc_hit = 0, pc_busy_skip = 0, pc_bad = 0;
+    double pc_push_us = 0, pc_poll_us = 0;
+    int64_t pc_chunks = 0;
     Ds41MoeStats st;
     std::mutex mu;
     bool planar = true;                ///< STRATA_XE_PLANAR (default 1): experts repacked on the cards, int8 kernels
@@ -696,6 +752,22 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
                 if (cp->arm_flag && cp->arm_src) im.relq->memcpy(cp->arm_flag, cp->arm_src, sizeof(int)).wait();
         }
     }
+    {   // larry: each expert card's flex region (prompt: prefetch buffers; decode: promotion slots), from the reserve
+        const double fg = env_d("STRATA_XE_FLEX_GIB", 1.25), fm = env_d("STRATA_XE_FLEX_MARGIN_GIB", 1.5);
+        for (auto& cp : im.cards) {
+            XeCard& c = *cp;
+            if (c.dense || c.flex) continue;
+            const int64_t fr = c.free_vram();
+            const int64_t want = std::min<int64_t>((int64_t) (fg * kGiB), fr > 0 ? fr - (int64_t) (fm * kGiB) : 0) & ~(int64_t) 255;
+            if (want < 8 * im.blob_max) continue;
+            c.flex = sycl::malloc_device<uint8_t>((size_t) want, c.q);
+            c.flex_cap = c.flex ? (size_t) want : 0;
+        }
+        if (env_i("STRATA_XE_PROMOTE", 1) && !im.pc_bounce) {   // the promotions' pinned bounces, now too
+            im.pc_slot = ((size_t) im.blob_max + 255) & ~(size_t) 255;
+            im.pc_bounce = sycl::malloc_host<uint8_t>((size_t) kPcBounce * im.pc_slot, im.ctx);
+        }
+    }
     im.placed = true;
     std::fprintf(stderr, "xe tier: placed in %.1f s (cards %.1f s, arena %.1f s)\n%s", (now_ms() - t0) / 1000.0,
                  (t1 - t0) / 1000.0, (now_ms() - t1) / 1000.0, report().c_str());
@@ -910,10 +982,20 @@ void Ds41XeTier::tl_flush() {
     d.done = dn;
     const size_t NC = im.tl_rings.size() - 1;
     im.tl_cbusy.resize(NC, 0.0); im.tl_clag.resize(NC, 0.0); im.tl_csum_lag.resize(NC, 0.0); im.tl_cn.resize(NC, 0);
+    im.tl_chunk.resize(NC, 0.0); im.tl_chunk_max.resize(NC, 0.0); im.tl_chunk_n.resize(NC, 0); im.tl_chunk_late.resize(NC, 0);
     for (size_t c = 0; c < NC; ++c) {
         Ds41XeImpl::TlRing& r = *im.tl_rings[1 + c];
         const uint32_t rn = r.seen.load(std::memory_order_acquire);
         for (uint32_t k = r.done; k + 1 < rn; ++k) {
+            if (r.id[k % C] == 12 && r.id[(k + 1) % C] == 13) {   // a promotion chunk
+                const double ts = r.t[k % C], te = r.t[(k + 1) % C];
+                im.tl_chunk[c] += te - ts;
+                im.tl_chunk_max[c] = std::max(im.tl_chunk_max[c], te - ts);
+                ++im.tl_chunk_n[c];
+                auto nb = std::upper_bound(t1.begin(), t1.end(), ts);   // the next readback after its start
+                if (nb != t1.end() && te > *nb) ++im.tl_chunk_late[c];
+                continue;
+            }
             if (r.id[k % C] != 10 || r.id[(k + 1) % C] != 11) continue;
             const double ts = r.t[k % C], te = r.t[(k + 1) % C];
             // the dense stamps around it: the last readback-done before its start, the first sum-done after its end
@@ -938,6 +1020,10 @@ void tl_print(Ds41XeImpl& im) {
     for (size_t c = 0; c < NC; ++c)
         if (im.tl_cn[c]) std::fprintf(stderr, " %zu: %.1f %.1f %.1f (x%ld)", c, im.tl_clag[c] / im.tl_cn[c], im.tl_cbusy[c] / im.tl_cn[c],
                                       im.tl_csum_lag[c] / im.tl_cn[c], im.tl_cn[c]);
+    for (size_t c = 0; c < NC; ++c)
+        if (c < im.tl_chunk_n.size() && im.tl_chunk_n[c])
+            std::fprintf(stderr, "; card %zu promotion chunks %.1f us (max %.0f, x%ld, %ld past the next readback)", c,
+                         im.tl_chunk[c] / im.tl_chunk_n[c], im.tl_chunk_max[c], im.tl_chunk_n[c], im.tl_chunk_late[c]);
     std::fprintf(stderr, "\n");
 }
 }  // namespace
@@ -1096,6 +1182,259 @@ void disarm(Ds41XeImpl& im) {
     ++im.arm_disarmed;
 }
 
+bool ev_done(const sycl::event& e) {
+    return e.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete;
+}
+
+/// Host twin of xe_planar.cpp's repack_mat (the same bytes): an [nrows x n] matrix of NB blocks, file layout -> planes.
+void cpu_repack_mat(int type, const uint8_t* src, uint8_t* dst, size_t NB) {
+    if (type == xe::kQ3K) {
+        for (size_t i = 0; i < NB; ++i) {
+            const uint8_t* sb = src + i * 110;
+            std::memcpy(dst + i * 64, sb + 32, 64);
+            std::memcpy(dst + 64 * NB + i * 32, sb, 32);
+            std::memcpy(dst + 96 * NB + i * 12, sb + 96, 12);
+            std::memcpy(dst + 108 * NB + i * 2, sb + 108, 2);
+        }
+    } else if (type == xe::kQ20) {
+        // 16-value unit: file value j' at byte j'/4 bits 2(j'%4) -> byte j'%4 bits 2(j'/4), a 4 x 4 transpose of 2-bit
+        // codes: input byte b's code i goes to output byte i at bits 2b.  spread[x] puts x's codes at bytes 0..3.
+        static const auto spread = [] {
+            std::array<uint32_t, 256> t{};
+            for (uint32_t x = 0; x < 256; ++x)
+                for (int i = 0; i < 4; ++i) t[x] |= ((x >> (2 * i)) & 3u) << (8 * i);
+            return t;
+        }();
+        for (size_t i = 0; i < NB; ++i) {
+            const uint8_t* sb = src + i * 18;
+            for (int u = 0; u < 4; ++u) {
+                const uint8_t* in = sb + 2 + 4 * u;
+                const uint32_t o = spread[in[0]] | (spread[in[1]] << 2) | (spread[in[2]] << 4) | (spread[in[3]] << 6);
+                std::memcpy(dst + i * 16 + 4 * u, &o, 4);   // little-endian: byte k = o >> 8k
+            }
+            std::memcpy(dst + 16 * NB + i * 2, sb, 2);
+        }
+    } else {
+        for (size_t i = 0; i < NB; ++i) {
+            const uint8_t* sb = src + i * 28;
+            std::memcpy(dst + i * 16, sb, 16);
+            std::memcpy(dst + 16 * NB + i * 8, sb + 16, 8);
+            std::memcpy(dst + 24 * NB + i * 4, sb + 24, 4);
+        }
+    }
+}
+
+/// The promotion cache's slots (each expert card's flex region, STRATA_XE_FLEX_GIB), the bounces and the helper thread.
+void pc_setup(Ds41XeImpl& im) {
+    im.pc_slot = ((size_t) im.blob_max + 255) & ~(size_t) 255;
+    int total = 0;
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (c.dense || c.pc_mem || !c.flex || c.pbuf_cap) continue;   // the slots: the card's flex region (no prompt running)
+        const int n = (int) std::min<size_t>(c.flex_cap / im.pc_slot, 65535);
+        if (n < 4) continue;
+        c.pc_mem = c.flex;
+        c.pc_n = n;
+        c.pc_key.assign((size_t) n, -1);
+        c.pc_tick.assign((size_t) n, 0);
+        c.pc_busy = false;
+        total += n;
+    }
+    if (!im.pc_bounce) im.pc_bounce = sycl::malloc_host<uint8_t>((size_t) kPcBounce * im.pc_slot, im.ctx);
+    im.pc_bfree.clear();
+    for (int b = 0; b < kPcBounce; ++b) im.pc_bfree.push_back(b);
+    im.pc_where.assign(im.card_of.size(), -1);
+    if (!im.pc_thr.joinable()) {
+        im.pc_stop = false;
+        im.pc_thr = std::thread([&im] {
+            {   // background work: it must not take a core from the decode thread's latency-bound path
+                sched_param sp{};
+                sp.sched_priority = 0;
+                pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp);
+            }
+            for (;;) {
+                Ds41XeImpl::PcJob* j = nullptr;
+                {
+                    std::unique_lock<std::mutex> lk(im.pc_mu);
+                    im.pc_cv.wait(lk, [&] { return im.pc_stop || !im.pc_fill.empty(); });
+                    if (im.pc_stop) return;
+                    j = im.pc_fill.front();
+                    im.pc_fill.pop_front();
+                }
+                const int64_t l = j->key / im.g.n_experts, e = j->key % im.g.n_experts;
+                const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
+                const uint8_t* src = im.aptr[(size_t) j->key];
+                uint8_t* dst = im.pc_bounce + (size_t) j->bounce * im.pc_slot;
+                if (!im.planar) std::memcpy(dst, src, im.bbytes(l, e));
+                else {
+                    const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
+                    auto qk = [](int t) { return t == xe::kQ3K ? 256 : t == xe::kQ20 ? 64 : 128; };
+                    const size_t nbg = (size_t) F * (H / qk(f.gu_type)), nbd = (size_t) H * (F / qk(f.d_type));
+                    cpu_repack_mat(f.gu_type, src, dst, nbg);
+                    cpu_repack_mat(f.gu_type, src + f.up_off, dst + f.up_off, nbg);
+                    cpu_repack_mat(f.d_type, src + f.down_off, dst + f.down_off, nbd);
+                }
+                j->filled.store(1, std::memory_order_release);
+            }
+        });
+    }
+    im.pc_ready = im.pc_bounce && total > 0;
+    static bool logged = false;
+    if (!logged || env_i("STRATA_XE_PROF", 0)) {
+        logged = true;
+        std::fprintf(stderr, "xe tier: promotion cache: %d slots (%.2f GiB) on the expert cards\n", total, total * (double) im.pc_slot / kGiB);
+    }
+}
+
+/// STRATA_XE_PROMOTE_CHECK=1 (debug): a published slot against the arena blob repacked afresh on the same card
+bool pc_check(Ds41XeImpl& im, XeCard& c, int64_t key, const uint8_t* slot) {
+    const int64_t l = key / im.g.n_experts, e = key % im.g.n_experts;
+    const size_t b = im.bbytes(l, e);
+    uint8_t* ref = sycl::malloc_device<uint8_t>(b, c.q);
+    std::vector<uint8_t> a(b), r(b);
+    upload_planar(im, c, l, e, im.aptr[(size_t) key], ref);
+    c.q.memcpy(r.data(), ref, b);
+    c.q.memcpy(a.data(), slot, b).wait();
+    sycl::free(ref, c.q);
+    return std::memcmp(a.data(), r.data(), b) == 0;
+}
+
+/// Promotions in flight, a step each: bounce filled -> one chunk of the copy a call on the card's queue (push = true:
+/// the end of a call, behind its card work) -> the repack behind the last chunk -> published once the repack is done
+/// (push = false: the start of a call)
+void pc_poll(Ds41XeImpl& im, bool push) {
+    static const bool check = env_i("STRATA_XE_PROMOTE_CHECK", 0) != 0;
+    static const size_t chunk = (size_t) (env_d("STRATA_XE_PROMOTE_CHUNK_MB", 1.0) * 1048576.0) & ~(size_t) 255;
+    for (auto it = im.pc_jobs.begin(); it != im.pc_jobs.end();) {
+        Ds41XeImpl::PcJob& j = *it;
+        XeCard& c = *im.cards[(size_t) j.card];
+        const int64_t l = j.key / im.g.n_experts, e = j.key % im.g.n_experts;
+        uint8_t* slot = c.pc_mem + (size_t) j.slot * im.pc_slot;
+        if (j.stage == 0 && j.filled.load(std::memory_order_acquire)) {
+            j.src = im.pc_bounce + (size_t) j.bounce * im.pc_slot;
+            j.stage = 1;
+        }
+        if (j.stage == 1 && push) {
+            const size_t b = im.bbytes(l, e), n = std::min(chunk ? chunk : b, b - j.sent);
+            // a kernel reads the pinned bounce (zero-copy, as the experts read X): a queue memcpy would put the copy
+            // engine in the card's queue, and the next kernel after an H2D memcpy starts ~300 us late when it comes to
+            // an idle queue (bench/dqb/defer_q.cpp) - the next call's spin / experts.  Blobs are multiples of 16 bytes.
+            using u4v = sycl::vec<uint32_t, 4>;
+            const u4v* sv = reinterpret_cast<const u4v*>(j.src + j.sent);
+            u4v* dv = reinterpret_cast<u4v*>(slot + j.sent);
+            if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 12);
+            const sycl::event kev = c.q.parallel_for(sycl::range<1>(n / 16), [=](sycl::id<1> i) { dv[i] = sv[i]; });
+            if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 13);
+            j.sent += n;
+            ++im.pc_chunks;
+            if (j.sent == b) {   // in queue order: once this kernel is done the whole copy is
+                j.ev = kev;
+                j.stage = 3;
+            }
+        } else if (j.stage == 3 && !push && ev_done(j.ev)) {
+            if (j.bounce >= 0) { im.pc_bfree.push_back(j.bounce); j.bounce = -1; }
+            c.pc_busy = false;
+            if (check && !pc_check(im, c, j.key, slot)) {   // debug: keep it on the CPU
+                ++im.pc_bad;
+                c.pc_key[(size_t) j.slot] = -1;
+                im.pc_where[(size_t) j.key] = -1;
+                std::fprintf(stderr, "xe tier: promotion of layer %lld expert %lld on card %d: slot differs from a fresh repack\n",
+                             (long long) l, (long long) e, c.idx);
+            } else {
+                im.card_of[(size_t) j.key] = (int8_t) c.idx;
+                im.dptr[(size_t) j.key] = slot;
+                c.pc_key[(size_t) j.slot] = j.key;
+                c.pc_tick[(size_t) j.slot] = im.pc_clock;
+                im.pc_where[(size_t) j.key] = (c.idx << 16) | j.slot;
+                ++im.pc_done;
+            }
+            it = im.pc_jobs.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
+/// A CPU-pool expert of layer l: its promotion starts if an expert card has its stage free.  The slot: a free one, else
+/// the least recently used of another layer (no queued job reads it: only layer l's are in flight now, every earlier
+/// layer's cards were done before this layer's attention; its repack is queued after them anyway).
+void pc_want(Ds41XeImpl& im, int64_t l, size_t key) {
+    if (im.pc_where[key] != -1 || !im.aptr[key]) return;
+    static const int pmin = std::max(1, env_i("STRATA_XE_PROMOTE_MIN", 2));
+    if (im.pc_uses.size() != im.card_of.size()) im.pc_uses.assign(im.card_of.size(), 0);
+    if (im.pc_uses[key] < 255) ++im.pc_uses[key];
+    if (im.pc_uses[key] < pmin) return;
+    const int NC = (int) im.cards.size();
+    XeCard* cd = nullptr;
+    for (int k = 0; k < NC && !cd; ++k) {
+        XeCard& c = *im.cards[(size_t) ((im.pc_rr + k) % NC)];
+        if (!c.dense && c.pc_n > 0 && !c.pc_busy) cd = &c;
+    }
+    if (!cd) { ++im.pc_busy_skip; return; }
+    if (im.pc_bfree.empty()) { ++im.pc_busy_skip; return; }
+    int slot = -1;
+    uint64_t best = UINT64_MAX;
+    for (int sl = 0; sl < cd->pc_n; ++sl) {
+        const int64_t k = cd->pc_key[(size_t) sl];
+        if (k == -1) { slot = sl; break; }
+        if (k >= 0 && k / im.g.n_experts != l && cd->pc_tick[(size_t) sl] < best) { best = cd->pc_tick[(size_t) sl]; slot = sl; }
+    }
+    if (slot < 0) return;
+    im.pc_rr = (cd->idx + 1) % NC;
+    const int64_t old = cd->pc_key[(size_t) slot];
+    if (old >= 0) {   // evicted: the CPU pool runs it again
+        im.card_of[(size_t) old] = -1;
+        im.dptr[(size_t) old] = nullptr;
+        im.pc_where[(size_t) old] = -1;
+        ++im.pc_evicted;
+    }
+    cd->pc_key[(size_t) slot] = -2;
+    cd->pc_busy = true;
+    im.pc_where[key] = -2;
+    im.pc_jobs.emplace_back();
+    Ds41XeImpl::PcJob& j = im.pc_jobs.back();
+    j.key = (int64_t) key;
+    j.card = cd->idx;
+    j.slot = slot;
+    j.bounce = im.pc_bfree.back();   // the helper repacks it into a bounce (pinned arena copies too)
+    im.pc_bfree.pop_back();
+    { std::lock_guard<std::mutex> lk(im.pc_mu); im.pc_fill.push_back(&j); }
+    im.pc_cv.notify_one();
+}
+
+/// The cache gone (a prompt's prefetch wants the VRAM; close): in-flight promotions finished, every promoted expert
+/// back to the CPU pool, the slots freed.
+void pc_drop(Ds41XeImpl& im) {
+    im.pc_calls = 0;
+    im.pc_tried = false;
+    if (!im.pc_ready && im.pc_jobs.empty()) return;
+    for (;;) {   // the helper's fills in flight (their jobs are freed below)
+        bool busy = false;
+        for (auto& j : im.pc_jobs) if (j.stage == 0 && !j.filled.load(std::memory_order_acquire)) busy = true;
+        if (!busy) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (!c.pc_mem) continue;
+        c.q.wait();
+        for (int sl = 0; sl < c.pc_n; ++sl) {
+            const int64_t k = c.pc_key[(size_t) sl];
+            if (k >= 0) { im.card_of[(size_t) k] = -1; im.dptr[(size_t) k] = nullptr; }
+        }
+        c.pc_mem = nullptr;   // the flex region (prefetch buffers next)
+        c.pc_n = 0;
+        c.pc_key.clear();
+        c.pc_tick.clear();
+        c.pc_busy = false;
+    }
+    im.pc_jobs.clear();
+    im.pc_bfree.clear();
+    for (int b = 0; b < kPcBounce; ++b) im.pc_bfree.push_back(b);
+    std::fill(im.pc_where.begin(), im.pc_where.end(), -1);
+    im.pc_ready = false;
+}
+
 /// One decode / verify call: nt <= 8 tokens.  out_host (nt x n_embd) or out_dev (the dense card) gets the sum.
 bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const float* w, const float* x, float* out_host,
                void* out_dev) {
@@ -1105,13 +1444,29 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     static thread_local std::vector<Ent> ents;
     static thread_local std::vector<int32_t> first;
     group(ids, w, nt, K, im.g.n_experts, ents, first);
+    if (im.pc_mode < 0) im.pc_mode = env_i("STRATA_XE_PROMOTE", 1) != 0 && im.planar && im.dense >= 0 ? 1 : 0;
+    if (im.pc_mode > 0) {
+        ++im.pc_clock;
+        // the slots (the expert cards' flex regions: nothing allocated here - that cost 555 ms mid-decode once)
+        if (!im.pc_ready && !im.pc_tried && !im.pf_on && ++im.pc_calls >= env_i("STRATA_XE_PROMOTE_AFTER", 1)) {
+            im.pc_tried = true;   // once a drop (no prompt prefetch running: the flex regions are its buffers then)
+            pc_setup(im);
+        }
+        if (!im.pc_jobs.empty()) {
+            const double tq = now_ms();
+            pc_poll(im, false);
+            im.pc_poll_us += (now_ms() - tq) * 1000.0;
+        }
+    }
     static const bool cpu_stats = env_i("STRATA_XE_CPU_STATS", 0) != 0;
     struct CpuStats { std::vector<uint8_t> seen; int64_t uses = 0, repeats = 0, distinct = 0, calls = 0, tok_uses = 0; };
     static CpuStats cst;
     if (cpu_stats && ++cst.calls % 4000 == 0)
         std::fprintf(stderr, "xe cpu stats (%lld calls): %lld CPU expert uses (%lld token-uses), %lld repeats of an expert already run on the "
-                     "CPU, %lld distinct\n", (long long) cst.calls, (long long) cst.uses, (long long) cst.tok_uses, (long long) cst.repeats,
-                     (long long) cst.distinct);
+                     "CPU, %lld distinct; promoted %lld (hits %lld, evicted %lld, skipped busy %lld, bad %lld)\n", (long long) cst.calls,
+                     (long long) cst.uses, (long long) cst.tok_uses, (long long) cst.repeats, (long long) cst.distinct,
+                     (long long) im.pc_done, (long long) im.pc_hit, (long long) im.pc_evicted, (long long) im.pc_busy_skip,
+                     (long long) im.pc_bad);
     // per card: its jobs; the rest: the CPU pool
     std::vector<const Ent*> cpu_list;
     const size_t NC = im.cards.size();
@@ -1121,10 +1476,14 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
     const bool take_armed = im.armed_l == l && im.armed_nt == nt && out_dev && im.dense_q && x == im.arm_x;
     if (!take_armed) disarm(im);
     if (x && im.x_direct) im.arm_x = x;   // the X the next arm's sequences read
+    static double pw_us = 0, pl_us = 0;
+    static int64_t pw_n = 0;
+    const double tw0 = now_ms();
     for (auto& cp : im.cards) {
         cp->busy = false;
         if (im.dense_q && !cp->armed) cp->stage_ev.wait();   // a back-to-back call (no dense sync between): its stage copy is done
     }
+    const double tw1 = now_ms();
     for (const Ent& en : ents) {
         const size_t key = (size_t) im.key(l, en.e);
         const int c = im.card_of[key];
@@ -1135,7 +1494,15 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             if (cst.seen[key]) ++cst.repeats;
             else { cst.seen[key] = 1; ++cst.distinct; }
         }
-        if (c < 0) { cpu_list.push_back(&en); continue; }
+        if (c < 0) {
+            if (im.pc_ready) pc_want(im, l, key);
+            cpu_list.push_back(&en);
+            continue;
+        }
+        if (im.pc_ready && im.pc_where[key] >= 0) {   // a promoted expert: its slot used now
+            im.cards[(size_t) (im.pc_where[key] >> 16)]->pc_tick[(size_t) (im.pc_where[key] & 0xFFFF)] = im.pc_clock;
+            ++im.pc_hit;
+        }
         XeCard& cd = *im.cards[(size_t) c];
         if (nj[(size_t) c] >= (cd.armed ? cd.arm_ng : kMaxDecodeJobs)) { cpu_list.push_back(&en); continue; }
         XeJob j = make_job(im, l, en.e, im.dptr[key]);
@@ -1146,6 +1513,11 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
         mnt[(size_t) c] = std::max(mnt[(size_t) c], en.nt);
         im.st.hits += 1;
     }
+    pw_us += (tw1 - tw0) * 1000.0;
+    pl_us += (now_ms() - tw1) * 1000.0;
+    if (++pw_n % 15000 == 0 && env_i("STRATA_XE_PROF", 0))
+        std::fprintf(stderr, "xe decode prep split (%lld calls): unarmed cards' stage waits %.1f us, routing loop %.1f us a call\n",
+                     (long long) pw_n, pw_us / pw_n, pl_us / pw_n);
     const size_t xoff = (kMaxDecodeJobs * sizeof(XeJob) + kStageAlign - 1) / kStageAlign * kStageAlign;
     const size_t n_out = (size_t) nt * H;
     XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
@@ -1302,6 +1674,11 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             if (im.host_slots && !cpu_list.empty()) im.hsum_ev = ev;   // hsum is read in place: its next write waits for this
         }
         if (Ds41XeTier::tl_on() && im.dense_q) tl_stamp(im, 0, *im.dense_q, nt == 1 ? 3 : 11);
+        if (im.pc_mode > 0 && !im.pc_jobs.empty()) {   // promotions: behind this call's card work
+            const double tq = now_ms();
+            pc_poll(im, true);
+            im.pc_push_us += (now_ms() - tq) * 1000.0;
+        }
         if (sprof) {
             const double ts3 = now_ms();
             sp[0] += ts0 - t0;      // grouping + job building (before the cards' submissions)
@@ -2344,6 +2721,7 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
     Ds41XeImpl& im = *im_;
     static const int on = env_i("STRATA_XE_PREFETCH", 1);
     if (!on || !im.pf_stage_cap || im.pf_on || last < first) return false;
+    pc_drop(im);   // the promoted experts' VRAM back first (the buffers below are sized from what is free)
     // the buffers: per expert card two of the largest layer's per-card share, within its free VRAM less a reserve
     // for run_big's own buffers (STRATA_XE_PREFETCH_RESERVE_GIB, 1.3; the xe driver spills an over-commit into host
     // RAM instead of failing, so stay well inside)
@@ -2375,18 +2753,18 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         const int64_t have = (int64_t) (c.cX_cap + c.cOUT_cap) * 4 + (int64_t) c.cS_cap * 8 + (int64_t) c.gscratch_cap +
                              (c.cjobs_cap ? BJ * kMaxJobTok * (F + H) * 4 : 0) + (int64_t) c.cxq_rows * H * 2;
         const int64_t reserve = std::max<int64_t>(0, rb - have) + (int64_t) (margin * kGiB);
-        const int64_t fr = c.free_vram();
+        const int64_t fr = c.free_vram() + (int64_t) c.flex_cap;   // the flex region becomes the buffers
         int64_t room = fr > 0 ? (fr - reserve) / 2 : 0;
         const size_t cap = (size_t) std::max<int64_t>(0, std::min<int64_t>((int64_t) per, room)) & ~(size_t) 255;
         if (cap < (size_t) im.blob_max) { c.pbuf_cap = 0; continue; }
-        c.pbuf[0] = sycl::malloc_device<uint8_t>(cap, c.q);
-        c.pbuf[1] = c.pbuf[0] ? sycl::malloc_device<uint8_t>(cap, c.q) : nullptr;
-        if (!c.pbuf[1]) {
-            if (c.pbuf[0]) sycl::free(c.pbuf[0], c.q);
-            c.pbuf[0] = nullptr;
-            c.pbuf_cap = 0;
-            continue;
+        if (!c.flex || c.flex_cap < 2 * cap) {   // (re)allocated only when it is too small
+            if (c.flex) { c.q.wait(); sycl::free(c.flex, c.q); }
+            c.flex = sycl::malloc_device<uint8_t>(2 * cap, c.q);
+            c.flex_cap = c.flex ? 2 * cap : 0;
+            if (!c.flex) { c.pbuf_cap = 0; continue; }
         }
+        c.pbuf[0] = c.flex;
+        c.pbuf[1] = c.flex + cap;
         c.pbuf_cap = cap;
     }
     // the calls' buffers now, once (they are in the reserve above): the overflow stream buffer at its planned size, X /
@@ -2487,6 +2865,7 @@ void Ds41XeTier::prefetch_end() {
         if (!c.pbuf_cap) continue;
         c.pq.wait();
         c.q.wait();
+        if (c.pbuf[0] == c.flex) c.pbuf[0] = c.pbuf[1] = nullptr;   // the flex region stays (decode: promotion slots)
         for (auto& p : c.pbuf) { if (p) sycl::free(p, c.q); p = nullptr; }
         c.pbuf_cap = 0;
     }
@@ -2501,6 +2880,17 @@ void Ds41XeTier::close() {
     if (!im_) return;
     Ds41XeImpl& im = *im_;
     disarm(im);
+    pc_drop(im);
+    if (im.pc_thr.joinable()) {
+        { std::lock_guard<std::mutex> lk(im.pc_mu); im.pc_stop = true; }
+        im.pc_cv.notify_all();
+        im.pc_thr.join();
+    }
+    if (im.pc_bounce) { sycl::free(im.pc_bounce, im.ctx); im.pc_bounce = nullptr; }
+    if (im.pc_done || im.pc_busy_skip)
+        std::fprintf(stderr, "xe tier: promotion cache: %lld promoted, %lld hits, %lld evicted, %lld skipped (cards busy), %lld bad; "
+                     "%lld chunks, host push %.1f ms, poll %.1f ms\n", (long long) im.pc_done, (long long) im.pc_hit, (long long) im.pc_evicted,
+                     (long long) im.pc_busy_skip, (long long) im.pc_bad, (long long) im.pc_chunks, im.pc_push_us / 1000.0, im.pc_poll_us / 1000.0);
     if (im.relq) { im.relq->wait(); im.relq.reset(); }
     if (im.arm_used || im.arm_disarmed)
         std::fprintf(stderr, "xe tier: armed card shares used %lld, disarmed calls %lld\n", (long long) im.arm_used,
@@ -2525,6 +2915,9 @@ void Ds41XeTier::close() {
         XeCard& c = *cp;
         c.free_experts();
         auto fr = [&](void* p) { if (p) sycl::free(p, c.q); };
+        if (c.pbuf[0] == c.flex) c.pbuf[0] = c.pbuf[1] = nullptr;
+        fr(c.flex);
+        c.flex = nullptr;
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY); fr(c.stream);
         fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots); fr(c.rstage);
