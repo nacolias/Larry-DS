@@ -1412,6 +1412,7 @@ PrioMutex g_submit;
 struct BigProf {
     double prep = 0, cards = 0, combine = 0, total = 0;
     double prep_pf = 0, prep_plan = 0, prep_lock = 0;   ///< prep's prefetch waits, planning, submit-lock wait
+    double prep_grow = 0, prep_x = 0, prep_w = 0, prep_z = 0;   ///< prep's buffer checks, X / W copy and memset enqueues
     std::atomic<int64_t> lk_gemm_us{0}, lk_jobs_us{0}, lk_n{0};   ///< submit-lock hold time of the GEMM / job sites
     std::atomic<int64_t> st_us{0}, st_bytes{0}, pfw_us{0}, dma_us{0}, dma_wait_us{0}, dma_bytes{0}, dma_n{0};   ///< prefetch
     std::atomic<int64_t> min_free[8] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}};   ///< per card, bytes
@@ -1623,9 +1624,11 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         XeCard& c = *cp;
         c.busy = !cl[(size_t) c.idx].empty();
         if (!c.busy) continue;
+        const double tg0 = prof ? now_ms() : 0;
         uint8_t* const st0 = c.stream;   // a card keeping experts keeps its buffer (no regrow)
-        const size_t sreq = kept[(size_t) c.idx].empty() ? std::min<size_t>(stream_cap, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1))
-                                                         : c.stream_bytes;
+        const size_t sneed = std::min<size_t>(stream_cap, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1));
+        // with the prefetch on, a regrowth goes straight to the cap (planned into the prefetch's reserve)
+        const size_t sreq = !kept[(size_t) c.idx].empty() ? c.stream_bytes : im.pf_on && sneed > c.stream_bytes ? stream_cap : sneed;
         if (!grow_dev(c.stream, c.stream_bytes, sreq, c.q)) {
             std::fprintf(stderr, "xe tier: card %d: stream buffer allocation failed (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
             return false;
@@ -1667,9 +1670,23 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             }
             c.cjobs_cap = BJ;
         }
+        const double tq0 = prof ? now_ms() : 0;
         c.q.memcpy(c.cX, x_dev ? x_dev : x, (size_t) n * H * 4);   // x_dev: card-to-card from the dense card
+        const double tq1 = prof ? now_ms() : 0;
         c.q.memcpy(c.cW, w, (size_t) n * K * 4);
+        const double tq2 = prof ? now_ms() : 0;
         c.q.memset(c.cOUT, 0, (size_t) n * H * 4);
+        if (prof) {
+            const double tq3 = now_ms();
+            if (tq0 - tg0 > 5.0)
+                std::fprintf(stderr, "xe prof: call %lld layer %lld card %d: buffers %.1f ms (n %d, stream %.0f MiB, cX %.0f MiB, cjobs %d)\n",
+                             (long long) g_bp.calls, (long long) l, c.idx, tq0 - tg0, n, c.stream_bytes / 1048576.0,
+                             c.cX_cap * 4 / 1048576.0, c.cjobs_cap);
+            g_bp.prep_grow += tq0 - tg0;
+            g_bp.prep_x += tq1 - tq0;
+            g_bp.prep_w += tq2 - tq1;
+            g_bp.prep_z += tq3 - tq2;
+        }
     }
     prep_lk.unlock();
     const double t_prep = now_ms();
@@ -1843,11 +1860,12 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 bool grown;
                 {
                     std::lock_guard<PrioMutex> lk(g_submit);
-                    grown = grow_dev(c.gscratch, c.gscratch_cap, need, c.q);
+                    grown = grow_dev(c.gscratch, c.gscratch_cap, c.gscratch_cap < need ? need + need / 4 : need, c.q);   // headroom: few regrowths
                     if (grown && c.dq_host_cap < jbytes + tbytes) {
+                        const size_t hb = (jbytes + tbytes) + (jbytes + tbytes) / 4;
                         if (c.dq_host) sycl::free(c.dq_host, c.q);
-                        c.dq_host = sycl::malloc_host<uint8_t>(jbytes + tbytes, c.q);
-                        c.dq_host_cap = c.dq_host ? jbytes + tbytes : 0;
+                        c.dq_host = sycl::malloc_host<uint8_t>(hb, c.q);
+                        c.dq_host_cap = c.dq_host ? hb : 0;
                         grown = c.dq_host != nullptr;
                     }
                 }
@@ -2209,6 +2227,8 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                          (long long) g_bp.streamed.load(), (long long) g_bp.kept.load(), g_bp.gemm_us / 1000.0, (long long) g_bp.gemm_e.load(),
                          g_bp.small_us / 1000.0, (long long) g_bp.small_j.load());
         if (prof && g_bp.calls % 40 == 0) {
+            std::fprintf(stderr, "xe prof: prep enqueues: buffers %.0f ms, X copy %.0f, W copy %.0f, memset %.0f\n", g_bp.prep_grow,
+                         g_bp.prep_x, g_bp.prep_w, g_bp.prep_z);
             std::fprintf(stderr, "xe prof: lowest free VRAM after a call:");
             for (int k = 0; k < 4; ++k) std::fprintf(stderr, " %.2f", g_bp.min_free[k].load() / kGiB);
             std::fprintf(stderr, " GiB\n");
@@ -2353,6 +2373,26 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
             continue;
         }
         c.pbuf_cap = cap;
+    }
+    // the calls' buffers now, once (they are in the reserve above): the overflow stream buffer at its planned size, X /
+    // OUT / the slot maps for n_call tokens
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (c.dense || !c.pbuf_cap) continue;
+        const size_t sb = (size_t) (env_d("STRATA_XE_PREFETCH_STREAM_GIB", 0.25) * kGiB) & ~(size_t) 255;
+        if (!grow_dev(c.stream, c.stream_bytes, sb, c.q) || !grow_dev(c.cX, c.cX_cap, (size_t) nc * H, c.q) ||
+            !grow_dev(c.cOUT, c.cOUT_cap, (size_t) nc * H, c.q))
+            std::fprintf(stderr, "xe prefetch: card %d: call buffers not pre-allocated (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
+        if (c.cS_cap < (size_t) nc * K) {
+            size_t scap = 0, wcap = 0;
+            if (c.cS) { c.q.wait(); sycl::free(c.cS, c.q); sycl::free(c.cW, c.q); c.cS = nullptr; c.cW = nullptr; c.cS_cap = 0; }
+            if (grow_dev(c.cS, scap, (size_t) nc * K, c.q) && grow_dev(c.cW, wcap, (size_t) nc * K, c.q)) c.cS_cap = (size_t) nc * K;
+            else {
+                if (c.cS) sycl::free(c.cS, c.q);
+                if (c.cW) sycl::free(c.cW, c.q);
+                c.cS = nullptr; c.cW = nullptr;
+            }
+        }
     }
     static const int pf_dense = env_i("STRATA_XE_PREFETCH_DENSE", 0);   // measured no gain (8.5K: 13.4-13.8 vs 12.7-13.1 s)
     if (pf_dense && im.dense >= 0) {
