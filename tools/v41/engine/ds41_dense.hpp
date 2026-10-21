@@ -118,6 +118,9 @@ public:
     /// larry: called right before a decode / verify layer's host waits for its router readback (layer, width) - the
     /// tier queues its cards' share then (Ds41XeTier::arm)
     void set_pre_wait_hook(std::function<void(int, int)> h);
+    /// larry, STRATA_TP_OPROJ=2: the attention output projection of a decode / verify layer, queued between the two
+    /// halves of its attention graph (layer, width, wo_a, wo_b, o: OGD * OG floats a column, dst: n_embd a column)
+    void set_oproj_hook(std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> h);
     void pass_sync();
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,

@@ -82,6 +82,12 @@ sycl::event xe_quant_rows(sycl::queue& q, const float* x, int nrows, int n, XeQ8
 sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
                           int n_ff, float swiglu_limit, bool accumulate, int max_nt = 0);
 
+/// larry (xe_xmx.cpp): the same on the XMX engines (fp16 DPAS) - xt = xe_xt of the call's rows ([n_embd][8] fp16,
+/// rows >= ntok zero), ht = scratch [nj][n_ff][8] fp16.  The weights stream once whatever a job's tokens.
+sycl::event xe_xt(sycl::queue& q, const float* x, int ntok, int n, sycl::half* xt);
+sycl::event xe_experts_x(sycl::queue& q, const XeJob* jobs, int nj, int ntok, const sycl::half* xt, sycl::half* ht,
+                         float* OUT, int n_embd, int n_ff, float swiglu_limit, bool accumulate);
+
 /// xe_experts_y on PLANAR experts (Y: [nj][8][n_embd]; H scratch as above).
 sycl::event xe_experts_y_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H, float* Y, int n_embd, int n_ff,
                             float swiglu_limit, int max_nt);

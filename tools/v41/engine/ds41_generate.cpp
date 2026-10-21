@@ -438,6 +438,16 @@ int main(int argc, char ** argv) {
     if (!mc.cpu_only && !(std::getenv("STRATA_HEAD_SPLIT") && std::getenv("STRATA_HEAD_SPLIT")[0] == '0'))
         ggml_backend_sycl_set_mv_hook(&Ds41XeTier::mv_hook, &tier,
                                       std::getenv("STRATA_HEAD_SPLIT_MB") ? std::atof(std::getenv("STRATA_HEAD_SPLIT_MB")) : 100.0);
+    // larry, STRATA_TP_OPROJ=1: the attention output split over the cards (the dense graphs build GGML_OP_DSV41_OPROJ)
+    if (!mc.cpu_only && std::getenv("STRATA_TP_OPROJ") && std::atoi(std::getenv("STRATA_TP_OPROJ")) != 0) {
+        ggml_backend_sycl_set_oproj_hook(&Ds41XeTier::oproj_hook, &tier);
+        // =2: between the two halves of a decode layer's attention graph (both stay replayable SYCL graphs)
+        const auto & gg = dense.geom();
+        const int64_t ogd = gg.n_head * gg.d_head / gg.o_groups, ol = gg.o_lora, og = gg.o_groups;
+        dense.set_oproj_hook([&dense, ogd, ol, og](int, int n, const ggml_tensor * wa, const ggml_tensor * wb, const float * o, float * y) {
+            return ggml_backend_sycl_oproj(dense.backend(), wa, ogd, ol, og, wb, o, n, y, wb->ne[1]);
+        });
+    }
     if (Ds41XeTier::tl_on()) ds41_dense_tl_hook = [](int id) { tl_tier->tl_tag(id); };
 #else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }

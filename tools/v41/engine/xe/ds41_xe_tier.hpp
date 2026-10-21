@@ -68,6 +68,12 @@ public:
     /// way; the dense card computes the first rows.  `user` is the tier.
     static bool mv_hook(void* queue, const void* w, int64_t K, int64_t N, int ncols, const int8_t* xq, const float* xd,
                         float* y, int64_t y_col_stride, void* user);
+    /// larry (ggml-sycl's DSV41_OPROJ hook, STRATA_TP_OPROJ): the attention output split by head groups - expert card k
+    /// keeps wo_a's slices of its groups and wo_b's matching columns, gets its groups' int8 o by a card-to-card copy, sends
+    /// its partial sum back; the dense card computes the first groups and adds the parts.  `user` is the tier.
+    static bool oproj_hook(void* queue, const void* wo_a, size_t wo_a_slice_bytes, const void* wo_b, int64_t OGD,
+                           int64_t OL, int64_t OG, int64_t D, int ncols, const float* o, int64_t o_col_stride, float* dst,
+                           int64_t dst_col_stride, void* user);
     void tl_tag(int id);
     void tl_flush();
     void set_cache_enabled(bool on);

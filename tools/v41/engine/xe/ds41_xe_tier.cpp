@@ -166,6 +166,8 @@ struct XeCard {
     uint8_t* rstage = nullptr;      ///< [blob_max]: a file-layout blob on its way to its planar slot
     std::mutex rmu;                 ///< makes (copy into rstage, repack out of it) one unit for concurrent uploaders
     xe::XeQ8 xq, hq;                ///< decode / verify: X [8][n_embd], H [kMaxDecodeJobs][8][n_ff]
+    sycl::half* xt = nullptr;       ///< STRATA_XE_XMX: X as [n_embd][8] fp16, H as [kMaxDecodeJobs][n_ff][8] fp16
+    sycl::half* ht = nullptr;
     xe::XeQ8 cxq; size_t cxq_rows = 0;   ///< prompt chunks: X [n][n_embd]
     xe::XeQ8 chq; int chq_jobs = 0;      ///< prompt chunks: H [jobs][8][n_ff]
 
@@ -214,6 +216,8 @@ struct Ds41XeImpl {
     long tl_n[17][17] = {};
     std::vector<double> tl_cbusy, tl_clag, tl_csum_lag;   // per card: start->end, dense 1->start, end->dense 3
     std::vector<double> tl_chunk, tl_chunk_max;          // per card: promotion chunks' device time (stamps 12 -> 13)
+    std::vector<double> tl_op_busy, tl_op_lag;           // per card: oproj part 20 -> 21, dense 5 -> 21
+    std::vector<long> tl_op_n;
     std::vector<long> tl_chunk_n, tl_chunk_late;         // ... how many, how many ended after the next readback
     std::vector<long> tl_cn;
     long tl_tokens = 0;
@@ -256,6 +260,26 @@ struct Ds41XeImpl {
         std::vector<float*> xd, y;
     };
     std::map<const void*, HeadSplit> heads;
+    // STRATA_TP_OPROJ: per layer (keyed by wo_a), the attention output's parts - part 0 the dense card, part i >= 1 an
+    // expert card: groups [g0[i], g0[i + 1]) of wo_a (its slices as they are) and wo_b's matching columns (gathered)
+    struct OSplit {
+        bool ok = false;
+        int np = 0;
+        int64_t g0[9] = {};
+        std::vector<XeCard*> c;           ///< part i >= 1: c[i - 1]
+        std::vector<uint8_t*> wa, wb;     ///< part i's weights (part 0's wa: wo_a itself)
+        std::vector<int8_t*> xq, aq;      ///< part i >= 1: its groups' int8 o, its int8 wo_a output (8 columns)
+        std::vector<float*> xd, oa, ad, y;
+        /// STRATA_TP_GRAPH (default 1): part i's commands for a width, recorded once (g[i][ncols])
+        std::vector<std::array<std::shared_ptr<sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::executable>>, 9>> g;
+    };
+    std::map<const void*, OSplit> osplits;
+    // the dense card's side, shared by the layers (in-order on its queue): o quantised (all groups), its own part's
+    // wo_a output and its quantisation, the expert cards' partial sums (8 columns each)
+    int8_t* os_xq = nullptr; int8_t* os_aq = nullptr;
+    float* os_xd = nullptr; float* os_oa = nullptr; float* os_ad = nullptr; float* os_slots = nullptr;
+    int64_t os_calls = 0, os_declined = 0;
     // STRATA_XE_CPU_ASYNC (default 1): a decode / verify call's CPU-pool experts run on a helper thread (it drives
     // the pool) while the main thread dispatches the cards - they used to start only after every card's submission
     struct CpuTask { int64_t l; const void* ents; const float* x; float* hs; size_t n_out; };   ///< ents: std::vector<const Ent*>
@@ -542,6 +566,9 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
             err = "xe tier: int8 scratch allocation failed";
             return false;
         }
+        c.xt = sycl::malloc_device<sycl::half>((size_t) 8 * H, c.q);
+        c.ht = sycl::malloc_device<sycl::half>((size_t) kMaxDecodeJobs * F * 8, c.q);
+        if (!c.xt || !c.ht) { err = "xe tier: fp16 scratch allocation failed"; return false; }
         if (c.dense) {
             c.dslots = sycl::malloc_device<float>((im.cards.size() + 1) * kMaxJobTok * H, c.q);
             if (!c.dslots) { err = "xe tier: slot allocation failed"; return false; }
@@ -1060,9 +1087,10 @@ void Ds41XeTier::tl_flush() {
     Ds41XeImpl::TlRing& d = *im.tl_rings[0];
     const uint32_t dn = d.seen.load(std::memory_order_acquire);
     // dense transitions; and the times of this token's dense stamps 1 and 3 in order (one per layer)
-    std::vector<double> t1, t3;
+    std::vector<double> t1, t3, t5;
     for (uint32_t k = d.done; k < dn; ++k) {
         const int b = d.id[k % C];
+        if (b == 5) t5.push_back(d.t[k % C]);
         if (b == 1 || b == 9) t1.push_back(d.t[k % C]);
         if (b == 3 || b == 11) t3.push_back(d.t[k % C]);
         if (k == d.done) continue;
@@ -1082,6 +1110,7 @@ void Ds41XeTier::tl_flush() {
     im.tl_cbusy.resize(NC, 0.0); im.tl_clag.resize(NC, 0.0); im.tl_csum_lag.resize(NC, 0.0); im.tl_cn.resize(NC, 0);
     im.tl_chunk.resize(NC, 0.0); im.tl_chunk_max.resize(NC, 0.0); im.tl_chunk_n.resize(NC, 0); im.tl_chunk_late.resize(NC, 0);
     im.tl_copy_lag.resize(NC, 0.0); im.tl_copy_sum.resize(NC, 0.0); im.tl_copy_n.resize(NC, 0);
+    im.tl_op_busy.resize(NC, 0.0); im.tl_op_lag.resize(NC, 0.0); im.tl_op_n.resize(NC, 0);
     for (size_t c = 0; c < NC; ++c) {
         Ds41XeImpl::TlRing& r = *im.tl_rings[1 + c];
         const uint32_t rn = r.seen.load(std::memory_order_acquire);
@@ -1093,6 +1122,12 @@ void Ds41XeTier::tl_flush() {
                 ++im.tl_chunk_n[c];
                 auto nb = std::upper_bound(t1.begin(), t1.end(), ts);   // the next readback after its start
                 if (nb != t1.end() && te > *nb) ++im.tl_chunk_late[c];
+                continue;
+            }
+            if (r.id[k % C] == 20 && r.id[(k + 1) % C] == 21) {   // an oproj part (STRATA_TP_OPROJ)
+                const double ts = r.t[k % C], te = r.t[(k + 1) % C];
+                auto lb = std::upper_bound(t5.begin(), t5.end(), te);   // the dense card's start of that projection
+                if (lb != t5.begin()) { im.tl_op_busy[c] += te - ts; im.tl_op_lag[c] += te - *(lb - 1); ++im.tl_op_n[c]; }
                 continue;
             }
             if (r.id[k % C] == 11 && r.id[(k + 1) % C] == 14) {   // end -> copy done; copy done -> the next sum
@@ -1131,6 +1166,10 @@ void tl_print(Ds41XeImpl& im) {
         if (c < im.tl_copy_n.size() && im.tl_copy_n[c])
             std::fprintf(stderr, "; card %zu end->copy done %.1f us, copy done->sum %.1f us (x%ld)", c,
                          im.tl_copy_lag[c] / im.tl_copy_n[c], im.tl_copy_sum[c] / im.tl_copy_n[c], im.tl_copy_n[c]);
+    for (size_t c = 0; c < NC; ++c)
+        if (c < im.tl_op_n.size() && im.tl_op_n[c])
+            std::fprintf(stderr, "; card %zu oproj part ready->done %.1f us, dense start->part done %.1f us (x%ld)", c,
+                         im.tl_op_busy[c] / im.tl_op_n[c], im.tl_op_lag[c] / im.tl_op_n[c], im.tl_op_n[c]);
     for (size_t c = 0; c < NC; ++c)
         if (c < im.tl_chunk_n.size() && im.tl_chunk_n[c])
             std::fprintf(stderr, "; card %zu promotion chunks %.1f us (max %.0f, x%ld, %ld past the next readback)", c,
@@ -1262,6 +1301,11 @@ sycl::event card_experts(Ds41XeImpl& im, XeCard& c, int n, int nt, int max_nt, s
     const XeJob* jobs = (const XeJob*) c.stage_dev;
     const float* X = xsrc ? xsrc : (const float*) (c.stage_dev + xoff);   // xsrc: pinned host rows, read over PCIe
     if (!im.planar) return xe::xe_experts(c.q, jobs, n, nt, X, c.H, dst, H, F, im.L, false);
+    static const bool xmx = env_i("STRATA_XE_XMX", 0) != 0;   // larry: the XMX kernels (xe_xmx.cpp)
+    if (xmx) {
+        xe::xe_xt(c.q, X, nt, H, c.xt);
+        return xe::xe_experts_x(c.q, jobs, n, nt, c.xt, c.ht, dst, H, F, im.L, false);
+    }
     xe::xe_quant_rows(c.q, X, nt, H, c.xq);
     return xe::xe_experts_q8(c.q, jobs, n, nt, c.xq, c.hq, dst, H, F, im.L, false, max_nt);
 }
@@ -2768,6 +2812,209 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
 
 }  // namespace
 
+namespace {
+// STRATA_TP_OPROJ: one layer's parts (lazily, at its first decode call: no card is armed while an attention graph queues)
+Ds41XeImpl::OSplit osplit_init(Ds41XeImpl& im, sycl::queue& q0, const void* wo_a, size_t sb, const void* wo_b, int64_t OGD,
+                               int64_t OL, int64_t OG, int64_t D) {
+    Ds41XeImpl::OSplit s;
+    std::vector<XeCard*> parts;
+    for (auto& cp : im.cards) if (!cp->dense) parts.push_back(cp.get());
+    const int np = (int) std::min<size_t>(parts.size(), 7) + 1;
+    if (np < 2 || OG % np) return s;
+    const int64_t gp = OG / np, KB = OL * gp, KA = OL * OG;
+    if (KB % 256 || OGD % 256) return s;
+    s.np = np;
+    for (int i = 0; i <= np; ++i) s.g0[i] = gp * i;
+    if (!im.os_xq) {
+        im.os_xq = sycl::malloc_device<int8_t>((size_t) 8 * OGD * OG, q0);
+        im.os_xd = sycl::malloc_device<float>((size_t) 8 * OGD * OG / 32, q0);
+        im.os_oa = sycl::malloc_device<float>((size_t) 8 * KB, q0);
+        im.os_aq = sycl::malloc_device<int8_t>((size_t) 8 * KB, q0);
+        im.os_ad = sycl::malloc_device<float>((size_t) 8 * KB / 32, q0);
+        im.os_slots = sycl::malloc_device<float>((size_t) 8 * (np - 1) * D, q0);
+        if (!im.os_xq || !im.os_xd || !im.os_oa || !im.os_aq || !im.os_ad || !im.os_slots) {
+            std::fprintf(stderr, "xe tier: oproj split buffers failed - not split\n");
+            return Ds41XeImpl::OSplit();
+        }
+    }
+    // wo_b's planar planes hold block (row r, b) at r * bpr + b: part i's columns are each row's blocks [i bpp, +bpp)
+    const int64_t bpr = KA / 256, nb = D * bpr, bpp = KB / 256, nbp = D * bpp;
+    const size_t po[4] = {0, 128, 192, 208}, pb[4] = {128, 64, 16, 2};
+    const size_t wb_bytes = (size_t) nbp * 210, wa_bytes = (size_t) gp * sb;
+    auto gather = [&](int i, uint8_t* out) {   // on the dense card: part i's columns of the four planes into out
+        for (int p = 0; p < 4; ++p) {
+            const uint8_t* sp = (const uint8_t*) wo_b + po[p] * (size_t) nb + pb[p] * (size_t) (i * bpp);
+            uint8_t* dp = out + po[p] * (size_t) nbp;
+            const size_t w = pb[p] * (size_t) bpp, spitch = pb[p] * (size_t) bpr;
+            q0.parallel_for(sycl::range<1>((size_t) D * w), [=](sycl::id<1> id) {
+                const size_t r = id[0] / w, b = id[0] % w;
+                dp[r * w + b] = sp[r * spitch + b];
+            });
+        }
+    };
+    XeCard* dc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
+    if (!dc) return Ds41XeImpl::OSplit();
+    uint8_t* wb0 = local_alloc(q0, wb_bytes);   // the dense card's columns: read by its own kernels only
+    uint8_t* stage = sycl::malloc_device<uint8_t>(wb_bytes, q0);   // the expert cards' columns, one card at a time
+    if (!wb0 || !stage) {
+        if (wb0) local_free(q0, wb0);
+        if (stage) sycl::free(stage, q0);
+        std::fprintf(stderr, "xe tier: oproj split: no room on the dense card - not split\n");
+        return Ds41XeImpl::OSplit();
+    }
+    gather(0, wb0);
+    s.wa.push_back((uint8_t*) wo_a);
+    s.wb.push_back(wb0);
+    s.xq.push_back(nullptr); s.aq.push_back(nullptr);
+    s.xd.push_back(nullptr); s.oa.push_back(nullptr); s.ad.push_back(nullptr); s.y.push_back(nullptr);
+    bool ok = true;
+    for (int i = 1; i < np && ok; ++i) {
+        XeCard& c = *parts[(size_t) i - 1];
+        const size_t scratch = (size_t) 8 * gp * OGD * 5 / 4 + (size_t) 8 * KB * 6 + (size_t) 8 * D * 4 + ((size_t) 1 << 20);
+        if (c.free_vram() > 0 && c.free_vram() < (int64_t) (wa_bytes + wb_bytes + scratch + ((size_t) 768 << 20))) {
+            std::fprintf(stderr, "xe tier: no room on card %d for the oproj split (%zu MB) - not split\n", c.idx,
+                         (wa_bytes + wb_bytes) >> 20);
+            ok = false;
+            break;
+        }
+        // its weights only its kernels read (no UR peer residency); its scratch is touched by its own engines only
+        uint8_t* wa = local_alloc(c.q, wa_bytes);
+        uint8_t* wb = local_alloc(c.q, wb_bytes);
+        int8_t* xq = sycl::malloc_device<int8_t>((size_t) 8 * gp * OGD, c.q);
+        float* xd = sycl::malloc_device<float>((size_t) 8 * gp * OGD / 32, c.q);
+        float* oa = sycl::malloc_device<float>((size_t) 8 * KB, c.q);
+        int8_t* aq = sycl::malloc_device<int8_t>((size_t) 8 * KB, c.q);
+        float* ad = sycl::malloc_device<float>((size_t) 8 * KB / 32, c.q);
+        float* y = sycl::malloc_device<float>((size_t) 8 * D, c.q);
+        if (!wa || !wb || !xq || !xd || !oa || !aq || !ad || !y) {
+            std::fprintf(stderr, "xe tier: oproj split allocation on card %d failed - not split\n", c.idx);
+            ok = false;
+            break;
+        }
+        c.q.memcpy(wa, (const uint8_t*) wo_a + (size_t) (i * gp) * sb, wa_bytes);   // its slices: whole plane sets
+        gather(i, stage);
+        q0.wait();
+        c.q.memcpy(wb, stage, wb_bytes).wait();
+        s.c.push_back(&c);
+        s.wa.push_back(wa); s.wb.push_back(wb);
+        s.xq.push_back(xq); s.aq.push_back(aq);
+        s.xd.push_back(xd); s.oa.push_back(oa); s.ad.push_back(ad); s.y.push_back(y);
+    }
+    q0.wait();
+    sycl::free(stage, q0);
+    if (!ok) return Ds41XeImpl::OSplit();   // (what was allocated stays: a few layers' worth at most, then nothing splits)
+    s.g.resize((size_t) np);
+    s.ok = true;
+    static int told = 0;
+    if (!told++) std::fprintf(stderr, "xe tier: attention output split over %d cards (%lld groups each; %.0f MB a card a layer)\n", np,
+                              (long long) gp, (double) (wa_bytes + wb_bytes) / 1e6);
+    return s;
+}
+
+// a Q6K_R8 product of G slices / one matrix for ncols columns (quant_x's int8 rows: batch-major, g * ncols + c)
+void os_mv(sycl::queue& q, const void* w, int64_t K, int64_t N, int64_t G, size_t batch_bytes, int n, const int8_t* xq,
+           const float* xd, float* y, int64_t y_col_stride, int64_t y_batch_stride) {
+    fastmv::Args a;
+    a.w = w; a.K = K; a.N = N; a.G = G; a.g_div = 1; a.n_blocks_total = N * (K / 256); a.w_batch_bytes = batch_bytes;
+    a.x_col_stride = K; a.x_batch_stride = K * n;
+    a.y = y; a.y_col_stride = y_col_stride; a.y_batch_stride = y_batch_stride; a.ncols = n;
+    a.xq = xq; a.xd = xd;
+    if (!fastmv::launch(q, fastmv::WType::Q6K_R8, a)) throw std::runtime_error("oproj split: fastmv shape not covered");
+}
+}  // namespace
+
+bool Ds41XeTier::oproj_hook(void* queue, const void* wo_a, size_t sb, const void* wo_b, int64_t OGD, int64_t OL, int64_t OG,
+                            int64_t D, int ncols, const float* o, int64_t ocs, float* dst, int64_t dcs, void* user) {
+    Ds41XeImpl& im = *static_cast<Ds41XeTier*>(user)->im_;
+    if (!queue || ncols < 1 || ncols > 8 || im.cards.empty()) return false;
+    sycl::queue& q0 = *static_cast<sycl::queue*>(queue);
+    // a SYCL graph recording (GGML_SYCL_GRAPH_CACHE) would capture this queue's part only: the dense card computes it all
+    if (q0.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) { ++im.os_declined; return false; }
+    try {
+        auto it = im.osplits.find(wo_a);
+        if (it == im.osplits.end()) it = im.osplits.emplace(wo_a, osplit_init(im, q0, wo_a, sb, wo_b, OGD, OL, OG, D)).first;
+        Ds41XeImpl::OSplit& s = it->second;
+        if (!s.ok) { ++im.os_declined; return false; }
+        const int n = ncols;
+        const int64_t gp = s.g0[1], KB = OL * gp;
+        static const bool tp_prof = env_i("STRATA_TP_PROF", 0) != 0;
+        static double tpp[6] = {};   // lock, quant_x, cards (sum over cards), own quarter, sum, calls
+        double tq = tp_prof ? now_ms() : 0;
+        auto tick = [&](int k) { if (tp_prof) { const double t = now_ms(); tpp[k] += t - tq; tq = t; } };
+        std::lock_guard<PrioMutex> lk(g_submit);
+        tick(0);
+        const bool tl = Ds41XeTier::tl_on();
+        if (tl) tl_stamp(im, 0, q0, 5);
+        const sycl::event e0 = fastmv::quant_x(q0, o, ocs, OGD, n, OG, OGD, im.os_xq, im.os_xd);   // all groups
+        tick(1);
+        std::vector<sycl::event> ev;
+        static const bool rec = env_i("STRATA_TP_GRAPH", 1) != 0;
+        for (int i = 1; i < s.np; ++i) {
+            XeCard& c = *s.c[(size_t) i - 1];
+            const size_t r0 = (size_t) s.g0[i] * n;   // its groups' rows of the quantised o
+            int8_t* xq = s.xq[(size_t) i];
+            const int8_t* xq_src = im.os_xq + r0 * OGD;
+            // its copies of its groups' int8 o, both products, its partial sum to the dense card (the first copy waits
+            // for the dense card's quant_x unless recorded: a replay carries that dependency instead)
+            auto enqueue = [&](const sycl::event* dep) {
+                if (dep) c.q.submit([&](sycl::handler& h) { h.depends_on(*dep); h.memcpy(xq, xq_src, (size_t) gp * n * OGD); });
+                else c.q.memcpy(xq, xq_src, (size_t) gp * n * OGD);
+                c.q.memcpy(s.xd[(size_t) i], im.os_xd + r0 * (OGD / 32), (size_t) gp * n * (OGD / 32) * sizeof(float));
+                os_mv(c.q, s.wa[(size_t) i], OGD, OL, gp, sb, n, xq, s.xd[(size_t) i], s.oa[(size_t) i], KB, OL);
+                fastmv::quant_x(c.q, s.oa[(size_t) i], KB, KB, n, 1, KB, s.aq[(size_t) i], s.ad[(size_t) i]);
+                os_mv(c.q, s.wb[(size_t) i], KB, D, 1, 0, n, s.aq[(size_t) i], s.ad[(size_t) i], s.y[(size_t) i], D, D * n);
+                return c.q.memcpy(im.os_slots + (size_t) (i - 1) * 8 * D, s.y[(size_t) i], (size_t) n * D * sizeof(float));
+            };
+            if (rec) {
+                namespace sx = sycl::ext::oneapi::experimental;
+                auto& eg = s.g[(size_t) i][(size_t) n];
+                if (!eg) {
+                    sx::command_graph<sx::graph_state::modifiable> g(c.q.get_context(), c.q.get_device());
+                    g.begin_recording(c.q);
+                    enqueue(nullptr);
+                    g.end_recording();
+                    eg = std::make_shared<sx::command_graph<sx::graph_state::executable>>(g.finalize());
+                }
+                sx::command_graph<sx::graph_state::executable>& gr = *eg;
+                if (tl) tl_stamp(im, 1 + (size_t) c.idx, c.q, 20);
+                ev.push_back(c.q.submit([&](sycl::handler& h) { h.depends_on(e0); h.ext_oneapi_graph(gr); }));
+                if (tl) tl_stamp(im, 1 + (size_t) c.idx, c.q, 21);
+            } else {
+                if (tl) tl_stamp(im, 1 + (size_t) c.idx, c.q, 20);
+                ev.push_back(enqueue(&e0));
+                if (tl) tl_stamp(im, 1 + (size_t) c.idx, c.q, 21);
+            }
+        }
+        tick(2);
+        os_mv(q0, s.wa[0], OGD, OL, gp, sb, n, im.os_xq, im.os_xd, im.os_oa, KB, OL);   // its groups: o's first rows
+        fastmv::quant_x(q0, im.os_oa, KB, KB, n, 1, KB, im.os_aq, im.os_ad);
+        os_mv(q0, s.wb[0], KB, D, 1, 0, n, im.os_aq, im.os_ad, dst, dcs, dcs * n);
+        if (tl) tl_stamp(im, 0, q0, 6);
+        tick(3);
+        const float* sl = im.os_slots;
+        const int nparts = s.np - 1;
+        q0.submit([&](sycl::handler& h) {   // dst += the expert cards' partial sums
+            h.depends_on(ev);
+            h.parallel_for(sycl::range<1>((size_t) n * D), [=](sycl::id<1> id) {
+                const int64_t c = (int64_t) id[0] / D, r = (int64_t) id[0] % D;
+                float v = dst[c * dcs + r];
+                for (int k = 0; k < nparts; ++k) v += sl[(size_t) k * 8 * D + c * D + r];
+                dst[c * dcs + r] = v;
+            });
+        });
+        if (tl) tl_stamp(im, 0, q0, 7);
+        tick(4);
+        if (tp_prof && ++tpp[5] >= 1 && (long) tpp[5] % 4000 == 0)
+            std::fprintf(stderr, "xe tp prof (%.0f calls): host us a call - lock %.1f, quant_x %.1f, cards %.1f, own quarter %.1f, sum %.1f\n",
+                         tpp[5], 1e3 * tpp[0] / tpp[5], 1e3 * tpp[1] / tpp[5], 1e3 * tpp[2] / tpp[5], 1e3 * tpp[3] / tpp[5], 1e3 * tpp[4] / tpp[5]);
+        ++im.os_calls;
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xe tier: oproj split: %s\n", e.what());
+        return false;
+    }
+}
+
 void Ds41XeTier::arm(int64_t l, int nt) {
     Ds41XeImpl& im = *im_;
     disarm(im);   // an earlier arm nobody took
@@ -3024,6 +3271,9 @@ void Ds41XeTier::close() {
                      "%lld chunks, host push %.1f ms, poll %.1f ms\n", (long long) im.pc_done, (long long) im.pc_hit, (long long) im.pc_evicted,
                      (long long) im.pc_busy_skip, (long long) im.pc_bad, (long long) im.pc_chunks, im.pc_push_us / 1000.0, im.pc_poll_us / 1000.0);
     if (im.relq) { im.relq->wait(); im.relq.reset(); }
+    if (im.os_calls || im.os_declined)
+        std::fprintf(stderr, "xe tier: attention output split %lld calls (%zu layers), declined %lld\n", (long long) im.os_calls,
+                     im.osplits.size(), (long long) im.os_declined);
     if (im.arm_used || im.arm_disarmed)
         std::fprintf(stderr, "xe tier: armed card shares used %lld, disarmed calls %lld\n", (long long) im.arm_used,
                      (long long) im.arm_disarmed);
@@ -3052,7 +3302,7 @@ void Ds41XeTier::close() {
         c.flex = nullptr;
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY); fr(c.stream);
-        fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots); fr(c.rstage);
+        fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }
     }
     im.cards.clear();

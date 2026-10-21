@@ -174,6 +174,11 @@ struct Ds41Dense::Impl {
     ggml_tensor * comb_f = nullptr;       // [HC, HC, NC]
     ggml_tensor * shexp = nullptr;        // [D, NC]
     ggml_tensor * o_fn = nullptr;         // [D, NC]    ffn_norm activation (the routed experts' input)
+    // larry, STRATA_TP_OPROJ=2: between a decode layer's two attention halves (<= 8 columns) - the de-RoPEd attention
+    // output, the attention hc mixes (hc_fb's pre | post | comb planes) and the output projection
+    ggml_tensor * o_att = nullptr;        // [OGD * OG, <= 8]
+    ggml_tensor * o_mix = nullptr;        // [2 HC + HC * HC, <= 8]
+    ggml_tensor * o_proj = nullptr;       // [D, <= 8]
     ggml_tensor * o_ids = nullptr;        // I32 [NU, NC]
     ggml_tensor * o_wts = nullptr;        // [NU, NC]
     ggml_tensor * routed = nullptr;       // [D, NC]
@@ -294,6 +299,7 @@ struct Ds41Dense::Impl {
     std::mutex * sub_mu = nullptr;            // larry: set_submit_lock
     bool fn_host = true;                      // larry: set_fn_host
     std::function<void(int, int)> pre_wait;   // larry: set_pre_wait_hook
+    std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> oproj_hook;   // larry
     std::atomic<int> * sub_prio = nullptr;    // larry: raised while waiting for sub_mu (the tier's threads hold off)
     ggml_backend_event_t rb_ev = nullptr;   // larry: the router readbacks' event (async decode / verify layers)
     // larry: a decode / verify pass's inputs go up through a pinned staging buffer with async copies (each
@@ -678,7 +684,7 @@ static ggml_tensor * shexp_ffn(Ds41Dense::Impl & im, ggml_context * gc, int il, 
 // with_shexp = false (larry, decode): the shared expert is left out; attn_router runs it as its own graph (build_shexp)
 // after the router readback, so the dense card computes it while the expert cards compute the routed experts
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0,
-                                bool with_shexp = true, int64_t max_nodes = 8192) {
+                                bool with_shexp = true, int64_t max_nodes = 8192, bool dec = false, int part = 0) {
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
     const Ds41Geometry & G = im.g;
@@ -688,10 +694,24 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     const int64_t r = L.ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     std::vector<ggml_tensor *> outs, late;    // late: ring / state write-backs, after every read
+    // larry, STRATA_TP_OPROJ=2 (decode widths, fused hc): part 1 ends with the de-RoPEd attention output and the attention
+    // hc mixes in o_att / o_mix (every ring / state write-back with it: no read of them follows); the projection runs
+    // between the two graphs; part 2 starts from o_proj.  Part 0: the whole layer.
+    ggml_tensor * x = nullptr, * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr, * attn = nullptr, * fb_a = nullptr;
+    const bool hcf = b.hc_fused(n);
+    GGML_ASSERT(part == 0 || (hcf && col0 == 0 && n <= im.o_att->ne[1]));
+    if (part == 2) {
+        x = b.cols3(im.x_state, D, HC, n, col0);
+        ggml_tensor * mx = ggml_view_1d(gc, im.o_mix, (2 * HC + HC * HC) * n, 0);
+        a_pre = ggml_view_2d(gc, mx, HC, n, (size_t) HC * 4, 0);
+        a_post = ggml_view_2d(gc, mx, HC, n, (size_t) HC * 4, (size_t) (HC * n) * 4);
+        a_comb = ggml_view_3d(gc, mx, HC, HC, n, (size_t) HC * 4, (size_t) (HC * HC) * 4, (size_t) (2 * HC * n) * 4);
+        attn = b.cols2(im.o_proj, D, n, 0);
+    } else {
     ggml_tensor * pos = b.v1(im.i_pos, n, (size_t) col0 * 4);
 
     // ---- Engram (model.py Engram.forward), before the block, on the hc state
-    ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
+    x = b.cols3(im.x_state, D, HC, n, col0);
     if (L.eslot >= 0 && im.engram.enabled()) {
         ggml_tensor * rows = b.cols2(im.i_eng[L.eslot], im.EC * im.ED, n, col0);
         ggml_tensor * kv = ggml_mul_mat(gc, im.BL(il, "engram_kv.weight"), rows);          // [(HC+1) D, n]
@@ -711,13 +731,13 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
 
     // ---- attention hc: mixes of the block input; its pre-mix is the previous FFN's (pre_state)
-    ggml_tensor * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr, * xn = nullptr;
-    const bool hcf = b.hc_fused(n);
+    ggml_tensor * xn = nullptr;
     if (hcf) {
         ggml_tensor * fa = ggml_dsv41_hc_fa(gc, x, im.BL(il, "hc_attn_fn.weight"), b.cols2(im.pre_state, HC, n, col0),
                                             nullptr, nullptr, nullptr);
         ggml_tensor * fb = ggml_dsv41_hc_fb(gc, fa, im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
                                             im.BL(il, "attn_norm.weight"), (float) G.rms_eps, (float) G.hc_eps, (int) G.hc_iters);
+        fb_a = fb;
         b.hc_fb_views(fb, n, &xn, &a_pre, &a_post, &a_comb);
     } else {
         b.hc_mixes(x, im.BL(il, "hc_attn_fn.weight"), im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
@@ -896,11 +916,27 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     o = ggml_reshape_3d(gc, o, DH, NH, n);
     o = b.rope(o, pos, r, true);                                                               // de-RoPE the output
-    // grouped output LoRA (model.py: einsum over groups) then wo_b
-    o = ggml_permute(gc, ggml_reshape_3d(gc, o, im.OGD, im.OG, n), 0, 2, 1, 3);               // [OGD, n, OG]
+    if (part == 1) {
+        outs.push_back(ggml_cpy(gc, o, b.cols2(im.o_att, im.OGD * im.OG, n, 0)));
+        outs.push_back(ggml_cpy(gc, ggml_view_1d(gc, fb_a, (2 * HC + HC * HC) * n, (size_t) (D * n) * 4),
+                                ggml_view_1d(gc, im.o_mix, (2 * HC + HC * HC) * n, 0)));
+        for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
+        for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
+        return gf;
+    }
     ggml_tensor * wo_a = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.weight"), im.OGD, im.OL, im.OG);
-    ggml_tensor * oa = ggml_permute(gc, ggml_mul_mat(gc, wo_a, o), 0, 2, 1, 3);              // [OL, OG, n]
-    ggml_tensor * attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
+    // larry, STRATA_TP_OPROJ=1 (decode / verify graphs): wo_a and wo_b as one op that ggml-sycl hands to the xe tier, which
+    // splits wo_a's head groups (and wo_b's matching columns) over the four cards and adds the partial sums on this one
+    static const int tp_oproj = std::getenv("STRATA_TP_OPROJ") ? std::atoi(std::getenv("STRATA_TP_OPROJ")) : 0;
+    if (dec && tp_oproj == 1 && im.sycl && n <= 8) {
+        attn = ggml_dsv41_oproj(gc, o, wo_a, im.BL(il, "attn_output_b.weight"));                  // [D, n]
+    } else {
+        // grouped output LoRA (model.py: einsum over groups) then wo_b
+        o = ggml_permute(gc, ggml_reshape_3d(gc, o, im.OGD, im.OG, n), 0, 2, 1, 3);           // [OGD, n, OG]
+        ggml_tensor * oa = ggml_permute(gc, ggml_mul_mat(gc, wo_a, o), 0, 2, 1, 3);          // [OL, OG, n]
+        attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
+    }
+    }   // part != 2
 
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
     ggml_tensor * h = nullptr, * fn = nullptr;                                              // [D, HC, n], [D, n]
@@ -1243,6 +1279,12 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.comb_f = ggml_new_tensor_3d(c, GGML_TYPE_F32, HC, HC, NC);
     im.shexp = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
     im.o_fn = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    {
+        const int64_t NO = std::min<int64_t>(NC, 8);
+        im.o_att = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.OGD * im.OG, NO);
+        im.o_mix = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2 * HC + HC * HC, NO);
+        im.o_proj = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NO);
+    }
     im.o_ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
     im.o_wts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
     im.routed = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
@@ -1965,6 +2007,9 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
 }
 
 void Ds41Dense::set_pre_wait_hook(std::function<void(int, int)> h) { p_->pre_wait = std::move(h); }
+void Ds41Dense::set_oproj_hook(std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> h) {
+    p_->oproj_hook = std::move(h);
+}
 void Ds41Dense::set_submit_lock(std::mutex * m, std::atomic<int> * prio) { p_->sub_mu = m; p_->sub_prio = m ? prio : nullptr; }
 
 bool Ds41Dense::upload_routed(const float * routed_host, int B) {
@@ -2035,17 +2080,31 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const bool cached = n == 1 || (pass_cache && n <= 8);
     // larry: decode runs the shared expert as its own graph after the readback (STRATA_SHEXP_INLINE=1: in the attention graph)
     static const bool split_shexp = std::getenv("STRATA_SHEXP_INLINE") == nullptr;
-    if (cached) {
+    // larry, STRATA_TP_OPROJ=2: the kept graph in two halves, the output projection queued between them (oproj_hook)
+    static const int tp_mode = std::getenv("STRATA_TP_OPROJ") ? std::atoi(std::getenv("STRATA_TP_OPROJ")) : 0;
+    static const bool hc_fuse = env_on("STRATA_HC_FUSE", true);
+    static const int64_t hc_maxn = std::getenv("STRATA_HC_FUSE_MAXN") ? std::atoll(std::getenv("STRATA_HC_FUSE_MAXN")) : 8;
+    const bool halves = cached && tp_mode == 2 && im.sycl && im.oproj_hook && hc_fuse && n <= hc_maxn && n <= im.o_att->ne[1];
+    ggml_cgraph * gf2 = nullptr;
+    if (halves) {
+        const Impl::GKey ka { il, 11, cap, (int64_t) n }, kb { il, 12, cap, (int64_t) n };
+        auto ia = im.graphs.find(ka);
+        if (ia == im.graphs.end()) ia = im.graphs.emplace(ka, build_attn(im, im.gctx, il, n, 0, !split_shexp, 2048, true, 1)).first;
+        auto ib = im.graphs.find(kb);
+        if (ib == im.graphs.end()) ib = im.graphs.emplace(kb, build_attn(im, im.gctx, il, n, 0, !split_shexp, 2048, true, 2)).first;
+        gf = ia->second;
+        gf2 = ib->second;
+    } else if (cached) {
         const Impl::GKey key { il, 1, cap, (int64_t) n };
         auto it = im.graphs.find(key);
         // a kept graph is a few hundred nodes: room for 2048 (the gctx holds hundreds of them: layers x caps x widths)
-        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n, 0, !split_shexp, 2048)).first;
+        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n, 0, !split_shexp, 2048, true)).first;
         gf = it->second;
     } else {
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
         ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
         gc = ggml_init(p);
-        gf = build_attn(im, gc, il, n);
+        gf = build_attn(im, gc, il, n, 0, true, 8192, true);
     }
     // async (kept graphs): the readbacks get their own event and the shared expert is queued BEFORE the host waits,
     // so the host's wait ends when the router's rows land, not when this card is idle
@@ -2055,7 +2114,13 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const int tlo = n == 1 ? 0 : 8;   // timeline ids: decode 0.., verify passes 8..
     if (tl) ds41_dense_tl_hook(tlo + 0);
     const double tp0 = g_decprof_on ? dprof_now() : 0;
-    const bool ok = im.compute(gf, cached, async);
+    bool ok = im.compute(gf, cached, async);
+    if (ok && gf2) {
+        ok = im.oproj_hook(il, (int) n, im.BL(il, "attn_output_a.weight"), im.BL(il, "attn_output_b.weight"),
+                           (const float *) im.o_att->data, (float *) im.o_proj->data);
+        if (!ok) im.err = "attention output projection failed";
+        ok = ok && im.compute(gf2, cached, async);
+    }
     if (gc) ggml_free(gc);
     if (!ok) return false;
     const double tp1 = g_decprof_on ? dprof_now() : 0;

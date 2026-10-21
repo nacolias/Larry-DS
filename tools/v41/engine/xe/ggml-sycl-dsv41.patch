@@ -1,7 +1,7 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -587,6 +587,13 @@
+@@ -587,6 +587,14 @@
          GGML_OP_DSV4_HC_POST,
          GGML_OP_DSV41_FAKE_QUANT,
          GGML_OP_DSV41_HC_MIXES,
@@ -12,10 +12,11 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +        GGML_OP_DSV41_HC_POST2,
 +        GGML_OP_DSV41_HC_FA,
 +        GGML_OP_DSV41_HC_FB,
++        GGML_OP_DSV41_OPROJ,
  
          GGML_OP_UNARY,
  
-@@ -2751,6 +2758,95 @@
+@@ -2751,6 +2759,104 @@
              struct ggml_tensor  * base,
              float                 eps);
  
@@ -67,6 +68,15 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +            struct ggml_tensor  * y,
 +            float                 lim);
 +
++    // larry: DeepSeek-V4.1's attention output at decode widths as one op: dst[D, n] = wo_b @ concat_g(wo_a[g] @ o[g]),
++    // o: f32 contiguous, OGD * OG values a column (a group's heads adjacent); wo_a: the 3-D view [OGD, OL, OG]; wo_b:
++    // [OL * OG, D].  ggml-sycl only (an external launcher may take it: ggml_backend_sycl_set_oproj_hook).
++    GGML_API struct ggml_tensor * ggml_dsv41_oproj(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * o,
++            struct ggml_tensor  * wo_a,
++            struct ggml_tensor  * wo_b);
++
 +    // larry: DeepSeek-V4.1's hyper-connection steps fused for decode widths (ggml-sycl kernels, CPU references).
 +    // hc_post2: dst = hc_post(a + b, res, post, comb) written straight into dst (the result is a view of dst, as with
 +    // ggml_cpy).  a, b F32 [D, n] (b may be NULL), res F32 [D, hc, n], post F32 [hc, n], comb F32 [hc(dst), hc(src), n],
@@ -114,7 +124,7 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 --- a/ggml/include/ggml-sycl.h
 +++ b/ggml/include/ggml-sycl.h
-@@ -21,6 +21,23 @@
+@@ -21,6 +21,37 @@
  
  GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
  
@@ -132,6 +142,20 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 +// decode's mat-vec and the prompt's per-slice GEMM read - instead of by the first decode-shaped product
 +GGML_BACKEND_API bool ggml_backend_sycl_prereorder_slices(ggml_backend_t backend, struct ggml_tensor * t, int64_t n_slices);
 +GGML_BACKEND_API void ggml_backend_sycl_set_mv_hook(ggml_sycl_larry_mv_hook_t fn, void * user, double min_mb);
++// larry: an external launcher for GGML_OP_DSV41_OPROJ (DeepSeek-V4.1's attention output, <= 8 columns): the backend's
++// queue, wo_a's per-slice planar Q6_K (OG slices of OL rows x OGD, slice stride in bytes), wo_b's planar Q6_K (D rows
++// x OL * OG), o (f32, ncols columns of OGD * OG, column stride in floats) and dst (column stride in floats).  True if it
++// queued the whole product, ordered on that queue.
++typedef bool (*ggml_sycl_larry_oproj_hook_t)(void * queue, const void * wo_a, size_t wo_a_slice_bytes, const void * wo_b,
++                                             int64_t OGD, int64_t OL, int64_t OG, int64_t D, int ncols, const float * o,
++                                             int64_t o_col_stride, float * dst, int64_t dst_col_stride, void * user);
++GGML_BACKEND_API void ggml_backend_sycl_set_oproj_hook(ggml_sycl_larry_oproj_hook_t fn, void * user);
++// larry: DSV41_OPROJ outside a graph (STRATA_TP_OPROJ=2: the decode attention graph in two halves around it) - wo_a the
++// 2-D weight read as OG slices of OL rows, o / dst device pointers of n columns (OGD * OG floats apart / dst_col_stride
++// floats apart).  Ordered on the backend's queue (the launcher above if it takes it); false if the shape is not covered.
++GGML_BACKEND_API bool ggml_backend_sycl_oproj(ggml_backend_t backend, const struct ggml_tensor * wo_a, int64_t OGD, int64_t OL,
++                                              int64_t OG, const struct ggml_tensor * wo_b, const float * o, int64_t n,
++                                              float * dst, int64_t dst_col_stride);
 +// larry: free the fp16 weight copies the prompt GEMMs keep (GGML_SYCL_LARRY_F16CACHE_MB) - their VRAM back for decode
 +GGML_BACKEND_API void ggml_backend_sycl_larry_f16cache_release(void);
 +
@@ -141,7 +165,7 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1086,6 +1086,13 @@
+@@ -1086,6 +1086,14 @@
      "DSV4_HC_POST",
      "DSV41_FAKE_QUANT",
      "DSV41_HC_MIXES",
@@ -152,19 +176,20 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    "DSV41_HC_POST2",
 +    "DSV41_HC_FA",
 +    "DSV41_HC_FB",
++    "DSV41_OPROJ",
  
      "UNARY",
  
-@@ -1103,7 +1110,7 @@
+@@ -1103,7 +1111,7 @@
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
++static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1203,6 +1210,13 @@
+@@ -1203,6 +1211,14 @@
      "dsv4_hc_post(x, residual, post, comb)",
      "dsv41_fake_quant(x)",
      "dsv41_hc_mixes(mixes, scale, base)",
@@ -175,19 +200,20 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    "dsv41_hc_post2(a, b, res, post, comb)",
 +    "dsv41_hc_fa(x, fn, pre, y, post, comb)",
 +    "dsv41_hc_fb(fa, scale, base, w)",
++    "dsv41_oproj(o, wo_a, wo_b)",
  
      "unary(x)",
  
-@@ -1220,7 +1234,7 @@
+@@ -1220,7 +1236,7 @@
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
++static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -6588,6 +6602,198 @@
+@@ -6588,6 +6604,215 @@
      return result;
  }
  
@@ -292,6 +318,23 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    return result;
 +}
 +
++struct ggml_tensor * ggml_dsv41_oproj(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * o,
++        struct ggml_tensor  * wo_a,
++        struct ggml_tensor  * wo_b) {
++    GGML_ASSERT(o->type == GGML_TYPE_F32 && ggml_is_contiguous(o));
++    const int64_t OGD = wo_a->ne[0], OL = wo_a->ne[1], OG = wo_a->ne[2];
++    GGML_ASSERT(wo_b->ne[0] == OL * OG && ggml_nelements(o) % (OGD * OG) == 0);
++    const int64_t n = ggml_nelements(o) / (OGD * OG);
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, wo_b->ne[1], n);
++    result->op     = GGML_OP_DSV41_OPROJ;
++    result->src[0] = o;
++    result->src[1] = wo_a;
++    result->src[2] = wo_b;
++    return result;
++}
++
 +struct ggml_tensor * ggml_dsv41_hc_post2(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * a,
@@ -389,7 +432,7 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2117,6 +2117,34 @@
+@@ -2117,6 +2117,38 @@
              {
                  ggml_compute_forward_dsv41_hc_mixes(params, tensor);
              } break;
@@ -409,6 +452,10 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 +            {
 +                ggml_compute_forward_dsv41_swiglu_lim(params, tensor);
 +            } break;
++        case GGML_OP_DSV41_OPROJ:
++            {
++                GGML_ABORT("DSV41_OPROJ is a ggml-sycl op (no CPU implementation)");
++            } break;
 +        case GGML_OP_DSV41_HC_POST2:
 +            {
 +                ggml_compute_forward_dsv41_hc_post2(params, tensor);
@@ -424,7 +471,7 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2305,6 +2333,22 @@
+@@ -2305,6 +2337,23 @@
              {
                  n_tasks = n_threads;
              } break;
@@ -435,6 +482,7 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 +        case GGML_OP_DSV41_HC_POST2:
 +        case GGML_OP_DSV41_HC_FA:
 +        case GGML_OP_DSV41_HC_FB:
++        case GGML_OP_DSV41_OPROJ:
 +            {
 +                n_tasks = 1;
 +            } break;
@@ -3151,7 +3199,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4921,279 @@
+@@ -4734,6 +4921,342 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -3231,6 +3279,11 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +static double g_larry_mv_mb = 0.0;
 +void ggml_backend_sycl_set_mv_hook(ggml_sycl_larry_mv_hook_t fn, void * user, double min_mb) {
 +    g_larry_mv_hook = fn; g_larry_mv_user = user; g_larry_mv_mb = min_mb;
++}
++static ggml_sycl_larry_oproj_hook_t g_larry_oproj_hook = nullptr;
++static void * g_larry_oproj_user = nullptr;
++void ggml_backend_sycl_set_oproj_hook(ggml_sycl_larry_oproj_hook_t fn, void * user) {
++    g_larry_oproj_hook = fn; g_larry_oproj_user = user;
 +}
 +
 +struct larry_qcache {
@@ -3428,10 +3481,68 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    return fastmv::launch(*ctx.stream(), t, a);
 +}
 +
++// larry: GGML_OP_DSV41_OPROJ - the attention output's two products at decode widths: the external launcher (the xe
++// tier's four-card split) when one is set and takes it, else this card alone with the kernels the two mul_mats ran
++// (quant_x + fastmv Q6K_R8 for wo_a's slices and for wo_b: the same numbers)
++// wa: wo_a's 2-D weight (its slices: sb bytes apart); x / y: n columns (OGD * OG / y_cs floats apart)
++static bool larry_oproj_core(ggml_backend_sycl_context & ctx, const ggml_tensor * wa, size_t sb, int64_t OGD, int64_t OL,
++                             int64_t OG, const ggml_tensor * wb, const float * x, int64_t n, float * y, int64_t y_cs) {
++    const int64_t D = wb->ne[1], KA = OL * OG;
++    if (n < 1 || n > 8 || wa->type != GGML_TYPE_Q6_K || wb->type != GGML_TYPE_Q6_K || OGD % QK_K || KA % QK_K) return false;
++    queue_ptr st = ctx.stream();
++    if (!g_larry_slice_planar.count(wa->data)) {   // wo_a per slice (STRATA_PREREORDER_SLICES did it at load), once
++        if (!reorder_qw_q6_k_moe((uint8_t *) wa->data, sb, OG, st)) return false;
++        g_larry_slice_planar.insert(wa->data);
++    }
++    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(wb->extra);
++    if (!extra) return false;
++    if (!extra->optimized_feature.reorder) {   // wo_b whole (STRATA_PREREORDER did it at load), once
++        if (!reorder_qw(wb, st)) return false;
++        extra->optimized_feature.reorder = true;
++    }
++    if (g_larry_oproj_hook &&
++        g_larry_oproj_hook(st, wa->data, sb, wb->data, OGD, OL, OG, D, (int) n, x, OGD * OG, y, y_cs, g_larry_oproj_user))
++        return true;
++    ggml_sycl_pool_alloc<int8_t> xq(ctx.pool(), (size_t) (OG * n * OGD));
++    ggml_sycl_pool_alloc<float> xd(ctx.pool(), (size_t) (OG * n * OGD / 32));
++    ggml_sycl_pool_alloc<float> oa(ctx.pool(), (size_t) (KA * n));
++    ggml_sycl_pool_alloc<int8_t> aq(ctx.pool(), (size_t) (KA * n));
++    ggml_sycl_pool_alloc<float> ad(ctx.pool(), (size_t) (KA * n / 32));
++    fastmv::quant_x(*st, x, OGD * OG, OGD, (int) n, OG, OGD, xq.get(), xd.get());
++    fastmv::Args a;   // wo_a: slice g of o's column c -> oa[c * KA + g * OL + r] (wo_b's input column)
++    a.w = wa->data; a.K = OGD; a.N = OL; a.G = OG; a.g_div = 1;
++    a.n_blocks_total = OL * (OGD / QK_K); a.w_batch_bytes = wa->nb[2];
++    a.x = x; a.x_col_stride = OGD * OG; a.x_batch_stride = OGD;
++    a.y = oa.get(); a.y_col_stride = KA; a.y_batch_stride = OL;
++    a.ncols = (int) n; a.xq = xq.get(); a.xd = xd.get();
++    if (!fastmv::launch(*st, fastmv::WType::Q6K_R8, a)) return false;
++    fastmv::quant_x(*st, oa.get(), KA, KA, (int) n, 1, KA, aq.get(), ad.get());
++    fastmv::Args b;
++    b.w = wb->data; b.K = KA; b.N = D; b.G = 1; b.g_div = 1;
++    b.n_blocks_total = D * (KA / QK_K); b.w_batch_bytes = 0;
++    b.x = oa.get(); b.x_col_stride = KA; b.x_batch_stride = KA;
++    b.y = y; b.y_col_stride = y_cs; b.y_batch_stride = y_cs * n;
++    b.ncols = (int) n; b.xq = aq.get(); b.xd = ad.get();
++    return fastmv::launch(*st, fastmv::WType::Q6K_R8, b);
++}
++
++static bool larry_oproj(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * wa = dst->src[1];   // the 3-D view: its parent holds the slices
++    return larry_oproj_core(ctx, wa->view_src ? wa->view_src : wa, wa->nb[2], wa->ne[0], wa->ne[1], wa->ne[2], dst->src[2],
++                            (const float *) dst->src[0]->data, dst->ne[1], (float *) dst->data, (int64_t) (dst->nb[1] / 4));
++}
++
++bool ggml_backend_sycl_oproj(ggml_backend_t backend, const ggml_tensor * wo_a, int64_t OGD, int64_t OL, int64_t OG,
++                             const ggml_tensor * wo_b, const float * o, int64_t n, float * dst, int64_t dst_col_stride) {
++    if (!backend || !wo_a || !wo_b || wo_a->ne[0] != OGD || wo_a->ne[1] != OL * OG) return false;
++    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
++    return larry_oproj_core(*ctx, wo_a, (size_t) OL * wo_a->nb[1], OGD, OL, OG, wo_b, o, n, dst, dst_col_stride);
++}
++
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +5207,9 @@
+@@ -4747,6 +5270,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -3441,7 +3552,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5114,6 +5577,108 @@
+@@ -5114,6 +5640,108 @@
      }
  }
  
@@ -3550,7 +3661,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5134,6 +5699,48 @@
+@@ -5134,6 +5762,48 @@
              return;
          }
      }
@@ -3599,7 +3710,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +6041,33 @@
+@@ -5434,6 +6104,36 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -3630,10 +3741,13 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +        case GGML_OP_DSV41_HC_FB:
 +            ggml_sycl_op_dsv41_hc_fb(ctx, dst);
 +            break;
++        case GGML_OP_DSV41_OPROJ:
++            if (!larry_oproj(ctx, dst)) GGML_ABORT("DSV41_OPROJ: shape or layout not covered");
++            break;
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6610,33 @@
+@@ -5976,6 +6676,33 @@
      return skip;
  }
  
@@ -3667,7 +3781,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6727,29 @@
+@@ -6066,6 +6793,29 @@
              continue;
          }
  
@@ -3697,7 +3811,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6803,64 @@
+@@ -6119,6 +6869,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -3762,7 +3876,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +6971,12 @@
+@@ -6229,6 +7037,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -3775,7 +3889,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7217,24 @@
+@@ -6469,6 +7283,26 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -3797,6 +3911,8 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +        case GGML_OP_DSV41_HC_FA:
 +        case GGML_OP_DSV41_HC_FB:
 +            return true;
++        case GGML_OP_DSV41_OPROJ:
++            return op->src[1]->type == GGML_TYPE_Q6_K && op->src[2]->type == GGML_TYPE_Q6_K && op->ne[1] <= 8;
          case GGML_OP_LIGHTNING_INDEXER:
              return op->src[0]->type == GGML_TYPE_F32 &&
                  (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
