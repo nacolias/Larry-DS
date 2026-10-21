@@ -2753,7 +2753,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4753,185 @@
+@@ -4734,6 +4753,195 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -2820,7 +2820,12 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    float * xd = nullptr;
 +    size_t cap = 0;   // int8 elements
 +};
-+static std::unordered_map<const void *, larry_qcache> g_larry_qcache;
++// four entries a context, replaced round-robin
++struct larry_qcache_set {
++    larry_qcache e[4];
++    int next = 0;
++};
++static std::unordered_map<const void *, larry_qcache_set> g_larry_qcache;
 +static uint64_t g_larry_graph_epoch = 1;
 +
 +static bool larry_fastmv(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -2900,10 +2905,15 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    a.ncols = (int) ncols;
 +    static const int qreuse = ggml_sycl_get_env("GGML_SYCL_LARRY_QREUSE", 1);
 +    if (t == fastmv::WType::Q6K_R8 && qreuse) {
-+        larry_qcache & qc = g_larry_qcache[&ctx];
++        larry_qcache_set & qs = g_larry_qcache[&ctx];
 +        const size_t need = (size_t) G * ncols * K;
-+        const bool hit = qc.epoch == g_larry_graph_epoch && qc.t == src1 && qc.data == src1->data && qc.K == K &&
-+                         qc.ncols == ncols && qc.G == G && qc.xc == a.x_col_stride && qc.xb == a.x_batch_stride;
++        larry_qcache * found = nullptr;
++        for (larry_qcache & e : qs.e)
++            if (e.epoch == g_larry_graph_epoch && e.t == src1 && e.data == src1->data && e.K == K && e.ncols == ncols &&
++                e.G == G && e.xc == a.x_col_stride && e.xb == a.x_batch_stride) { found = &e; break; }
++        const bool hit = found != nullptr;
++        if (!hit) { found = &qs.e[qs.next]; qs.next = (qs.next + 1) % 4; }
++        larry_qcache & qc = *found;
 +        if (!hit) {
 +            if (need > qc.cap) {   // grows a few times early on: queued kernels may still read the old buffer
 +                ctx.stream()->wait();
@@ -2939,7 +2949,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +4945,9 @@
+@@ -4747,6 +4955,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -2949,7 +2959,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5134,6 +5335,22 @@
+@@ -5134,6 +5345,22 @@
              return;
          }
      }
@@ -2972,7 +2982,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +5651,33 @@
+@@ -5434,6 +5661,33 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -3006,7 +3016,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6220,33 @@
+@@ -5976,6 +6230,33 @@
      return skip;
  }
  
@@ -3040,7 +3050,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6337,29 @@
+@@ -6066,6 +6347,29 @@
              continue;
          }
  
@@ -3070,7 +3080,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6413,64 @@
+@@ -6119,6 +6423,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -3135,7 +3145,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +6581,12 @@
+@@ -6229,6 +6591,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -3148,7 +3158,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +6827,24 @@
+@@ -6469,6 +6837,24 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

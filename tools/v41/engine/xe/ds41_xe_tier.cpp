@@ -217,6 +217,9 @@ struct Ds41XeImpl {
     std::vector<long> tl_chunk_n, tl_chunk_late;         // ... how many, how many ended after the next readback
     std::vector<long> tl_cn;
     long tl_tokens = 0;
+    std::vector<double> tl_copy_lag, tl_copy_sum; std::vector<long> tl_copy_n;   // per card: end -> copy done -> sum
+    std::vector<std::pair<double, double>> tl_hmark;   // decode calls: host us at the tier's entry, at the sum's submit
+    double tl_h_entry = 0, tl_h_sum = 0; long tl_h_n = 0;
     Ds41MoeGeom g;
     Ds41MoeConfig cfg;
     Ds41BlobSource* blobs = nullptr;
@@ -1069,9 +1072,16 @@ void Ds41XeTier::tl_flush() {
         ++im.tl_n[a][b];
     }
     d.done = dn;
+    for (const auto& hm : im.tl_hmark) {   // the readback stamp (1) each decode call follows
+        auto lb = std::upper_bound(t1.begin(), t1.end(), hm.first);
+        if (lb == t1.begin()) continue;
+        im.tl_h_entry += hm.first - *(lb - 1); im.tl_h_sum += hm.second - *(lb - 1); ++im.tl_h_n;
+    }
+    im.tl_hmark.clear();
     const size_t NC = im.tl_rings.size() - 1;
     im.tl_cbusy.resize(NC, 0.0); im.tl_clag.resize(NC, 0.0); im.tl_csum_lag.resize(NC, 0.0); im.tl_cn.resize(NC, 0);
     im.tl_chunk.resize(NC, 0.0); im.tl_chunk_max.resize(NC, 0.0); im.tl_chunk_n.resize(NC, 0); im.tl_chunk_late.resize(NC, 0);
+    im.tl_copy_lag.resize(NC, 0.0); im.tl_copy_sum.resize(NC, 0.0); im.tl_copy_n.resize(NC, 0);
     for (size_t c = 0; c < NC; ++c) {
         Ds41XeImpl::TlRing& r = *im.tl_rings[1 + c];
         const uint32_t rn = r.seen.load(std::memory_order_acquire);
@@ -1083,6 +1093,12 @@ void Ds41XeTier::tl_flush() {
                 ++im.tl_chunk_n[c];
                 auto nb = std::upper_bound(t1.begin(), t1.end(), ts);   // the next readback after its start
                 if (nb != t1.end() && te > *nb) ++im.tl_chunk_late[c];
+                continue;
+            }
+            if (r.id[k % C] == 11 && r.id[(k + 1) % C] == 14) {   // end -> copy done; copy done -> the next sum
+                const double te = r.t[k % C], tc = r.t[(k + 1) % C];
+                auto ub = std::lower_bound(t3.begin(), t3.end(), tc);
+                if (ub != t3.end()) { im.tl_copy_lag[c] += tc - te; im.tl_copy_sum[c] += *ub - tc; ++im.tl_copy_n[c]; }
                 continue;
             }
             if (r.id[k % C] != 10 || r.id[(k + 1) % C] != 11) continue;
@@ -1105,10 +1121,16 @@ void tl_print(Ds41XeImpl& im) {
     for (int a = 0; a < 16; ++a)
         for (int b = 0; b < 16; ++b)
             if (im.tl_n[a][b]) std::fprintf(stderr, " %d->%d %.1f (x%ld)", a, b, im.tl_sum[a][b] / im.tl_n[a][b], im.tl_n[a][b]);
+    if (im.tl_h_n) std::fprintf(stderr, "; host after readback: tier entry %.1f us, sum submitted %.1f us (x%ld)",
+                                im.tl_h_entry / im.tl_h_n, im.tl_h_sum / im.tl_h_n, im.tl_h_n);
     std::fprintf(stderr, "; cards [readback->start, start->end, end->sum]:");
     for (size_t c = 0; c < NC; ++c)
         if (im.tl_cn[c]) std::fprintf(stderr, " %zu: %.1f %.1f %.1f (x%ld)", c, im.tl_clag[c] / im.tl_cn[c], im.tl_cbusy[c] / im.tl_cn[c],
                                       im.tl_csum_lag[c] / im.tl_cn[c], im.tl_cn[c]);
+    for (size_t c = 0; c < NC; ++c)
+        if (c < im.tl_copy_n.size() && im.tl_copy_n[c])
+            std::fprintf(stderr, "; card %zu end->copy done %.1f us, copy done->sum %.1f us (x%ld)", c,
+                         im.tl_copy_lag[c] / im.tl_copy_n[c], im.tl_copy_sum[c] / im.tl_copy_n[c], im.tl_copy_n[c]);
     for (size_t c = 0; c < NC; ++c)
         if (c < im.tl_chunk_n.size() && im.tl_chunk_n[c])
             std::fprintf(stderr, "; card %zu promotion chunks %.1f us (max %.0f, x%ld, %ld past the next readback)", c,
@@ -1525,6 +1547,7 @@ void pc_drop(Ds41XeImpl& im) {
 /// One decode / verify call: nt <= 8 tokens.  out_host (nt x n_embd) or out_dev (the dense card) gets the sum.
 bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const float* w, const float* x, float* out_host,
                void* out_dev) {
+    const double tl_h0 = Ds41XeTier::tl_on() && nt == 1 ? tl_now_us() : 0;
     const int64_t H = im.g.n_embd;
     const int K = (int) im.g.top_k;
     const double t0 = now_ms();
@@ -1749,6 +1772,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
                 const bool on_dense = (u < (int) NC && im.cards[(size_t) u]->dense) || !im.host_slots;
                 src.p[k] = on_dense ? slots + (size_t) u * stride : u == (int) NC ? im.hsum : im.hslots + (size_t) u * stride;
             }
+            if (Ds41XeTier::tl_on() && nt == 1 && im.dense_q) tl_stamp(im, 0, qd, 15);   // the dense queue is free
             sycl::event ev = qd.submit([&](sycl::handler& h) {
                 h.depends_on(deps);
                 h.parallel_for(sycl::range<1>(n_out), [=](sycl::id<1> i) {
@@ -1761,6 +1785,7 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             if (im.host_slots && !cpu_list.empty()) im.hsum_ev = ev;   // hsum is read in place: its next write waits for this
         }
         if (Ds41XeTier::tl_on() && im.dense_q) tl_stamp(im, 0, *im.dense_q, nt == 1 ? 3 : 11);
+        if (tl_h0 > 0) im.tl_hmark.emplace_back(tl_h0, tl_now_us());
         if (im.pc_mode > 0 && !im.pc_jobs.empty()) {   // promotions: behind this call's card work
             const double tq = now_ms();
             pc_poll(im, true);
@@ -2774,6 +2799,7 @@ void Ds41XeTier::arm(int64_t l, int nt) {
         card_experts(im, c, ng, nt, mv, xoff, c.OUT, im.arm_x);
         if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 11);
         c.arm_ev = c.q.memcpy(slots + (size_t) c.idx * kMaxJobTok * H, c.OUT, (size_t) nt * H * 4);
+        if (Ds41XeTier::tl_on() && nt == 1) tl_stamp(im, 1 + (size_t) c.idx, c.q, 14);   // its copy is done
         c.armed = true;
         c.arm_ng = ng;
     }
