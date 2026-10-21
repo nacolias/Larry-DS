@@ -2839,7 +2839,118 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
          ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
          if (src1->type != GGML_TYPE_F16) {
-@@ -4667,6 +4745,18 @@
+@@ -3144,6 +3222,84 @@
+     }
+ }
+ 
++// larry, GGML_SYCL_LARRY_ARGMAX: rows of >= 16384 values, <= 64 rows - NC chunks a row (256 lanes each), then a
++// reduction of the chunks; (v1, i1) beats (v2, i2) iff v1 > v2 or (v1 == v2 and i1 < i2)
++static bool larry_argmax(ggml_backend_sycl_context & ctx, const float * x, int32_t * dst, int64_t ncols, int64_t nrows,
++                         dpct::queue_ptr st) {
++    static const int on = ggml_sycl_get_env("GGML_SYCL_LARRY_ARGMAX", 1);
++    if (!on || ncols < 16384 || nrows < 1 || nrows > 64 || ncols > INT32_MAX) return false;
++    const int NC = (int) std::min<int64_t>(64, ncols / 2048);
++    ggml_sycl_pool_alloc<float> pv(ctx.pool(), (size_t) (nrows * NC));
++    ggml_sycl_pool_alloc<int32_t> pi(ctx.pool(), (size_t) (nrows * NC));
++    float * PV = pv.get();
++    int32_t * PI = pi.get();
++    const int64_t per = (ncols + NC - 1) / NC;
++    auto better = [](float v1, int32_t i1, float v2, int32_t i2) { return v1 > v2 || (v1 == v2 && i1 >= 0 && (i2 < 0 || i1 < i2)); };
++    st->submit([&](sycl::handler & h) {
++    sycl::local_accessor<float, 1> lv(sycl::range<1>(16), h);
++    sycl::local_accessor<int32_t, 1> li(sycl::range<1>(16), h);
++    h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) nrows, (size_t) NC * 256), sycl::range<2>(1, 256)),
++                     [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
++        const int64_t r = it.get_global_id(0);
++        const int c = (int) it.get_group(1), tid = (int) it.get_local_id(1);
++        const int64_t c0 = c * per, c1 = sycl::min(ncols, c0 + per);
++        float bv = -INFINITY;
++        int32_t bi = -1;
++        for (int64_t k = c0 + tid; k < c1; k += 256) {   // ascending: strict > keeps this lane's first maximum
++            const float v = x[r * ncols + k];
++            if (v > bv || bi < 0) { bv = v; bi = (int32_t) k; }
++        }
++        const sycl::sub_group sg = it.get_sub_group();
++        for (int off = 8; off > 0; off >>= 1) {
++            const float ov = sycl::permute_group_by_xor(sg, bv, off);
++            const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
++            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
++        }
++        // 16 sub-groups: lane 0 of each writes, the first sub-group reduces them
++        const int sgi = (int) sg.get_group_linear_id();
++        if (sg.get_local_linear_id() == 0) { lv[sgi] = bv; li[sgi] = bi; }
++        it.barrier(sycl::access::fence_space::local_space);
++        if (sgi == 0) {
++            const int l = (int) sg.get_local_linear_id();
++            bv = lv[l]; bi = li[l];
++            for (int off = 8; off > 0; off >>= 1) {
++                const float ov = sycl::permute_group_by_xor(sg, bv, off);
++                const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
++                if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
++            }
++            if (l == 0) { PV[r * NC + c] = bv; PI[r * NC + c] = bi; }
++        }
++    });
++    });
++    st->submit([&](sycl::handler & h) {
++    sycl::local_accessor<float, 1> lv(sycl::range<1>(4), h);
++    sycl::local_accessor<int32_t, 1> li(sycl::range<1>(4), h);
++    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nrows * 64), sycl::range<1>(64)),
++                     [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++        const int64_t r = it.get_group(0);
++        const int tid = (int) it.get_local_id(0);
++        float bv = tid < NC ? PV[r * NC + tid] : -INFINITY;
++        int32_t bi = tid < NC ? PI[r * NC + tid] : -1;
++        const sycl::sub_group sg = it.get_sub_group();
++        for (int off = 8; off > 0; off >>= 1) {
++            const float ov = sycl::permute_group_by_xor(sg, bv, off);
++            const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
++            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
++        }
++        const int sgi = (int) sg.get_group_linear_id();
++        if (sg.get_local_linear_id() == 0) { lv[sgi] = bv; li[sgi] = bi; }
++        it.barrier(sycl::access::fence_space::local_space);
++        if (tid == 0) {
++            for (int k = 1; k < 4; ++k)
++                if (better(lv[k], li[k], bv, bi)) { bv = lv[k]; bi = li[k]; }
++            // lv[0] / li[0] = this sub-group's own result (bv, bi)
++            dst[r] = bi;
++        }
++    });
++    });
++    return true;
++}
++
+ inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+     GGML_ASSERT( dst->type == GGML_TYPE_I32);
+@@ -3156,6 +3312,25 @@
+     const int64_t ncols = dst->src[0]->ne[0];
+     const int64_t nrows = ggml_nrows(dst->src[0]);
+ 
++    static const int chk = ggml_sycl_get_env("GGML_SYCL_LARRY_ARGMAX_CHECK", 0);
++    if (chk) {
++        ggml_sycl_pool_alloc<int32_t> ref(ctx.pool(), (size_t) nrows);
++        argmax_f32_i32_sycl(src0_dd, ref.get(), ncols, nrows, main_stream);
++        if (larry_argmax(ctx, src0_dd, dst_dd, ncols, nrows, main_stream)) {
++            std::vector<int32_t> a((size_t) nrows), b((size_t) nrows);
++            main_stream->memcpy(a.data(), ref.get(), nrows * 4).wait();
++            main_stream->memcpy(b.data(), dst_dd, nrows * 4).wait();
++            static long n = 0, bad = 0;
++            ++n;
++            for (int64_t r = 0; r < nrows; ++r)
++                if (a[(size_t) r] != b[(size_t) r] && ++bad <= 40) GGML_LOG_INFO("larry argmax check: row %lld stock %d larry %d\n", (long long) r, a[(size_t) r], b[(size_t) r]);
++            if (n % 500 == 0) GGML_LOG_INFO("larry argmax check: %ld calls, %ld mismatches\n", n, bad);
++            return;
++        }
++        main_stream->memcpy(dst_dd, ref.get(), nrows * 4);
++        return;
++    }
++    if (larry_argmax(ctx, src0_dd, dst_dd, ncols, nrows, main_stream)) return;
+     argmax_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
+ }
+ 
+@@ -4667,6 +4842,18 @@
             dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
  }
  
@@ -2858,7 +2969,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4824,219 @@
+@@ -4734,6 +4921,219 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -3078,7 +3189,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +5050,9 @@
+@@ -4747,6 +5147,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -3088,10 +3199,145 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5134,6 +5440,22 @@
+@@ -5114,6 +5517,108 @@
+     }
+ }
+ 
++// larry, GGML_SYCL_LARRY_MMID_Q2K: Q2_K experts x a few tokens, one launch (see ggml_sycl_mul_mat_id).  Pair p =
++// token t * n_ids + slot u runs expert ids[t][u] on activation row t (ne11 == 1) or t * n_ids + u; a sub-group owns
++// R rows of one pair, a lane 64-value units (one 128-half's 16 qs bytes, quarter lh: values 32 j + 16 lh + i, j = 0..3).
++static thread_local bool g_larry_mmid_nofast = false;   // the check mode's reference call
++static bool larry_mmid_q2k(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                           const ggml_tensor * ids, ggml_tensor * dst, float * y_over = nullptr) {
++    static const int on = ggml_sycl_get_env("GGML_SYCL_LARRY_MMID_Q2K", 1);
++    if (!on || src0->type != GGML_TYPE_Q2_K || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    const int64_t K = src0->ne[0], N = src0->ne[1], n_as = src0->ne[2];
++    const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2], n_ids = ids->ne[0];
++    if (K % QK_K || src1->ne[0] != K || ne12 < 1 || ne12 > 8 || n_ids < 1 || n_ids > 8 || ids->ne[1] != ne12) return false;
++    if (ne11 != 1 && ne11 != n_ids) return false;
++    if (src1->nb[0] != 4 || src1->ne[3] != 1 || dst->ne[0] != N || dst->nb[0] != 4) return false;
++    if (ids->type != GGML_TYPE_I32 || ids->nb[0] != 4) return false;
++    const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++    if (extra && extra->optimized_feature.reorder) return false;   // the standard block layout only
++    if (src0->nb[1] != (size_t) (K / QK_K) * sizeof(block_q2_K)) return false;
++    dpct::queue_ptr st = ctx.stream();
++    const int64_t nrows_x = ne11 * ne12;
++    ggml_sycl_pool_alloc<int8_t> xq(ctx.pool(), (size_t) (nrows_x * K));
++    ggml_sycl_pool_alloc<float> xd(ctx.pool(), (size_t) (nrows_x * K / 32));
++    fastmv::quant_x(*st, (const float *) src1->data, (int64_t) (src1->nb[1] / 4), (int64_t) (src1->nb[2] / 4), (int) ne11, ne12,
++                    K, xq.get(), xd.get());
++    constexpr int R = 2, SGW = 8;   // rows per sub-group, sub-groups per work-group
++    const int64_t rows_wg = (int64_t) R * SGW, nrg = (N + rows_wg - 1) / rows_wg, P = ne12 * n_ids;
++    const char * w = (const char *) src0->data;
++    const size_t nb02 = src0->nb[2], nb01 = src0->nb[1];
++    const int32_t * idp = (const int32_t *) ids->data;
++    const int64_t ids_ld = (int64_t) (ids->nb[1] / 4);
++    float * y = y_over ? y_over : (float *) dst->data;
++    const int64_t y1 = (int64_t) (dst->nb[1] / 4), y2 = (int64_t) (dst->nb[2] / 4);
++    const int8_t * XQ = xq.get();
++    const float * XD = xd.get();
++    const int64_t bpr = K / QK_K, upr = 4 * bpr;   // 64-value units a row
++    st->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) P, (size_t) (nrg * SGW * 16)), sycl::range<2>(1, (size_t) SGW * 16)),
++                     [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
++        const int64_t p = it.get_global_id(0);
++        const int64_t t = p / n_ids, u = p % n_ids;
++        const int32_t e = idp[t * ids_ld + u];
++        const sycl::sub_group sg = it.get_sub_group();
++        const int sgi = (int) sg.get_group_linear_id(), ln = (int) sg.get_local_linear_id();
++        const int64_t row0 = ((int64_t) it.get_group(1) * SGW + sgi) * R;
++        if (e < 0 || e >= n_as || row0 >= N) return;   // a whole sub-group leaves together
++        const int64_t xr = ne11 == 1 ? t : t * n_ids + u;
++        const int8_t * xq_r = XQ + xr * K;
++        const float * xd_r = XD + xr * (K / 32);
++        const char * we = w + (size_t) e * nb02;
++        float acc[R];
++#pragma unroll
++        for (int r = 0; r < R; ++r) acc[r] = 0.0f;
++        for (int64_t un = ln; un < upr; un += 16) {
++            const int64_t b = un >> 2;
++            const int h = (int) ((un >> 1) & 1), lh = (int) (un & 1);
++            // the unit's activations: values 256 b + 128 h + 32 j + 16 lh + 0..15 (4 dwords each j), their scales
++            const int8_t * xb = xq_r + b * QK_K + 128 * h + 16 * lh;
++            uint32_t xv[4][4];
++            float xs[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++#pragma unroll
++                for (int k = 0; k < 4; ++k) xv[j][k] = *reinterpret_cast<const uint32_t *>(xb + 32 * j + 4 * k);
++                xs[j] = xd_r[(b * QK_K + 128 * h + 32 * j) / 32];
++            }
++            int sx[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                int a = 0;
++#pragma unroll
++                for (int k = 0; k < 4; ++k) a = dpct::dp4a(0x01010101, (int) xv[j][k], a);
++                sx[j] = a;
++            }
++#pragma unroll
++            for (int r = 0; r < R; ++r) {
++                const int64_t row = sycl::min(row0 + r, N - 1);
++                const block_q2_K * blk = reinterpret_cast<const block_q2_K *>(we + (size_t) row * nb01) + b;
++                const uint32_t * qs = reinterpret_cast<const uint32_t *>(blk->qs + 32 * h + 16 * lh);
++                const uint32_t q0 = qs[0], q1 = qs[1], q2 = qs[2], q3 = qs[3];
++                const uint32_t * scw = reinterpret_cast<const uint32_t *>(blk->scales);
++                const uint32_t s0 = scw[2 * h], s1 = scw[2 * h + 1];   // scales[8 h .. 8 h + 7]
++                const sycl::float2 dm = blk->dm.convert<float, sycl::rounding_mode::automatic>();
++                float sum = 0.0f;
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    const uint32_t scb = (((j < 2) ? s0 : s1) >> (8 * ((2 * j + lh) % 4))) & 0xFF;   // scales[8 h + 2 j + lh]
++                    const int qd = dpct::dp4a((int) ((q0 >> (2 * j)) & 0x03030303u), (int) xv[j][0],
++                                   dpct::dp4a((int) ((q1 >> (2 * j)) & 0x03030303u), (int) xv[j][1],
++                                   dpct::dp4a((int) ((q2 >> (2 * j)) & 0x03030303u), (int) xv[j][2],
++                                   dpct::dp4a((int) ((q3 >> (2 * j)) & 0x03030303u), (int) xv[j][3], 0))));
++                    sum += xs[j] * (dm.x() * (float) (scb & 0xF) * (float) qd - dm.y() * (float) (scb >> 4) * (float) sx[j]);
++                }
++                acc[r] += sum;
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
++            if (ln == 0 && row0 + r < N) y[t * y2 + u * y1 + row0 + r] = v;
++        }
++    });
++    return true;
++}
++
+ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+                                  ggml_tensor *dst) try {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+@@ -5134,6 +5639,48 @@
              return;
          }
      }
++    if (ne12 > 1 && !g_larry_mmid_nofast) {   // larry: no host round trip for a few tokens
++        static const int check = ggml_sycl_get_env("GGML_SYCL_LARRY_MMID_Q2K_CHECK", 0);
++        if (check && ggml_is_contiguous(dst)) {
++            ggml_sycl_pool_alloc<float> yb(ctx.pool(), (size_t) ggml_nelements(dst));
++            if (larry_mmid_q2k(ctx, src0, src1, ids, dst, yb.get())) {
++                g_larry_mmid_nofast = true;
++                ggml_sycl_mul_mat_id(ctx, dst);
++                g_larry_mmid_nofast = false;
++                static int nchk = 0;
++                if (nchk < 24) {
++                    ++nchk;
++                    const size_t n = (size_t) ggml_nelements(dst);
++                    std::vector<float> a(n), b(n);
++                    stream->memcpy(a.data(), dst->data, n * 4).wait();
++                    stream->memcpy(b.data(), yb.get(), n * 4).wait();
++                    double md = 0, mx = 0;
++                    for (size_t i = 0; i < n; ++i) { md = std::max(md, (double) std::fabs(a[i] - b[i])); mx = std::max(mx, (double) std::fabs(a[i])); }
++                    GGML_LOG_INFO("larry mmid q2k check %d: %s [%lld x %lld x %lld] max |diff| %.3e, max |ref| %.3e\n", nchk, dst->name,
++                                  (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], md, mx);
++                }
++                return;
++            }
++        } else if (larry_mmid_q2k(ctx, src0, src1, ids, dst)) {
++            return;
++        }
++    }
 +    // larry: a few tokens (the DSpark draft block: 5) - the fused per-token GEMV once per token, ids read on the
 +    // device; the routed path below waits on the host for the ids (a full queue drain per call).  Measured on the
 +    // draft: 8.9 -> 9.5 ms/pass (the per-token GEMVs re-read shared experts) - off by default
@@ -3111,7 +3357,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +5756,33 @@
+@@ -5434,6 +5981,33 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -3145,7 +3391,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6325,33 @@
+@@ -5976,6 +6550,33 @@
      return skip;
  }
  
@@ -3179,7 +3425,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6442,29 @@
+@@ -6066,6 +6667,29 @@
              continue;
          }
  
@@ -3209,7 +3455,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6518,64 @@
+@@ -6119,6 +6743,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -3274,7 +3520,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +6686,12 @@
+@@ -6229,6 +6911,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -3287,7 +3533,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +6932,24 @@
+@@ -6469,6 +7157,24 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

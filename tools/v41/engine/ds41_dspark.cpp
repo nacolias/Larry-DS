@@ -116,6 +116,22 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         ggml_quantize_init(xt);
     }
     auto is_exp = [](const std::string & n) { return n.find(".ffn.experts.") != std::string::npos; };
+    // larry, STRATA_DSPARK_DENSE_TYPE=<ggml type> (q6_K): the draft's Q8_0 projections requantized on load as well
+    ggml_type dt = GGML_TYPE_COUNT;
+    if (const char * x = std::getenv("STRATA_DSPARK_DENSE_TYPE"); x && *x) {
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const char * nm = ggml_type_name((ggml_type) i);
+            if (nm && std::strcmp(nm, x) == 0) dt = (ggml_type) i;
+        }
+        if (dt == GGML_TYPE_COUNT) { e = std::string("STRATA_DSPARK_DENSE_TYPE: unknown type ") + x; return false; }
+        if (ggml_quantize_requires_imatrix(dt)) { e = std::string("STRATA_DSPARK_DENSE_TYPE ") + x + " needs an imatrix"; return false; }
+        ggml_quantize_init(dt);
+    }
+    auto is_dense_rq = [&](const std::string & n, ggml_type st) {   // a Q8_0 projection matrix (not the router / embeddings)
+        if (dt == GGML_TYPE_COUNT || st != GGML_TYPE_Q8_0 || is_exp(n)) return false;
+        auto ends = [&](const char * x) { const size_t l = std::strlen(x); return n.size() > l && n.compare(n.size() - l, l, x) == 0; };
+        return !ends(".ffn.gate.weight") && !ends("markov_head.embed.weight");
+    };
     // keep: per block, the K most-used experts (ascending index order)
     auto blk_of = [](const std::string & n) { return n.rfind("mtp.", 0) == 0 ? std::atoi(n.c_str() + 4) : -1; };
     auto sliced = [&](const std::string & n) -> int {   // 0 = no, 1 = experts (ne[2]), 2 = gate weight (ne[1]), 3 = gate bias (ne[0])
@@ -157,7 +173,8 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < s.second->shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) s.second->shape[d];
         if (const int sl = sliced(s.second->name)) ne[sl == 1 ? 2 : sl == 2 ? 1 : 0] = (int64_t) keep[(size_t) blk_of(s.second->name)].size();
-        const ggml_type ty = (xt != GGML_TYPE_COUNT && is_exp(s.second->name)) ? xt : (ggml_type) s.second->type;
+        const ggml_type ty = (xt != GGML_TYPE_COUNT && is_exp(s.second->name)) ? xt
+                           : is_dense_rq(s.second->name, (ggml_type) s.second->type) ? dt : (ggml_type) s.second->type;
         if (ty != (ggml_type) s.second->type && ne[0] % ggml_blck_size(ty)) { e = s.second->name + ": row not a multiple of the block"; return false; }
         ggml_tensor * t = ggml_new_tensor(wctx, ty, (int) s.second->shape.size(), ne);
         ggml_set_name(t, s.second->name.c_str());
@@ -442,6 +459,11 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
         ggml_backend_tensor_set(im.i_mask, mask.data(), 0, mask.size() * 4);
         ggml_backend_tensor_set(im.i_bonus, &bo, 0, 4);
     }
+    static const bool dprof = std::getenv("STRATA_DSPARK_PROF") != nullptr;
+    static double pt[5] = {}; static long pn = 0;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto msd = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto ti = now();
     Impl::G & gr = im.graph(k, draft);
     // ONE gallocr serves every cached graph, and ggml_gallocr only places tensors whose data is NULL: a cached graph
     // kept the addresses of its FIRST allocation, which a later, bigger graph's reserve frees (the buffer is
@@ -458,7 +480,11 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
         im.last_key = key;
     }
     if (!ggml_gallocr_alloc_graph(im.ga, gr.gf)) { im.err = "DSpark graph allocation failed"; return false; }
-    if (ggml_backend_graph_compute(im.be, gr.gf) != GGML_STATUS_SUCCESS) { im.err = "DSpark graph compute failed"; return false; }
+    const auto ta = now();
+    if (ggml_backend_graph_compute_async(im.be, gr.gf) != GGML_STATUS_SUCCESS) { im.err = "DSpark graph compute failed"; return false; }
+    const auto tq = now();
+    ggml_backend_synchronize(im.be);
+    const auto tc = now();
     if (!gr.rids.empty()) {
         if (im.counts.empty()) im.counts.assign(gr.rids.size(), std::vector<int64_t>((size_t) im.NE, 0));
         for (size_t b = 0; b < gr.rids.size(); ++b) {
@@ -474,5 +500,11 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
         }
     }
     im.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (dprof && draft) {
+        pt[0] += msd(t0, ti); pt[1] += msd(ti, ta); pt[2] += msd(ta, tq); pt[3] += msd(tq, tc); pt[4] += msd(tc, now());
+        if (++pn % 64 == 0)
+            std::fprintf(stderr, "dspark prof (%ld drafts): inputs %.2f ms, graph/alloc %.2f, enqueue %.2f, sync %.2f, readback %.2f, total %.2f\n",
+                         pn, pt[0] / pn, pt[1] / pn, pt[2] / pn, pt[3] / pn, pt[4] / pn, (pt[0] + pt[1] + pt[2] + pt[3] + pt[4]) / pn);
+    }
     return true;
 }
