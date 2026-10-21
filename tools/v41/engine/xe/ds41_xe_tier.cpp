@@ -8,6 +8,8 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <level_zero/ze_api.h>
 #include <oneapi/mkl/blas.hpp>
 
 #include <algorithm>
@@ -64,6 +66,30 @@ int64_t mem_available_bytes() {
 
 constexpr double kGiB = 1073741824.0;
 constexpr size_t kSlab = (size_t) 1 << 30;       ///< device expert storage is bump-allocated in 1 GiB slabs
+
+/// larry, STRATA_XE_LOCAL_ALLOC (default 1): device memory that no other card touches (expert slabs, flex regions) is
+/// allocated by Level Zero directly.  SYCL's allocations go through UR / UMF, which make each one resident on every P2P
+/// peer in the context, and on larry (card pairs behind ACS redirect) that costs ~1 GiB of host RAM per GiB once the
+/// peers hold memory: the expert cards' 3 x 28 GiB of slabs +13.8 GiB of driver-held RAM, the dense card's 1 GiB seed
+/// slabs 60-600 ms and +1 GiB each (bench/dqb/alloc_probe3.cpp; natively: +28 MiB, 0 ms).
+inline bool local_alloc_on() { static const bool on = std::getenv("STRATA_XE_LOCAL_ALLOC") == nullptr || std::atoi(std::getenv("STRATA_XE_LOCAL_ALLOC")) != 0; return on; }
+inline uint8_t* local_alloc(sycl::queue& q, size_t bytes) {
+    if (!local_alloc_on()) return sycl::malloc_device<uint8_t>(bytes, q);
+    ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+    ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+    ze_device_mem_alloc_desc_t d = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, nullptr, 0, 0};
+    void* p = nullptr;
+    if (zeMemAllocDevice(zc, &d, bytes, 4096, zd, &p) != ZE_RESULT_SUCCESS || !p) return nullptr;
+    // resident on this card now: such memory is otherwise committed at first touch (the free-VRAM query does not see
+    // it, and a card out of VRAM then fails the touching command - no spill into host RAM as UR / UMF memory does)
+    if (zeContextMakeMemoryResident(zc, zd, p, bytes) != ZE_RESULT_SUCCESS) { zeMemFree(zc, p); return nullptr; }
+    return (uint8_t*) p;
+}
+inline void local_free(sycl::queue& q, void* p) {
+    if (!p) return;
+    if (!local_alloc_on()) { sycl::free(p, q); return; }
+    zeMemFree(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context()), p);
+}
 constexpr int kMaxDecodeJobs = 64;               ///< a verify pass of 8 tokens routes at most 48 distinct experts
 constexpr size_t kStageAlign = 256;
 constexpr int kPcBounce = 3;                     ///< STRATA_XE_PROMOTE: pinned bounces (promotions in flight)
@@ -143,9 +169,19 @@ struct XeCard {
     xe::XeQ8 cxq; size_t cxq_rows = 0;   ///< prompt chunks: X [n][n_embd]
     xe::XeQ8 chq; int chq_jobs = 0;      ///< prompt chunks: H [jobs][8][n_ff]
 
+    int pre_slab = -1;           ///< DEBUG (STRATA_XE_SEED_PREALLOC): the preallocated slab being filled, -1 none
     uint8_t* alloc_expert(size_t bytes) {
+        if (pre_slab >= 0) {   // preallocated slabs: the next one when this is full
+            if (slab_used + bytes > kSlab) { ++pre_slab; slab_used = 0; }
+            if (pre_slab >= (int) slabs.size()) return nullptr;
+            uint8_t* p = slabs[(size_t) pre_slab] + slab_used;
+            slab_used += (bytes + 255) & ~(size_t) 255;
+            used += (int64_t) bytes;
+            ++n_experts;
+            return p;
+        }
         if (slabs.empty() || slab_used + bytes > kSlab) {
-            uint8_t* p = sycl::malloc_device<uint8_t>(kSlab, q);
+            uint8_t* p = local_alloc(q, kSlab);
             if (!p) return nullptr;
             slabs.push_back(p);
             slab_used = 0;
@@ -158,7 +194,8 @@ struct XeCard {
     }
     void free_experts() {
         q.wait();
-        for (uint8_t* p : slabs) sycl::free(p, q);
+        pre_slab = -1;
+        for (uint8_t* p : slabs) local_free(q, p);
         slabs.clear();
         slab_used = 0;
         used = 0;
@@ -753,14 +790,14 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         }
     }
     {   // larry: each expert card's flex region (prompt: prefetch buffers; decode: promotion slots), from the reserve
-        const double fg = env_d("STRATA_XE_FLEX_GIB", 1.25), fm = env_d("STRATA_XE_FLEX_MARGIN_GIB", 1.5);
+        const double fg = env_d("STRATA_XE_FLEX_GIB", 1.0), fm = env_d("STRATA_XE_FLEX_MARGIN_GIB", 1.5);
         for (auto& cp : im.cards) {
             XeCard& c = *cp;
             if (c.dense || c.flex) continue;
             const int64_t fr = c.free_vram();
             const int64_t want = std::min<int64_t>((int64_t) (fg * kGiB), fr > 0 ? fr - (int64_t) (fm * kGiB) : 0) & ~(int64_t) 255;
             if (want < 8 * im.blob_max) continue;
-            c.flex = sycl::malloc_device<uint8_t>((size_t) want, c.q);
+            c.flex = local_alloc(c.q, (size_t) want);
             c.flex_cap = c.flex ? (size_t) want : 0;
         }
         if (env_i("STRATA_XE_PROMOTE", 1) && !im.pc_bounce) {   // the promotions' pinned bounces, now too
@@ -804,19 +841,63 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
     sycl::event hev[2];
     int hcur = 0;
     size_t hused = 0;
+    double t_alloc = 0, t_copy = 0, t_wait = 0;   // the seed's split (printed below)
+    int64_t n_pin = 0, n_page = 0;
+    auto hidden_mib = [] {
+        std::ifstream f("/proc/meminfo");
+        std::string k, u; long v, t = 0, a = 0, p = 0;
+        while (f >> k >> v >> u) { if (k == "MemTotal:") t = v; if (k == "MemAvailable:") a = v; if (k == "AnonPages:") p = v; }
+        return (t - a - p) / 1024;
+    };
+    const long h0 = hidden_mib();
+    long h1 = h0;
+    if (env_i("STRATA_XE_SEED_PREALLOC", 0)) {   // DEBUG: every slab first
+        const double ta = now_ms();
+        const int ns = (int) ((c.budget + (int64_t) kSlab - 1) / (int64_t) kSlab);
+        auto vram_used_mib = [] {   // card 0 (the dense card here): the xe VRAM manager's usage
+            std::ifstream f("/sys/kernel/debug/dri/0000:15:00.0/tile0/vram_mm");
+            std::string k; long long v = -1;
+            while (f >> k) if (k == "usage:") { f >> v; break; }
+            return v >= 0 ? v / 1048576 : -1;
+        };
+        for (int i = 0; i < ns; ++i) {
+            const double t1 = now_ms();
+            uint8_t* sp = local_alloc(c.q, kSlab);
+            const double t2 = now_ms();
+            if (!sp) break;
+            c.slabs.push_back(sp);
+            const auto pt = sycl::get_pointer_type(sp, im.ctx);
+            std::fprintf(stderr, "xe seed slab %d: %.0f ms, type %s, card-0 VRAM used %lld MiB, hidden %ld MiB\n", i, t2 - t1,
+                         pt == sycl::usm::alloc::device ? "device" : pt == sycl::usm::alloc::host ? "host" : pt == sycl::usm::alloc::shared ? "shared" : "unknown",
+                         (long long) vram_used_mib(), hidden_mib());
+        }
+        c.slab_used = 0;
+        c.pre_slab = 0;
+        t_alloc += now_ms() - ta;
+        h1 = hidden_mib();
+    }
     for (const auto& le : ranked) {
         if (le.first < 0 || le.first >= im.g.n_layers || le.second < 0 || le.second >= im.g.n_experts) continue;
         const size_t key = (size_t) im.key(le.first, le.second);
         if (im.card_of[key] >= 0 || !im.aptr[key]) continue;
         const size_t b = im.bbytes(le.first, le.second);
         if (c.used + (int64_t) b > c.budget) continue;
+        const double ta = now_ms();
         uint8_t* p = c.alloc_expert(b);
+        t_alloc += now_ms() - ta;
         if (!p) break;
-        if (sycl::get_pointer_type(im.aptr[key], im.ctx) == sycl::usm::alloc::host) {
+        static const bool bounce_all = env_i("STRATA_XE_SEED_BOUNCE_ALL", 0) != 0;   // DEBUG
+        if (!bounce_all && sycl::get_pointer_type(im.aptr[key], im.ctx) == sycl::usm::alloc::host) {
             upload_planar(im, c, le.first, le.second, im.aptr[key], p);
+            ++n_pin;
         } else {
+            ++n_page;
+            const double tw = now_ms();
             if (hused + b > half) { hcur ^= 1; hused = 0; hev[hcur].wait(); }
+            t_wait += now_ms() - tw;
+            const double tc = now_ms();
             std::memcpy(c.bounce + (size_t) hcur * half + hused, im.aptr[key], b);
+            t_copy += now_ms() - tc;
             hev[hcur] = upload_planar(im, c, le.first, le.second, c.bounce + (size_t) hcur * half + hused, p);
             hused += (b + 255) & ~(size_t) 255;
         }
@@ -824,11 +905,17 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         im.dptr[key] = p;
         im.dense_set.push_back(le);
     }
+    const double tq = now_ms();
     c.q.wait();
+    const double t_final = now_ms() - tq;
+    c.pre_slab = -1;
+    std::fprintf(stderr, "xe tier: seed hidden memory %ld -> %ld (slabs) -> %ld MiB (uploads)\n", h0, h1, hidden_mib());
     im.resident_n = 0;
     for (auto& cp : im.cards) im.resident_n += cp->n_experts;
-    std::fprintf(stderr, "xe tier: dense card %d seeded with %zu experts (%.2f GiB) in %.2f s\n", c.idx,
-                 im.dense_set.size(), c.used / kGiB, (now_ms() - t0) / 1000.0);
+    std::fprintf(stderr, "xe tier: dense card %d seeded with %zu experts (%.2f GiB) in %.2f s (slabs %.0f ms, %lld pinned / %lld "
+                 "pageable experts: bounce copies %.0f ms, bounce waits %.0f ms, final queue wait %.0f ms)\n", c.idx,
+                 im.dense_set.size(), c.used / kGiB, (now_ms() - t0) / 1000.0, t_alloc, (long long) n_pin, (long long) n_page,
+                 t_copy, t_wait, t_final);
     return true;
 }
 
@@ -2757,9 +2844,11 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         int64_t room = fr > 0 ? (fr - reserve) / 2 : 0;
         const size_t cap = (size_t) std::max<int64_t>(0, std::min<int64_t>((int64_t) per, room)) & ~(size_t) 255;
         if (cap < (size_t) im.blob_max) { c.pbuf_cap = 0; continue; }
-        if (!c.flex || c.flex_cap < 2 * cap) {   // (re)allocated only when it is too small
-            if (c.flex) { c.q.wait(); sycl::free(c.flex, c.q); }
-            c.flex = sycl::malloc_device<uint8_t>(2 * cap, c.q);
+        // sized to this prompt: a larger region left over would over-commit the card (the xe driver then spills buffers
+        // into host RAM: a 16K prompt after an 8K one pushed larry past the watchdog, 2026-10-21 04:30)
+        if (!c.flex || c.flex_cap < 2 * cap || c.flex_cap > 2 * cap + ((size_t) 64 << 20)) {
+            if (c.flex) { c.q.wait(); local_free(c.q, c.flex); }
+            c.flex = local_alloc(c.q, 2 * cap);
             c.flex_cap = c.flex ? 2 * cap : 0;
             if (!c.flex) { c.pbuf_cap = 0; continue; }
         }
@@ -2916,7 +3005,7 @@ void Ds41XeTier::close() {
         c.free_experts();
         auto fr = [&](void* p) { if (p) sycl::free(p, c.q); };
         if (c.pbuf[0] == c.flex) c.pbuf[0] = c.pbuf[1] = nullptr;
-        fr(c.flex);
+        if (c.flex) { c.q.wait(); local_free(c.q, c.flex); }
         c.flex = nullptr;
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY); fr(c.stream);
