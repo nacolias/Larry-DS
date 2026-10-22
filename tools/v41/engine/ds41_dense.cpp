@@ -1395,7 +1395,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.cpu = ggml_backend_is_cpu(im.backend);
     im.sycl = !im.cpu && std::strstr(ggml_backend_name(im.backend), "SYCL") != nullptr;
     if (!load_weights(im, err)) return false;
-    if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
+    // larry, STRATA_ENGRAM_THREADS: the row reader's pool = its queue depth over both NVMe drives (a cold 16K prompt
+    // batch is ~1.4M random reads: at 32 a cold 31.6K prompt waited ~4 s for its first batch's rows)
+    const int eng_threads = std::getenv("STRATA_ENGRAM_THREADS") ? std::atoi(std::getenv("STRATA_ENGRAM_THREADS")) : cfg.engram_threads;
+    if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, eng_threads, err)) return false;
 
     // layers
     im.ly.resize((size_t) im.nl);

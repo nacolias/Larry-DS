@@ -151,6 +151,7 @@ struct XeCard {
     std::vector<std::pair<int32_t, int64_t>> st_have;
     uint8_t* gscratch = nullptr; size_t gscratch_cap = 0;  ///< the GEMM path's operands (bytes)
     float* cX2 = nullptr; size_t cX2_cap = 0;              ///< the dense card's copy of the other cards' sum
+    sycl::half* cX2h = nullptr; size_t cX2h_cap = 0;       ///< STRATA_XE_COMBINE=2: the parts as fp16 (slot = card)
     uint8_t* bounce = nullptr; size_t bounce_cap = 0;      ///< pinned staging for streamed experts in pageable memory
     // prompt prefetch (Ds41XeTier::prefetch_begin): a copy queue and two layer buffers (ping-pong by layer parity)
     sycl::queue pq;
@@ -2258,6 +2259,17 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
     // ---- every card's part on its own host thread
     std::vector<char> ok(NC, 1);
     std::atomic<int64_t> hits{0}, pcie{0};
+    // STRATA_XE_COMBINE (see the combine below): the cards push their parts themselves; the dense card's landing
+    // buffer (a slot per card) must exist before their threads start
+    static const int cmb_env = env_i("STRATA_XE_COMBINE", 0);
+    XeCard* cdc = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
+    int cmb = out_dev && cdc ? cmb_env : 0;
+    if (cmb > 0) {
+        std::lock_guard<PrioMutex> lk(g_submit);
+        const size_t need = im.cards.size() * (size_t) n * H;
+        const bool okb = cmb == 2 ? grow_dev(cdc->cX2h, cdc->cX2h_cap, need, cdc->q) : grow_dev(cdc->cX2, cdc->cX2_cap, need, cdc->q);
+        if (!okb) { std::fprintf(stderr, "xe tier: dense card: combine slots allocation failed - the copy-after combine\n"); cmb = 0; }
+    }
     auto card_work = [&](XeCard& c) -> bool {
         std::vector<int32_t> S((size_t) n * K);
         std::vector<int64_t> soff((size_t) E, -1);
@@ -2688,6 +2700,18 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             std::lock_guard<PrioMutex> lk(g_submit);
             c.q.memcpy(c.cOUT_host, c.cOUT, (size_t) n * H * 4);
         }
+        if (out_dev && !c.dense && cmb > 0 && cdc) {   // STRATA_XE_COMBINE: this card's part onto the dense card now
+            const size_t ne = (size_t) n * H;
+            std::lock_guard<PrioMutex> lk(g_submit);
+            if (cmb == 2) {   // fp16 in the call's X buffer (no longer read), half the bytes over the dense card's link
+                sycl::half* h16 = reinterpret_cast<sycl::half*>(c.cX);
+                const float* src = c.cOUT;
+                c.q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { h16[i] = (sycl::half) src[i]; });
+                c.q.memcpy(cdc->cX2h + (size_t) c.idx * ne, h16, ne * 2);
+            } else {
+                c.q.memcpy(cdc->cX2 + (size_t) c.idx * ne, c.cOUT, ne * 4);
+            }
+        }
         c.q.wait();
         if (prof) {   // the lowest free VRAM at the end of a call (every buffer of the call allocated)
             const int64_t fr = c.free_vram();
@@ -2733,7 +2757,29 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         std::vector<const XeCard*> others;
         for (auto& cp : im.cards) if (cp->busy && !cp->dense) others.push_back(cp.get());
         sycl::event cev;
-        {
+        if (cmb > 0) {   // STRATA_XE_COMBINE: every busy card's part is in its slot (its thread waited for the push)
+            std::lock_guard<PrioMutex> lk(g_submit);
+            int idx[8] = {};
+            const int np = (int) std::min<size_t>(others.size(), 8);
+            for (int k = 0; k < np; ++k) idx[k] = others[(size_t) k]->idx;
+            const float* own = dc->busy ? dc->cOUT : nullptr;
+            float* o = (float*) out_dev;
+            if (cmb == 2) {
+                const sycl::half* parts = dc->cX2h;
+                cev = dc->q.parallel_for(sycl::range<1>(NE), [=](sycl::id<1> i) {
+                    float sm = own ? own[i] : 0.0f;
+                    for (int k = 0; k < np; ++k) sm += (float) parts[(size_t) idx[k] * NE + i];
+                    o[i] = sm;
+                });
+            } else {
+                const float* parts = dc->cX2;
+                cev = dc->q.parallel_for(sycl::range<1>(NE), [=](sycl::id<1> i) {
+                    float sm = own ? own[i] : 0.0f;
+                    for (int k = 0; k < np; ++k) sm += parts[(size_t) idx[k] * NE + i];
+                    o[i] = sm;
+                });
+            }
+        } else {
             std::lock_guard<PrioMutex> lk(g_submit);
             if (!others.empty() && !grow_dev(dc->cX2, dc->cX2_cap, NE * others.size(), dc->q)) {
                 std::fprintf(stderr, "xe tier: dense card: combine buffer allocation failed\n");
@@ -3302,7 +3348,7 @@ void Ds41XeTier::close() {
         c.flex = nullptr;
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY); fr(c.stream);
-        fr(c.gscratch); fr(c.cX2); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
+        fr(c.gscratch); fr(c.cX2); fr(c.cX2h); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }
     }
     im.cards.clear();
