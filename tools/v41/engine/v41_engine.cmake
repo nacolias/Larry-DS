@@ -59,6 +59,9 @@ if(TARGET ds41_dense)
         # larry: the fused hyper-connection ops (ggml_dsv41_hc_post2 / _hc_fa / _hc_fb) vs the composite
         add_executable(test_ds41_hcfuse ${_v41_dir}/test_ds41_hcfuse.cpp)
         target_link_libraries(test_ds41_hcfuse PRIVATE ds41_dense)
+        # larry: the fused decode attention core (ggml_dsv41_kv_fin / _attn_dec) vs the op chain (GPU only)
+        add_executable(test_ds41_attnfuse ${_v41_dir}/test_ds41_attnfuse.cpp)
+        target_link_libraries(test_ds41_attnfuse PRIVATE ds41_dense)
     endif()
 endif()
 # the Engram row-read bench (CPU + disk only): it compiles the module straight in, so it builds without ggml or CUDA

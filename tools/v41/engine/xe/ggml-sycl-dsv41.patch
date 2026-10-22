@@ -1,7 +1,7 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -587,6 +587,14 @@
+@@ -587,6 +587,20 @@
          GGML_OP_DSV4_HC_POST,
          GGML_OP_DSV41_FAKE_QUANT,
          GGML_OP_DSV41_HC_MIXES,
@@ -13,10 +13,16 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +        GGML_OP_DSV41_HC_FA,
 +        GGML_OP_DSV41_HC_FB,
 +        GGML_OP_DSV41_OPROJ,
++        GGML_OP_DSV41_KV_FIN,
++        GGML_OP_DSV41_ATTN_DEC,
++        GGML_OP_DSV41_MVQ,
++        GGML_OP_DSV41_RMS_Q8,
++        GGML_OP_DSV41_LI_DEC,
++        GGML_OP_DSV41_SEL_FIN,
  
          GGML_OP_UNARY,
  
-@@ -2751,6 +2759,104 @@
+@@ -2751,6 +2765,272 @@
              struct ggml_tensor  * base,
              float                 eps);
  
@@ -103,6 +109,16 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +            struct ggml_tensor  * y,
 +            struct ggml_tensor  * post,
 +            struct ggml_tensor  * comb);
++    // larry: hc_fa with y = y + y2 (the finish's shexp + routed folded in: hc_post2 then the next sub-layer's hc_fa)
++    GGML_API struct ggml_tensor * ggml_dsv41_hc_fa2(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * fn,
++            struct ggml_tensor  * pre,
++            struct ggml_tensor  * y,
++            struct ggml_tensor  * y2,
++            struct ggml_tensor  * post,
++            struct ggml_tensor  * comb);
 +    // hc_fb: the second half.  fa = a ggml_dsv41_hc_fa result, scale F32 [3], base F32 [(2+hc)*hc], w F32 [D] (the
 +    // sub-layer's RMS-norm weight).  mixes = (fn . h) * rsqrt(mean(h^2) + eps) (ggml_dsv41_norm_mv);
 +    // pre = sigmoid(mixes*scale[0] + base) + hc_eps, post = 2 sigmoid(mixes*scale[1] + base) (ggml_dsv41_hc_mixes);
@@ -117,6 +133,164 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +            float                 eps,
 +            float                 hc_eps,
 +            int                   n_iter);
++
++    // larry: the RoPE of DeepSeek-V4.1's fused decode ops - ggml_rope_ext's parameters, NORMAL mode (adjacent pairs),
++    // applied to the LAST n_dims values of each row (ggml_rope_set_offset(r, ne0 - n_dims))
++    struct ggml_dsv41_rope {
++        int   n_dims;
++        int   n_ctx_orig;
++        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
++    };
++    // larry: DeepSeek-V4.1's window row at decode widths (ggml-sycl only): y = rms_norm(x) * w, the RoPE at pos, the FP8
++    // activation rounding when fq (FP8 E4M3, 32-value blocks, power-of-two scales; ds41_ops.hpp FP8_POW2_32), and the
++    // last nslot = ggml_nelements(slot) columns also written into ring rows slot[] (the window ring).  x F32 [512, n]
++    // (rows contiguous), w F32 [512], pos I32 [n], ring F32 [512, R], slot I32.  Result F32 1-D: y [512, n], then the
++    // pass's RoPE table [rope.n_dims, n] (per query and rotated pair: cos, sin) - what ggml_dsv41_attn_dec and
++    // ggml_dsv41_li_dec rotate with (the same positions and angles).
++    GGML_API struct ggml_tensor * ggml_dsv41_kv_fin(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * pos,
++            struct ggml_tensor  * ring,
++            struct ggml_tensor  * slot,
++            float                 eps,
++            struct ggml_dsv41_rope rope,
++            bool                  fq);
++    // larry: DeepSeek-V4.1's decode / verify attention (< 8 queries, ggml-sycl only) in one op: per query t its swa
++    // window keys - row widx[t * swa + j] of [ring (R rows) | rows (this pass's)] - masked by wmask, then its K
++    // compressed keys - row sel[i, t] of comp (F32 / F16 / BF16) - masked by selm (comp, sel, selm all set or none);
++    // K = V, MQA.  q is RoPE'd (forward) on the way in by tab (ggml_dsv41_kv_fin's table [n_dims, n]: the last n_dims
++    // of each head), the output RoPE'd back; sinks [NH] one logit per head.
++    // q F32 [512, NH, n] contiguous, ring F32 [512, R], rows F32 [512, n], widx I32 [swa * n], wmask F32 [swa, n],
++    // sel I32 [K, n], selm F32 [K, n] (any column strides).  Result F32 [512, NH, n].  NH % 32 == 0, swa + K <= 2048.
++    GGML_API struct ggml_tensor * ggml_dsv41_attn_dec(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * ring,
++            struct ggml_tensor  * rows,
++            struct ggml_tensor  * widx,
++            struct ggml_tensor  * wmask,
++            struct ggml_tensor  * comp,
++            struct ggml_tensor  * sel,
++            struct ggml_tensor  * selm,
++            struct ggml_tensor  * sinks,
++            struct ggml_tensor  * tab,
++            int                   swa,
++            float                 scale,
++            int                   n_dims);
++
++    // ---- larry: int8 activations straight from the op that produces them (fastmv's quant_x layout, "q8"): rows
++    // r = g * n + t (batch-major) of K int8 values each (round(x * 127 / amax) per 32-value block), then the rows' block
++    // scales (amax / 127) as f32.  A producer writes them next to its f32 result; ggml_dsv41_mvq reads them instead of
++    // quantising its input again (one kernel less a product).
++    // ggml_dsv41_mvq: ggml_mul_mat(w, x) where x8 holds x's q8 form (an F32-typed view of the bytes; ggml-sycl's fastmv
++    // takes it for a Q6_K weight - other weights read x itself)
++    GGML_API struct ggml_tensor * ggml_dsv41_mvq(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * x8);
++    // ggml_dsv41_rms_q8: y = rms_norm(x) * w and y's q8.  x F32 [K, n] (rows contiguous), w F32 [K], K % 32 == 0.
++    // Result F32 1-D: y [K, n] | q8 (ggml_dsv41_q8_floats(K, n) floats)
++    GGML_API struct ggml_tensor * ggml_dsv41_rms_q8(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * w,
++            float                 eps);
++    // the q8 form's size in floats (K int8 + K / 32 f32 a row, rows = n)
++    GGML_API int64_t ggml_dsv41_q8_floats(int64_t K, int64_t n);
++    // ggml_dsv41_hc_fb with xn's q8 appended: xn | pre | post | comb | q8(xn)
++    GGML_API struct ggml_tensor * ggml_dsv41_hc_fb_q8(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * fa,
++            struct ggml_tensor  * scale,
++            struct ggml_tensor  * base,
++            struct ggml_tensor  * w,
++            float                 eps,
++            float                 hc_eps,
++            int                   n_iter);
++    // ggml_dsv41_swiglu_lim with the result's q8 appended: out [N, n] | q8(out).  F32 1-D.
++    GGML_API struct ggml_tensor * ggml_dsv41_swiglu_q8(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * y,
++            float                 lim);
++    // ggml_dsv41_attn_dec with the output's q8 for the grouped output projection appended: o [512, NH, n] | q8 of the
++    // OG = NH / hpg head groups as batches (row g * n + t holds query t's heads hpg g .. hpg g + hpg - 1).  F32 1-D.
++    GGML_API struct ggml_tensor * ggml_dsv41_attn_dec_q8(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * ring,
++            struct ggml_tensor  * rows,
++            struct ggml_tensor  * widx,
++            struct ggml_tensor  * wmask,
++            struct ggml_tensor  * comp,
++            struct ggml_tensor  * sel,
++            struct ggml_tensor  * selm,
++            struct ggml_tensor  * sinks,
++            struct ggml_tensor  * tab,
++            int                   swa,
++            float                 scale,
++            int                   n_dims,
++            int                   hpg);
++    // ggml_dsv41_mvq writing into out (a contiguous F32 [N, n] view, e.g. a persistent tensor's columns): the result is
++    // a view of out, as ggml_cpy's - no copy after the product
++    GGML_API struct ggml_tensor * ggml_dsv41_mvq_into(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * x8,
++            struct ggml_tensor  * out);
++    // larry: run a ggml_dsv41_hc_fb(_q8) and its ggml_dsv41_hc_fa (fb->src[0]) as ONE kernel (ggml-sycl: the hc_fa node
++    // computes nothing, the hc_fb node both; hc_fa's result must not be read before hc_fb has run).  Returns fb.
++    GGML_API struct ggml_tensor * ggml_dsv41_hc_merge(
++            struct ggml_tensor  * fb);
++    // larry: a fused decode op also writes its outputs straight into (persistent) tensors - the copies after it go:
++    //   ggml_dsv41_router       d0 = ids I32 [k, n], d1 = weights F32 [k, n]
++    //   ggml_dsv41_hc_fa (y)    d0 = h F32 [D, hc, n]
++    //   ggml_dsv41_hc_fb(_q8)   d0 = xn [D, n], d1 = pre [hc, n], d2 = post [hc, n], d3 = comb [hc, hc, n], d4 = q8(xn)
++    // (rows contiguous, columns contiguous; NULL: not written).  Returns op.
++    GGML_API struct ggml_tensor * ggml_dsv41_write_to(
++            struct ggml_tensor  * op,
++            struct ggml_tensor  * d0,
++            struct ggml_tensor  * d1,
++            struct ggml_tensor  * d2,
++            struct ggml_tensor  * d3,
++            struct ggml_tensor  * d4);
++    // larry: DeepSeek-V4.1's lightning indexer at decode widths (< 8 queries, ggml-sycl only) from the raw products: q F32
++    // [128, 32, n] (the indexer's q_b product: RoPE'd by tab (ggml_dsv41_kv_fin's) on the last n_dims, FP4-rounded when
++    // fq, here), keys BF16
++    // [128, NKV] (rows nb[1] apart, NKV % 8 == 0), w F32 [32, n] (the proj product, times wscale here), nvis F32 [n] (rows
++    // i < nvis visible), cand I32 [ncb, n] (NULL, or: only rows of these 8-row blocks score), lastblk F32 [n] (NULL, or:
++    // also each 8-row block's max score, + 1e30 at block lastblk - the candidate-block selection's input).
++    // Result F32: scores [NKV, n] (-inf where masked), then with lastblk the block maxima [NKV / 8, n] (1-D).
++    GGML_API struct ggml_tensor * ggml_dsv41_li_dec(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * keys,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * nvis,
++            struct ggml_tensor  * tab,
++            struct ggml_tensor  * cand,
++            struct ggml_tensor  * lastblk,
++            float                 wscale,
++            int                   n_dims,
++            bool                  fq);
++    // larry: top-k ids (I32 [K, n], K <= 512) sorted ascending into sel (I32 [K, n]) and selm (F32 [K, n]: 0 where
++    // id < nvis, else -inf) - ggml-sycl only.  The result is a view of sel (as ggml_cpy's).
++    GGML_API struct ggml_tensor * ggml_dsv41_sel_fin(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * nvis,
++            struct ggml_tensor  * sel,
++            struct ggml_tensor  * selm);
++    // ggml_dsv41_oproj with o's q8 (ggml_dsv41_attn_dec_q8's, OGD = hpg * 512) - the first quantisation skipped
++    GGML_API struct ggml_tensor * ggml_dsv41_oproj_q8(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * o,
++            struct ggml_tensor  * o8,
++            struct ggml_tensor  * wo_a,
++            struct ggml_tensor  * wo_b);
 +
      // custom operators
  
@@ -165,7 +339,7 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1086,6 +1086,14 @@
+@@ -1086,6 +1086,20 @@
      "DSV4_HC_POST",
      "DSV41_FAKE_QUANT",
      "DSV41_HC_MIXES",
@@ -177,19 +351,25 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    "DSV41_HC_FA",
 +    "DSV41_HC_FB",
 +    "DSV41_OPROJ",
++    "DSV41_KV_FIN",
++    "DSV41_ATTN_DEC",
++    "DSV41_MVQ",
++    "DSV41_RMS_Q8",
++    "DSV41_LI_DEC",
++    "DSV41_SEL_FIN",
  
      "UNARY",
  
-@@ -1103,7 +1111,7 @@
+@@ -1103,7 +1117,7 @@
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
++static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1203,6 +1211,14 @@
+@@ -1203,6 +1217,20 @@
      "dsv4_hc_post(x, residual, post, comb)",
      "dsv41_fake_quant(x)",
      "dsv41_hc_mixes(mixes, scale, base)",
@@ -201,19 +381,25 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    "dsv41_hc_fa(x, fn, pre, y, post, comb)",
 +    "dsv41_hc_fb(fa, scale, base, w)",
 +    "dsv41_oproj(o, wo_a, wo_b)",
++    "dsv41_kv_fin(x, w, pos, ring, slot)",
++    "dsv41_attn_dec(q, ring, rows, widx, wmask, comp, sel, selm, sinks, pos)",
++    "dsv41_mvq(w, x, x8)",
++    "dsv41_rms_q8(x, w)",
++    "dsv41_li_dec(q, keys, w, nvis, pos, cand, lastblk)",
++    "dsv41_sel_fin(ids, nvis, sel, selm)",
  
      "unary(x)",
  
-@@ -1220,7 +1236,7 @@
+@@ -1220,7 +1248,7 @@
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
++static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -6588,6 +6604,215 @@
+@@ -6588,6 +6616,566 @@
      return result;
  }
  
@@ -318,6 +504,22 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    return result;
 +}
 +
++struct ggml_tensor * ggml_dsv41_swiglu_q8(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * y,
++        float                 lim) {
++    GGML_ASSERT(y->type == GGML_TYPE_F32 && ggml_is_contiguous(y) && y->ne[0] % 64 == 0);
++    const int64_t N = y->ne[0] / 2, n = y->ne[1] * y->ne[2] * y->ne[3];
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N * n + ggml_dsv41_q8_floats(N, n));
++    ggml_set_op_params_f32(result, 0, lim);
++    ggml_set_op_params_i32(result, 1, 1);
++    ggml_set_op_params_i32(result, 2, (int32_t) N);
++    ggml_set_op_params_i32(result, 3, (int32_t) n);
++    result->op     = GGML_OP_DSV41_SWIGLU_LIM;
++    result->src[0] = y;
++    return result;
++}
++
 +struct ggml_tensor * ggml_dsv41_oproj(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * o,
@@ -332,6 +534,314 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    result->src[0] = o;
 +    result->src[1] = wo_a;
 +    result->src[2] = wo_b;
++    return result;
++}
++
++static void ggml_dsv41_set_rope(struct ggml_tensor * t, int i0, struct ggml_dsv41_rope r) {
++    ggml_set_op_params_i32(t, i0 + 0, r.n_dims);
++    ggml_set_op_params_i32(t, i0 + 1, r.n_ctx_orig);
++    ggml_set_op_params_f32(t, i0 + 2, r.freq_base);
++    ggml_set_op_params_f32(t, i0 + 3, r.freq_scale);
++    ggml_set_op_params_f32(t, i0 + 4, r.ext_factor);
++    ggml_set_op_params_f32(t, i0 + 5, r.attn_factor);
++    ggml_set_op_params_f32(t, i0 + 6, r.beta_fast);
++    ggml_set_op_params_f32(t, i0 + 7, r.beta_slow);
++}
++
++struct ggml_tensor * ggml_dsv41_kv_fin(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * pos,
++        struct ggml_tensor  * ring,
++        struct ggml_tensor  * slot,
++        float                 eps,
++        struct ggml_dsv41_rope rope,
++        bool                  fq) {
++    const int64_t D = x->ne[0], n = x->ne[1];
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[2] == 1 && x->ne[3] == 1 && D == 512);
++    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == D);
++    GGML_ASSERT(pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) && ggml_nelements(pos) == n);
++    GGML_ASSERT(ring->type == GGML_TYPE_F32 && ring->nb[0] == sizeof(float) && ring->ne[0] == D);
++    GGML_ASSERT(slot->type == GGML_TYPE_I32 && ggml_is_contiguous(slot) && ggml_nelements(slot) <= n);
++    GGML_ASSERT(rope.n_dims > 0 && rope.n_dims % 4 == 0 && rope.n_dims <= D);
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D * n + (int64_t) rope.n_dims * n);
++    ggml_set_op_params_f32(result, 0, eps);
++    ggml_set_op_params_i32(result, 1, fq ? 1 : 0);
++    ggml_dsv41_set_rope(result, 2, rope);
++    ggml_set_op_params_i32(result, 10, (int32_t) n);
++    result->op     = GGML_OP_DSV41_KV_FIN;
++    result->src[0] = x;
++    result->src[1] = w;
++    result->src[2] = pos;
++    result->src[3] = ring;
++    result->src[4] = slot;
++    return result;
++}
++
++int64_t ggml_dsv41_q8_floats(int64_t K, int64_t n) {
++    GGML_ASSERT(K % 32 == 0);
++    return n * (K / 4 + K / 32);
++}
++
++static struct ggml_tensor * ggml_dsv41_attn_dec_impl(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * ring,
++        struct ggml_tensor  * rows,
++        struct ggml_tensor  * widx,
++        struct ggml_tensor  * wmask,
++        struct ggml_tensor  * comp,
++        struct ggml_tensor  * sel,
++        struct ggml_tensor  * selm,
++        struct ggml_tensor  * sinks,
++        struct ggml_tensor  * tab,
++        int                   swa,
++        float                 scale,
++        int                   n_dims,
++        int                   hpg) {
++    const int64_t D = q->ne[0], NH = q->ne[1], n = q->ne[2];
++    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[3] == 1 && D == 512 && NH % 32 == 0);
++    GGML_ASSERT(ring->type == GGML_TYPE_F32 && ring->nb[0] == sizeof(float) && ring->ne[0] == D);
++    GGML_ASSERT(rows->type == GGML_TYPE_F32 && rows->nb[0] == sizeof(float) && rows->ne[0] == D && rows->ne[1] == n);
++    GGML_ASSERT(widx->type == GGML_TYPE_I32 && ggml_is_contiguous(widx) && swa > 0 && ggml_nelements(widx) == swa * n);
++    GGML_ASSERT(wmask->type == GGML_TYPE_F32 && wmask->nb[0] == sizeof(float) && wmask->ne[0] == swa && wmask->ne[1] == n);
++    GGML_ASSERT((comp == NULL) == (sel == NULL) && (comp == NULL) == (selm == NULL));
++    int64_t K = 0;
++    if (comp) {
++        GGML_ASSERT(comp->type == GGML_TYPE_F32 || comp->type == GGML_TYPE_F16 || comp->type == GGML_TYPE_BF16);
++        GGML_ASSERT(comp->ne[0] == D && comp->nb[0] == ggml_type_size(comp->type));
++        GGML_ASSERT(sel->type == GGML_TYPE_I32 && sel->nb[0] == 4 && sel->ne[1] == n && sel->ne[2] == 1 && sel->ne[3] == 1);
++        GGML_ASSERT(selm->type == GGML_TYPE_F32 && selm->nb[0] == 4 && selm->ne[0] == sel->ne[0] && selm->ne[1] == n);
++        K = sel->ne[0];
++    }
++    GGML_ASSERT(swa + K <= 2048);
++    GGML_ASSERT(!sinks || (sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) && ggml_nelements(sinks) == NH));
++    GGML_ASSERT(n_dims > 0 && n_dims % 4 == 0 && n_dims <= 128);   // ggml-sycl: the rotated dims sit in the last 128
++    GGML_ASSERT(tab->type == GGML_TYPE_F32 && ggml_is_contiguous(tab) && ggml_nelements(tab) == n_dims * n);
++    GGML_ASSERT(hpg == 0 || NH % hpg == 0);
++    struct ggml_tensor * result = hpg ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D * NH * n + ggml_dsv41_q8_floats(D * hpg, n * (NH / hpg)))
++                                      : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, NH, n);
++    ggml_set_op_params_i32(result, 0, swa);
++    ggml_set_op_params_f32(result, 1, scale);
++    ggml_set_op_params_i32(result, 2, n_dims);
++    ggml_set_op_params_i32(result, 10, hpg);
++    ggml_set_op_params_i32(result, 11, (int32_t) NH);
++    ggml_set_op_params_i32(result, 12, (int32_t) n);
++    result->op     = GGML_OP_DSV41_ATTN_DEC;
++    result->src[0] = q;
++    result->src[1] = ring;
++    result->src[2] = rows;
++    result->src[3] = widx;
++    result->src[4] = wmask;
++    result->src[5] = comp;
++    result->src[6] = sel;
++    result->src[7] = selm;
++    result->src[8] = sinks;
++    result->src[9] = tab;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_attn_dec(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * ring,
++        struct ggml_tensor  * rows,
++        struct ggml_tensor  * widx,
++        struct ggml_tensor  * wmask,
++        struct ggml_tensor  * comp,
++        struct ggml_tensor  * sel,
++        struct ggml_tensor  * selm,
++        struct ggml_tensor  * sinks,
++        struct ggml_tensor  * tab,
++        int                   swa,
++        float                 scale,
++        int                   n_dims) {
++    return ggml_dsv41_attn_dec_impl(ctx, q, ring, rows, widx, wmask, comp, sel, selm, sinks, tab, swa, scale, n_dims, 0);
++}
++
++struct ggml_tensor * ggml_dsv41_attn_dec_q8(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * ring,
++        struct ggml_tensor  * rows,
++        struct ggml_tensor  * widx,
++        struct ggml_tensor  * wmask,
++        struct ggml_tensor  * comp,
++        struct ggml_tensor  * sel,
++        struct ggml_tensor  * selm,
++        struct ggml_tensor  * sinks,
++        struct ggml_tensor  * tab,
++        int                   swa,
++        float                 scale,
++        int                   n_dims,
++        int                   hpg) {
++    GGML_ASSERT(hpg > 0);
++    return ggml_dsv41_attn_dec_impl(ctx, q, ring, rows, widx, wmask, comp, sel, selm, sinks, tab, swa, scale, n_dims, hpg);
++}
++
++struct ggml_tensor * ggml_dsv41_mvq(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * x8) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && x8->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_nelements(x8) == ggml_dsv41_q8_floats(x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]));
++    struct ggml_tensor * result = ggml_mul_mat(ctx, w, x);
++    result->op     = GGML_OP_DSV41_MVQ;
++    result->src[2] = x8;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_mvq_into(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * x8,
++        struct ggml_tensor  * out) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && x8->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 && w->ne[2] == 1);
++    GGML_ASSERT(w->ne[0] == x->ne[0] && ggml_nelements(x8) == ggml_dsv41_q8_floats(x->ne[0], x->ne[1]));
++    GGML_ASSERT(out->type == GGML_TYPE_F32 && out->ne[0] == w->ne[1] && out->ne[1] == x->ne[1] && out->ne[2] == 1 &&
++                out->ne[3] == 1 && out->nb[0] == sizeof(float));
++    struct ggml_tensor * result = ggml_view_tensor(ctx, out);
++    result->op     = GGML_OP_DSV41_MVQ;
++    result->src[0] = w;
++    result->src[1] = x;
++    result->src[2] = x8;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_hc_fa2(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * fn,
++        struct ggml_tensor  * pre,
++        struct ggml_tensor  * y,
++        struct ggml_tensor  * y2,
++        struct ggml_tensor  * post,
++        struct ggml_tensor  * comb) {
++    GGML_ASSERT(y && y2 && y2->type == GGML_TYPE_F32 && y2->nb[0] == sizeof(float) && ggml_are_same_shape(y, y2));
++    struct ggml_tensor * result = ggml_dsv41_hc_fa(ctx, x, fn, pre, y, post, comb);
++    result->src[7] = y2;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_hc_merge(
++        struct ggml_tensor  * fb) {
++    GGML_ASSERT(fb->op == GGML_OP_DSV41_HC_FB && fb->src[0] && fb->src[0]->op == GGML_OP_DSV41_HC_FA);
++    ggml_set_op_params_i32(fb->src[0], 3, 1);
++    ggml_set_op_params_i32(fb, 7, 1);
++    return fb;
++}
++
++struct ggml_tensor * ggml_dsv41_write_to(
++        struct ggml_tensor  * op,
++        struct ggml_tensor  * d0,
++        struct ggml_tensor  * d1,
++        struct ggml_tensor  * d2,
++        struct ggml_tensor  * d3,
++        struct ggml_tensor  * d4) {
++    struct ggml_tensor * d[5] = { d0, d1, d2, d3, d4 };
++    int first = 0, nd = 0;
++    switch (op->op) {
++        case GGML_OP_DSV41_ROUTER: first = 3; nd = 2; break;
++        case GGML_OP_DSV41_HC_FA:  first = 6; nd = 1; GGML_ASSERT(op->src[3] != NULL); break;
++        case GGML_OP_DSV41_HC_FB:  first = 4; nd = 5; break;
++        default: GGML_ABORT("ggml_dsv41_write_to: not a fused DSV4.1 op that takes destinations");
++    }
++    for (int i = 0; i < 5; ++i) {
++        if (!d[i]) continue;
++        GGML_ASSERT(i < nd && ggml_is_contiguous(d[i]));
++        op->src[first + i] = d[i];
++    }
++    return op;
++}
++
++struct ggml_tensor * ggml_dsv41_li_dec(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * keys,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * nvis,
++        struct ggml_tensor  * tab,
++        struct ggml_tensor  * cand,
++        struct ggml_tensor  * lastblk,
++        float                 wscale,
++        int                   n_dims,
++        bool                  fq) {
++    const int64_t n = q->ne[2], NKV = keys->ne[1];
++    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128 && q->ne[1] == 32 && q->ne[3] == 1 && q->nb[0] == 4 && n >= 1 && n < 8);
++    GGML_ASSERT(keys->type == GGML_TYPE_BF16 && keys->ne[0] == 128 && keys->ne[2] == 1 && keys->nb[0] == 2 && NKV % 8 == 0);
++    GGML_ASSERT(w->type == GGML_TYPE_F32 && w->ne[0] == 32 && w->ne[1] == n && w->nb[0] == 4);
++    GGML_ASSERT(nvis->type == GGML_TYPE_F32 && ggml_is_contiguous(nvis) && ggml_nelements(nvis) == n);
++    GGML_ASSERT(tab->type == GGML_TYPE_F32 && ggml_is_contiguous(tab) && ggml_nelements(tab) == n_dims * n);
++    GGML_ASSERT(!cand || (cand->type == GGML_TYPE_I32 && cand->nb[0] == 4 && cand->ne[1] == n));
++    GGML_ASSERT(!lastblk || (lastblk->type == GGML_TYPE_F32 && ggml_is_contiguous(lastblk) && ggml_nelements(lastblk) == n));
++    GGML_ASSERT(n_dims > 0 && n_dims % 4 == 0 && n_dims <= 128);
++    struct ggml_tensor * result = lastblk ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, NKV * n + (NKV / 8) * n)
++                                          : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NKV, n);
++    ggml_set_op_params_i32(result, 0, n_dims);
++    ggml_set_op_params_i32(result, 8, fq ? 1 : 0);
++    ggml_set_op_params_f32(result, 9, wscale);
++    ggml_set_op_params_i32(result, 10, (int32_t) n);
++    result->op     = GGML_OP_DSV41_LI_DEC;
++    result->src[0] = q;
++    result->src[1] = keys;
++    result->src[2] = w;
++    result->src[3] = nvis;
++    result->src[4] = tab;
++    result->src[5] = cand;
++    result->src[6] = lastblk;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_sel_fin(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * nvis,
++        struct ggml_tensor  * sel,
++        struct ggml_tensor  * selm) {
++    const int64_t K = ids->ne[0], n = ids->ne[1];
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == 4 && ids->ne[2] == 1 && ids->ne[3] == 1 && K <= 512);
++    GGML_ASSERT(nvis->type == GGML_TYPE_F32 && ggml_is_contiguous(nvis) && ggml_nelements(nvis) == n);
++    GGML_ASSERT(sel->type == GGML_TYPE_I32 && sel->nb[0] == 4 && sel->ne[0] == K && sel->ne[1] == n);
++    GGML_ASSERT(selm->type == GGML_TYPE_F32 && selm->nb[0] == 4 && selm->ne[0] == K && selm->ne[1] == n);
++    struct ggml_tensor * result = ggml_view_tensor(ctx, sel);
++    result->op     = GGML_OP_DSV41_SEL_FIN;
++    result->src[0] = ids;
++    result->src[1] = nvis;
++    result->src[2] = sel;
++    result->src[3] = selm;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_rms_q8(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * w,
++        float                 eps) {
++    const int64_t K = x->ne[0], n = x->ne[1];
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[2] == 1 && x->ne[3] == 1 && K % 32 == 0);
++    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == K);
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K * n + ggml_dsv41_q8_floats(K, n));
++    ggml_set_op_params_f32(result, 0, eps);
++    ggml_set_op_params_i32(result, 1, (int32_t) K);
++    ggml_set_op_params_i32(result, 2, (int32_t) n);
++    result->op     = GGML_OP_DSV41_RMS_Q8;
++    result->src[0] = x;
++    result->src[1] = w;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_oproj_q8(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * o,
++        struct ggml_tensor  * o8,
++        struct ggml_tensor  * wo_a,
++        struct ggml_tensor  * wo_b) {
++    struct ggml_tensor * result = ggml_dsv41_oproj(ctx, o, wo_a, wo_b);
++    GGML_ASSERT(o8->type == GGML_TYPE_F32 && ggml_nelements(o8) == ggml_dsv41_q8_floats(wo_a->ne[0], result->ne[1] * wo_a->ne[2]));
++    result->src[3] = o8;
 +    return result;
 +}
 +
@@ -397,6 +907,38 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +    return result;
 +}
 +
++static struct ggml_tensor * ggml_dsv41_hc_fb_impl(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * fa,
++        struct ggml_tensor  * scale,
++        struct ggml_tensor  * base,
++        struct ggml_tensor  * w,
++        float                 eps,
++        float                 hc_eps,
++        int                   n_iter,
++        bool                  q8) {
++    GGML_ASSERT(fa->op == GGML_OP_DSV41_HC_FA && fa->type == GGML_TYPE_F32);
++    const int32_t D = ggml_get_op_params_i32(fa, 0), hc = ggml_get_op_params_i32(fa, 1), n = ggml_get_op_params_i32(fa, 2);
++    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) && ggml_nelements(scale) >= 3);
++    GGML_ASSERT(base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && ggml_nelements(base) == (2 + hc) * hc);
++    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == D);
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) n * (D + 2 * hc + hc * hc) +
++                                                                     (q8 ? ggml_dsv41_q8_floats(D, n) : 0));
++    ggml_set_op_params_i32(result, 0, D);
++    ggml_set_op_params_i32(result, 1, hc);
++    ggml_set_op_params_i32(result, 2, n);
++    ggml_set_op_params_f32(result, 3, eps);
++    ggml_set_op_params_f32(result, 4, hc_eps);
++    ggml_set_op_params_i32(result, 5, n_iter);
++    ggml_set_op_params_i32(result, 6, q8 ? 1 : 0);
++    result->op     = GGML_OP_DSV41_HC_FB;
++    result->src[0] = fa;
++    result->src[1] = scale;
++    result->src[2] = base;
++    result->src[3] = w;
++    return result;
++}
++
 +struct ggml_tensor * ggml_dsv41_hc_fb(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * fa,
@@ -406,24 +948,19 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 +        float                 eps,
 +        float                 hc_eps,
 +        int                   n_iter) {
-+    GGML_ASSERT(fa->op == GGML_OP_DSV41_HC_FA && fa->type == GGML_TYPE_F32);
-+    const int32_t D = ggml_get_op_params_i32(fa, 0), hc = ggml_get_op_params_i32(fa, 1), n = ggml_get_op_params_i32(fa, 2);
-+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) && ggml_nelements(scale) >= 3);
-+    GGML_ASSERT(base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && ggml_nelements(base) == (2 + hc) * hc);
-+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == D);
-+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) n * (D + 2 * hc + hc * hc));
-+    ggml_set_op_params_i32(result, 0, D);
-+    ggml_set_op_params_i32(result, 1, hc);
-+    ggml_set_op_params_i32(result, 2, n);
-+    ggml_set_op_params_f32(result, 3, eps);
-+    ggml_set_op_params_f32(result, 4, hc_eps);
-+    ggml_set_op_params_i32(result, 5, n_iter);
-+    result->op     = GGML_OP_DSV41_HC_FB;
-+    result->src[0] = fa;
-+    result->src[1] = scale;
-+    result->src[2] = base;
-+    result->src[3] = w;
-+    return result;
++    return ggml_dsv41_hc_fb_impl(ctx, fa, scale, base, w, eps, hc_eps, n_iter, false);
++}
++
++struct ggml_tensor * ggml_dsv41_hc_fb_q8(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * fa,
++        struct ggml_tensor  * scale,
++        struct ggml_tensor  * base,
++        struct ggml_tensor  * w,
++        float                 eps,
++        float                 hc_eps,
++        int                   n_iter) {
++    return ggml_dsv41_hc_fb_impl(ctx, fa, scale, base, w, eps, hc_eps, n_iter, true);
 +}
 +
  struct ggml_tensor * ggml_dsv4_hc_pre(
@@ -432,7 +969,7 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2117,6 +2117,38 @@
+@@ -2117,6 +2117,47 @@
              {
                  ggml_compute_forward_dsv41_hc_mixes(params, tensor);
              } break;
@@ -456,6 +993,15 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 +            {
 +                GGML_ABORT("DSV41_OPROJ is a ggml-sycl op (no CPU implementation)");
 +            } break;
++        case GGML_OP_DSV41_KV_FIN:
++        case GGML_OP_DSV41_ATTN_DEC:
++        case GGML_OP_DSV41_MVQ:
++        case GGML_OP_DSV41_RMS_Q8:
++        case GGML_OP_DSV41_LI_DEC:
++        case GGML_OP_DSV41_SEL_FIN:
++            {
++                GGML_ABORT("DSV41_KV_FIN / _ATTN_DEC / _MVQ / _RMS_Q8 are ggml-sycl ops (no CPU implementation)");
++            } break;
 +        case GGML_OP_DSV41_HC_POST2:
 +            {
 +                ggml_compute_forward_dsv41_hc_post2(params, tensor);
@@ -471,7 +1017,7 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2305,6 +2337,23 @@
+@@ -2305,6 +2346,29 @@
              {
                  n_tasks = n_threads;
              } break;
@@ -483,6 +1029,12 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 +        case GGML_OP_DSV41_HC_FA:
 +        case GGML_OP_DSV41_HC_FB:
 +        case GGML_OP_DSV41_OPROJ:
++        case GGML_OP_DSV41_KV_FIN:
++        case GGML_OP_DSV41_ATTN_DEC:
++        case GGML_OP_DSV41_MVQ:
++        case GGML_OP_DSV41_RMS_Q8:
++        case GGML_OP_DSV41_LI_DEC:
++        case GGML_OP_DSV41_SEL_FIN:
 +            {
 +                n_tasks = 1;
 +            } break;
@@ -805,17 +1357,782 @@ diff --git a/ggml/src/ggml-sycl/dpct/helper.hpp b/ggml/src/ggml-sycl/dpct/helper
        dot_product_acc_t<T1, T2> res = c;
        auto va = extract_and_sign_or_zero_extend4(a);
        auto vb = extract_and_sign_or_zero_extend4(b);
+diff --git a/ggml/src/ggml-sycl/dsv41-dec.hpp b/ggml/src/ggml-sycl/dsv41-dec.hpp
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dsv41-dec.hpp
+@@ -0,0 +1,759 @@
++// ggml-sycl/dsv41-dec.hpp - larry (DeepSeek-V4.1 on Intel Arc B70): the decode / verify-width (< 8 queries) attention
++// core as three kernels, pointer-based (dsv41-fused.cpp wraps them as ggml ops; an engine without ggml can call them).
++//
++//   kv_fin    the window row: rms_norm(kv) * w, RoPE, FP8 fake-quant -> this pass's rows and straight into the window
++//             ring (the slots it writes hold positions >= RAW - SWA = 16 older than any query's window: nothing this
++//             pass reads); and the pass's RoPE table (cos, sin per pair and query: the layer's q, o and indexer q use
++//             the same angles - the transcendentals once, not per work-group: computed per work-group they cost the
++//             attention ~30 us a layer)
++//   attn_dec  per query its SWA window rows (ring or this pass's rows) and its top-K compressed rows, gathered straight
++//             into local memory (f16); q RoPE'd while loaded; flash-decoding over 64-key chunks with XMX (as
++//             fattn-dsv4-dec.hpp's launch_xmx); sinks; the output de-RoPE'd in the combine
++//
++// They replace, per decode layer: rms_norm * w, rope, fake_quant, set_rows (the window row); rope (q), concat (the
++// window source), kgather2, concat + cast (the mask), rope back (o) - and keep the attention's two kernels.
++// Tensor parallel: attn_dec reads q / sinks and writes o through pointers + strides over NH heads, so a shard of the
++// heads passes its slice (NH % 32 == 0).
++#pragma once
++
++#include <sycl/sycl.hpp>
++
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++
++namespace dsv41dec {
++
++// ---- RoPE as ggml-sycl's rope_norm (NORMAL mode: adjacent pairs) on the LAST n_dims values of each row; YaRN when
++// ext_factor != 0.  theta_scale = powf(freq_base, -2 / n_dims) and the corr dims (ggml_rope_yarn_corr_dims) come from
++// the host, as ggml-sycl computes them.
++struct Rope {
++    int n_dims = 0;
++    float theta_scale = 1.0f, freq_scale = 1.0f, ext_factor = 0.0f, attn_factor = 1.0f;
++    float corr0 = 0.0f, corr1 = 0.0f;
++};
++
++// cos / sin of the pair starting at iw (even, relative to the rotated range) at position p: rope_yarn's arithmetic
++inline void rope_cs(const Rope & r, int p, int iw, bool forward, float & c, float & s) {
++    const float theta_extrap = (float) p * sycl::pow(r.theta_scale, iw / 2.0f);
++    const float theta_interp = r.freq_scale * theta_extrap;
++    float theta = theta_interp;
++    float mscale = r.attn_factor;
++    if (r.ext_factor != 0.0f) {
++        const float y = (iw / 2 - r.corr0) / sycl::max(0.001f, r.corr1 - r.corr0);
++        const float ramp_mix = (1.0f - sycl::min(1.0f, sycl::max(0.0f, y))) * r.ext_factor;
++        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
++        mscale *= 1.0f + 0.1f * sycl::log(1.0f / r.freq_scale);
++    }
++    c = sycl::cos(theta) * mscale;
++    s = sycl::sin(theta) * mscale;
++    if (!forward) s *= -1.0f;
++}
++
++inline void rope_pair(const Rope & r, int p, int iw, bool forward, float & x0, float & x1) {
++    float c, s;
++    rope_cs(r, p, iw, forward, c, s);
++    const float a = x0, b = x1;
++    x0 = a * c - b * s;
++    x1 = a * s + b * c;
++}
++
++// the same rotation from a table entry (tab[iw] = cos, tab[iw + 1] = sin of the forward rotation; back: sin negated,
++// as rope_cs does)
++inline void rope_tab(const float * tab, int iw, bool forward, float & x0, float & x1) {
++    const float c = tab[iw];
++    float s = tab[iw + 1];
++    if (!forward) s *= -1.0f;
++    const float a = x0, b = x1;
++    x0 = a * c - b * s;
++    x1 = a * s + b * c;
++}
++
++// ---- the model's FP8 activation rounding (ds41_ops.hpp; dsv41-fused.cpp's fake_quant_blocks mode 0) with exact IEEE
++// arithmetic (icpx defaults to fast-math; the pragma is only allowed at file scope)
++}  // namespace dsv41dec
++#pragma float_control(precise, on, push)
++namespace dsv41dec {
++inline float fq8_pow2_ceil(float a) {
++    const uint32_t u = sycl::bit_cast<uint32_t>(a);
++    const uint32_t e = (u >> 23) & 0xffu;
++    if (e == 0) return 0.0f;
++    if (e == 0xffu) return a;
++    return (u & 0x7fffffu) == 0 ? sycl::bit_cast<float>(e << 23) : sycl::bit_cast<float>((e + 1) << 23);
++}
++inline float fq8_pow2_floor(float a) {
++    const uint32_t u = sycl::bit_cast<uint32_t>(a);
++    const uint32_t e = (u >> 23) & 0xffu;
++    if (e == 0) return 0.0f;
++    if (e == 0xffu) return a;
++    return sycl::bit_cast<float>(e << 23);
++}
++// v rounded to E4M3 (3 mantissa bits, smallest normal 2^-6), round half to even
++inline float fq8_round_e4m3(float v) {
++    const float p = sycl::fmax(fq8_pow2_floor(sycl::fabs(v)), 0x1p-6f);
++    const float r = sycl::rint(v / p * 8.0f) + 0.0f;
++    return r / 8.0f * p;
++}
++// the block scale from the block's max |x| (FP8_POW2_32: >= 1e-4, / 448, power-of-two ceiling)
++inline float fq8_scale(float amax) { return fq8_pow2_ceil(sycl::fmax(amax, 1e-4f) / 448.0f); }
++inline float fq8_apply(float x, float s) { return fq8_round_e4m3(sycl::fmin(sycl::fmax(x / s, -448.0f), 448.0f)) * s; }
++// FP4_POW2_32 (the indexer's q and k): E2M1 (1 mantissa bit, smallest normal 1), scale 2^ceil(log2(max(amax, 6 2^-126) / 6))
++inline float fq4_round_e2m1(float v) {
++    const float p = sycl::fmax(fq8_pow2_floor(sycl::fabs(v)), 1.0f);
++    const float r = sycl::rint(v / p * 2.0f) + 0.0f;
++    return r / 2.0f * p;
++}
++inline float fq4_scale(float amax) { return fq8_pow2_ceil(sycl::fmax(amax, 6.0f * 0x1p-126f) / 6.0f); }
++inline float fq4_apply(float x, float s) { return fq4_round_e2m1(sycl::fmin(sycl::fmax(x / s, -6.0f), 6.0f)) * s; }
++}  // namespace dsv41dec
++#pragma float_control(pop)
++namespace dsv41dec {
++
++// ---- int8 activations for fastmv's Q6K_R8 mat-vecs ("q8", quant_x's layout and arithmetic): per 32-value block
++// q = round(x * 127 / amax), scale amax / 127 (amax 0: all 0).  A producer that holds a block across lanes takes the
++// block's amax with sub-group shuffles (max is exact in any order) and writes the same bytes quant_x would.
++inline float q8_inv(float amax) { return amax > 0.f ? 127.0f / amax : 0.f; }
++inline uint32_t q8_pack4(float a, float b, float c, float d, float id) {
++    return ((uint32_t) ((int) sycl::rint(a * id) & 0xFF)) | ((uint32_t) ((int) sycl::rint(b * id) & 0xFF) << 8) |
++           ((uint32_t) ((int) sycl::rint(c * id) & 0xFF) << 16) | ((uint32_t) ((int) sycl::rint(d * id) & 0xFF) << 24);
++}
++
++// ================================================================== rms_q8
++// y = rms_norm(x) * w (ggml-sycl's rms_norm_f32 at decode shapes: a 256-lane work-group below 1024 values, 1024 lanes
++// from there - same sums in the same order) and y's q8: y goes through local memory, then a sub-group a 32-value block
++struct RmsQ8Args {
++    const float * x = nullptr; int64_t x_cs = 0;
++    const float * w = nullptr;
++    float eps = 0.0f;
++    float * y = nullptr;        // [n][K]
++    int8_t * q = nullptr;       // [n][K]
++    float * d = nullptr;        // [n][K / 32]
++    int K = 0, n = 0;
++};
++
++template <int WG>
++inline sycl::event rms_q8_t(sycl::queue & q, const RmsQ8Args & a) {
++    const RmsQ8Args A = a;
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> s_sum(sycl::range<1>(WG / 16), h);
++        sycl::local_accessor<float, 1> ys(sycl::range<1>((size_t) A.K), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) A.n * WG), sycl::range<1>(WG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int t = (int) it.get_group(0), l = (int) it.get_local_id(0);
++            const sycl::sub_group sg = it.get_sub_group();
++            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
++            const float * x = A.x + (size_t) t * A.x_cs;
++            float tmp = 0.0f;
++            for (int col = l; col < A.K; col += WG) {
++                const float xi = x[col];
++                tmp += xi * xi;
++            }
++#pragma unroll
++            for (int m = 8; m > 0; m >>= 1) tmp += sycl::permute_group_by_xor(sg, tmp, m);
++            if (lane == 0) s_sum[sgi] = tmp;
++            sycl::group_barrier(it.get_group());
++            tmp = 0.0f;
++            for (int i = 0; i < (WG / 16 + 15) / 16; ++i) tmp += s_sum[lane + i * 16];
++#pragma unroll
++            for (int m = 8; m > 0; m >>= 1) tmp += sycl::permute_group_by_xor(sg, tmp, m);
++            const float mean = tmp / A.K;
++            const float scale = sycl::rsqrt(mean + A.eps);
++            float * y = A.y + (size_t) t * A.K;
++            for (int col = l; col < A.K; col += WG) {
++                const float v = scale * x[col] * A.w[col];
++                y[col] = v;
++                ys[col] = v;
++            }
++            sycl::group_barrier(it.get_group());
++            const int nblk = A.K / 32;
++            for (int bk = sgi; bk < nblk; bk += WG / 16) {
++                const float v0 = ys[bk * 32 + 2 * lane], v1 = ys[bk * 32 + 2 * lane + 1];
++                const float am = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(v0), sycl::fabs(v1)), sycl::maximum<float>());
++                const float id = q8_inv(am);
++                const uint16_t pk = (uint16_t) (((int) sycl::rint(v0 * id) & 0xFF) | (((int) sycl::rint(v1 * id) & 0xFF) << 8));
++                *(uint16_t *) (A.q + (size_t) t * A.K + bk * 32 + 2 * lane) = pk;
++                if (lane == 0) A.d[(size_t) t * nblk + bk] = am / 127.0f;
++            }
++        });
++    });
++}
++
++inline sycl::event rms_q8(sycl::queue & q, const RmsQ8Args & a) {
++    return a.K < 1024 ? rms_q8_t<256>(q, a) : rms_q8_t<1024>(q, a);
++}
++
++// ================================================================== kv_fin
++struct KvFinArgs {
++    const float * x = nullptr;  int64_t x_cs = 0;      // n columns of D values (column stride in floats)
++    const float * w = nullptr;                         // [D] the norm weight
++    const int32_t * pos = nullptr;                     // [n]
++    float eps = 0.0f;
++    Rope rope;
++    bool fq = true;                                    // the FP8 rounding (act_quant)
++    float * y = nullptr;        int64_t y_cs = 0;      // n columns out
++    float * ring = nullptr;     int64_t ring_cs = 0;   // column t >= slot_from also -> ring row slot[t - slot_from]
++    const int32_t * slot = nullptr;
++    int slot_from = 0;
++    float * tab = nullptr;                             // the RoPE table: tab[t * n_dims + iw] = cos, [.. + 1] = sin
++    int D = 0, n = 0;
++};
++
++// one 256-lane work-group a column, D == 512: the sum of squares as ggml-sycl's rms_norm_f32 at this shape (2 values a
++// lane, sub-group xor butterflies, per-sub-group partials through local memory), then pairs (2 l, 2 l + 1) per lane -
++// a 16-lane sub-group holds exactly one 32-value FP8 block
++inline sycl::event kv_fin(sycl::queue & q, const KvFinArgs & a) {
++    constexpr int WG = 256, D = 2 * WG;
++    const KvFinArgs A = a;
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> s_sum(sycl::range<1>(WG / 16), h);
++        sycl::local_accessor<float, 1> ys(sycl::range<1>(D), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) A.n * WG), sycl::range<1>(WG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int t = (int) it.get_group(0), l = (int) it.get_local_id(0);
++            const sycl::sub_group sg = it.get_sub_group();
++            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
++            const float * x = A.x + (size_t) t * A.x_cs;
++            const float x0 = x[l], x1 = x[l + WG];
++            float tmp = 0.0f;
++            tmp += x0 * x0;
++            tmp += x1 * x1;
++#pragma unroll
++            for (int m = 8; m > 0; m >>= 1) tmp += sycl::permute_group_by_xor(sg, tmp, m);
++            if (lane == 0) s_sum[sgi] = tmp;
++            sycl::group_barrier(it.get_group());
++            tmp = 0.0f;
++            tmp += s_sum[lane];
++#pragma unroll
++            for (int m = 8; m > 0; m >>= 1) tmp += sycl::permute_group_by_xor(sg, tmp, m);
++            const float mean = tmp / D;
++            const float scale = sycl::rsqrt(mean + A.eps);
++            ys[l] = scale * x0 * A.w[l];
++            ys[l + WG] = scale * x1 * A.w[l + WG];
++            sycl::group_barrier(it.get_group());
++            const int i0 = 2 * l;
++            float v0 = ys[i0], v1 = ys[i0 + 1];
++            const int off = D - A.rope.n_dims;
++            if (i0 >= off) {
++                float c, sn;
++                rope_cs(A.rope, A.pos[t], i0 - off, true, c, sn);
++                const float a0 = v0, a1 = v1;
++                v0 = a0 * c - a1 * sn;
++                v1 = a0 * sn + a1 * c;
++                if (A.tab) {
++                    A.tab[(size_t) t * A.rope.n_dims + (i0 - off)] = c;
++                    A.tab[(size_t) t * A.rope.n_dims + (i0 - off) + 1] = sn;
++                }
++            }
++            if (A.fq) {
++                const float am = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(v0), sycl::fabs(v1)), sycl::maximum<float>());
++                const float s = fq8_scale(am);
++                v0 = fq8_apply(v0, s);
++                v1 = fq8_apply(v1, s);
++            }
++            *(sycl::float2 *) (A.y + (size_t) t * A.y_cs + i0) = sycl::float2(v0, v1);
++            if (A.ring && t >= A.slot_from)
++                *(sycl::float2 *) (A.ring + (size_t) A.slot[t - A.slot_from] * A.ring_cs + i0) = sycl::float2(v0, v1);
++        });
++    });
++}
++
++// ================================================================== attn_dec
++constexpr int DD = 512;            // head dim
++constexpr int XKC = 64, XHG = 32;  // keys per chunk, heads per work-group (fattn-dsv4-dec.hpp's XMX form)
++
++struct AttnArgs {
++    const float * q = nullptr;  size_t q_h = 0, q_b = 0;   // q[b * q_b + h * q_h + d], before RoPE
++    const float * tab = nullptr;                           // kv_fin's RoPE table [n][n_dims]: q forward, o back,
++    int n_dims = 0;                                        // the last n_dims of each head
++    // the window: key j < swa of query b is row widx[b * wi_b + j] of [ring (RAW rows) | rows (this pass)]
++    const float * ring = nullptr; int64_t ring_cs = 0; int RAW = 0;
++    const float * rows = nullptr; int64_t rows_cs = 0;
++    const int32_t * widx = nullptr; int64_t wi_b = 0;
++    const float * wmask = nullptr;  int64_t wm_b = 0;      // 0 / -inf
++    // the compressed keys: key swa + i of query b is row sel[b * sel_b + i] of comp (0 f32, 1 bf16, 2 f16)
++    const void * comp = nullptr; int comp_t = 0; size_t comp_rb = 0;
++    const int32_t * sel = nullptr; int64_t sel_b = 0;
++    const float * selm = nullptr;  int64_t sm_b = 0;
++    int swa = 0, K = 0;                                    // M = swa + K keys a query
++    const float * sinks = nullptr;                         // [NH] or null
++    float * o = nullptr; size_t o_h = 0, o_b = 0;          // o[b * o_b + h * o_h + d], de-RoPE'd
++    int NH = 0, n = 0;
++    float scale = 1.0f;
++    float * part = nullptr;                                // scratch_floats()
++    // optional: o's q8 for the grouped output projection - row (h / hpg) * n + b of K8 = hpg * 512 values holds query
++    // b's heads of group h / hpg (head h at (h % hpg) * 512)
++    int hpg = 0;
++    int8_t * oq = nullptr;
++    float * od = nullptr;
++};
++
++inline int n_chunks(int M) { return (M + XKC - 1) / XKC; }
++inline size_t scratch_floats(int NH, int M, int n) { return (size_t) n * n_chunks(M) * NH * (DD + 2); }
++inline bool covered(int NH, int M) { return NH % XHG == 0 && M >= 1 && n_chunks(M) <= 32; }
++
++namespace jm = sycl::ext::oneapi::experimental::matrix;
++
++inline sycl::event attn_dec(sycl::queue & q, const AttnArgs & a, sycl::event * first = nullptr) {
++    const int M = a.swa + a.K;
++    const int nch = n_chunks(M);
++    const int NH = a.NH, n = a.n;
++    constexpr int D = DD;
++    constexpr int KS = D + 8;     // ks row stride (halves): ks[key][d]
++    constexpr int QS = XHG + 8;   // qt row stride (halves): qt[d][head]
++    constexpr int SS = XHG + 4;   // ss row stride (floats): ss[key][head]
++    constexpr int PS = XKC + 16;  // ps row stride (halves): ps[head][key]
++    const AttnArgs A = a;
++    float * pO = a.part;
++    float * pML = a.part + (size_t) n * nch * NH * D;
++    sycl::event e1 = q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<sycl::half, 1> ks(sycl::range<1>((size_t) XKC * KS), h);
++        sycl::local_accessor<sycl::half, 1> qt(sycl::range<1>((size_t) D * QS), h);
++        sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) XKC * SS), h);
++        sycl::local_accessor<sycl::half, 1> ps(sycl::range<1>((size_t) XHG * PS), h);
++        sycl::local_accessor<float, 1> mk(sycl::range<1>((size_t) XKC), h);
++        sycl::local_accessor<uint64_t, 1> rp(sycl::range<1>((size_t) XKC), h);   // the chunk's key rows: address | type
++        sycl::local_accessor<float, 1> tl(sycl::range<1>((size_t) DD), h);       // the query's RoPE table
++        h.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t) n, (size_t) nch, (size_t) (NH / XHG) * 256),
++                                         sycl::range<3>(1, 1, 256)),
++                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int b = (int) it.get_group(0), c = (int) it.get_group(1), hg = (int) it.get_group(2);
++            const int lid = (int) it.get_local_id(2);
++            const sycl::sub_group sg = it.get_sub_group();
++            const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
++            const int j0 = c * XKC;
++            const int nk = sycl::min(XKC, M - j0);
++            // 0. per key of the chunk its source row (an address; bit 0: a compressed row) and its mask (-1e30 for keys
++            // past the count); the query's RoPE table -> local memory (the gather below then has no dependent loads)
++            if (lid < XKC) {
++                uint64_t ra = 0;
++                float mv = -1e30f;
++                if (lid < nk) {
++                    const int m = j0 + lid;
++                    if (m < A.swa) {
++                        const int r = A.widx[(size_t) b * A.wi_b + m];
++                        ra = (uint64_t) (r < A.RAW ? A.ring + (size_t) r * A.ring_cs : A.rows + (size_t) (r - A.RAW) * A.rows_cs);
++                        mv = A.wmask[(size_t) b * A.wm_b + m];
++                    } else {
++                        ra = (uint64_t) ((const char *) A.comp + (size_t) A.sel[(size_t) b * A.sel_b + (m - A.swa)] * A.comp_rb) | 1u;
++                        mv = A.selm[(size_t) b * A.sm_b + (m - A.swa)];
++                    }
++                    mv = sycl::fmax(mv, -1e30f);
++                }
++                rp[lid] = ra;
++                mk[lid] = mv;
++            } else if (lid - XKC < A.n_dims) {
++                tl[lid - XKC] = A.tab[(size_t) b * A.n_dims + (lid - XKC)];
++            }
++            sycl::group_barrier(it.get_group());
++            // 1. the chunk's keys -> ks (f16; rows past the key count are zero), each straight from its source row
++#pragma unroll 8
++            for (int idx = lid * 4; idx < XKC * D; idx += 256 * 4) {
++                const int row = idx / D, d = idx % D;
++                sycl::half4 hv(0.0f, 0.0f, 0.0f, 0.0f);
++                if (row < nk) {
++                    const uint64_t ra = rp[row];
++                    if (!(ra & 1u)) {
++                        const sycl::float4 fv = *reinterpret_cast<const sycl::float4 *>((const float *) ra + d);
++                        hv = sycl::half4((sycl::half) fv.x(), (sycl::half) fv.y(), (sycl::half) fv.z(), (sycl::half) fv.w());
++                    } else {
++                        const char * src = (const char *) (ra & ~(uint64_t) 1);
++                        if (A.comp_t == 1) {
++                            const sycl::uint2 u = *reinterpret_cast<const sycl::uint2 *>(src + (size_t) d * 2);
++                            hv = sycl::half4((sycl::half) sycl::bit_cast<float>(u.x() << 16), (sycl::half) sycl::bit_cast<float>(u.x() & 0xffff0000u),
++                                             (sycl::half) sycl::bit_cast<float>(u.y() << 16), (sycl::half) sycl::bit_cast<float>(u.y() & 0xffff0000u));
++                        } else if (A.comp_t == 2) {
++                            hv = *reinterpret_cast<const sycl::half4 *>(src + (size_t) d * 2);
++                        } else {
++                            const sycl::float4 fv = *reinterpret_cast<const sycl::float4 *>(src + (size_t) d * 4);
++                            hv = sycl::half4((sycl::half) fv.x(), (sycl::half) fv.y(), (sycl::half) fv.z(), (sycl::half) fv.w());
++                        }
++                    }
++                }
++                *reinterpret_cast<sycl::half4 *>(&ks[(size_t) row * KS + d]) = hv;
++            }
++            // 2. Q^T of this work-group's 32 heads -> qt (RoPE'd from the local table, scaled, f16)
++            const int roff = D - A.n_dims;
++            const float * tb = tl.template get_multi_ptr<sycl::access::decorated::no>().get();
++#pragma unroll 8
++            for (int idx = lid * 4; idx < XHG * D; idx += 256 * 4) {
++                const int hl = idx / D, d = idx % D;
++                sycl::float4 v = *reinterpret_cast<const sycl::float4 *>(A.q + (size_t) b * A.q_b + (size_t) (hg * XHG + hl) * A.q_h + d);
++                if (d >= roff) {
++                    float v0 = v.x(), v1 = v.y(), v2 = v.z(), v3 = v.w();
++                    rope_tab(tb, d - roff, true, v0, v1);
++                    rope_tab(tb, d + 2 - roff, true, v2, v3);
++                    v = sycl::float4(v0, v1, v2, v3);
++                }
++                qt[(size_t) d * QS + hl] = (sycl::half) (v.x() * A.scale);
++                qt[(size_t) (d + 1) * QS + hl] = (sycl::half) (v.y() * A.scale);
++                qt[(size_t) (d + 2) * QS + hl] = (sycl::half) (v.z() * A.scale);
++                qt[(size_t) (d + 3) * QS + hl] = (sycl::half) (v.w() * A.scale);
++            }
++            sycl::group_barrier(it.get_group());
++            auto kp = ks.template get_multi_ptr<sycl::access::decorated::no>();
++            // 3. S^T: one 8-key x 16-head tile per sub-group (keys 8 mt.., heads 16 nt..), 32 steps over D
++            {
++                const int mt = s >> 1, nt = s & 1;
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> ma;
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> mb;
++                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> mc;
++                jm::joint_matrix_fill(sg, mc, 0.0f);
++                auto qp = qt.template get_multi_ptr<sycl::access::decorated::no>();
++                for (int k = 0; k < D / 16; ++k) {
++                    jm::joint_matrix_load(sg, ma, kp + (size_t) (mt * 8) * KS + k * 16, KS);
++                    jm::joint_matrix_load(sg, mb, qp + (size_t) (k * 16) * QS + nt * 16, QS);
++                    jm::joint_matrix_mad(sg, mc, ma, mb, mc);
++                }
++                auto sp = ss.template get_multi_ptr<sycl::access::decorated::no>();
++                jm::joint_matrix_store(sg, mc, sp + (size_t) (mt * 8) * SS + nt * 16, SS, jm::layout::row_major);
++            }
++            sycl::group_barrier(it.get_group());
++            // 4. the chunk's softmax per head: sub-groups 0, 1, lane = head; P (f16) -> ps[head][key]
++            if (s < 2) {
++                const int hl = s * 16 + lane, hh = hg * XHG + hl;
++                float xv[XKC];
++                float mx = -1e30f;
++#pragma unroll
++                for (int j = 0; j < XKC; ++j) {
++                    xv[j] = sycl::fmax(ss[(size_t) j * SS + hl] + mk[j], -1e30f);
++                    mx = sycl::fmax(mx, xv[j]);
++                }
++                float l = 0.0f;
++#pragma unroll
++                for (int j = 0; j < XKC; ++j) {
++                    const float pj = xv[j] > -1e29f ? sycl::exp(xv[j] - mx) : 0.0f;
++                    l += pj;
++                    ps[(size_t) hl * PS + j] = (sycl::half) pj;
++                }
++                float * ml = pML + (((size_t) b * nch + c) * NH + hh) * 2;
++                ml[0] = mx;
++                ml[1] = l;
++            }
++            sycl::group_barrier(it.get_group());
++            // 5. this chunk's O = P . K: 4 head tiles x 32 dim tiles, 8 per sub-group, 4 steps over the keys
++            {
++                auto pp = ps.template get_multi_ptr<sycl::access::decorated::no>();
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> ma;
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> mb;
++                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> mc;
++                for (int ti = 0; ti < 8; ++ti) {
++                    const int tile = s * 8 + ti, ht = tile / 32, dt = tile % 32;
++                    jm::joint_matrix_fill(sg, mc, 0.0f);
++#pragma unroll
++                    for (int k = 0; k < XKC / 16; ++k) {
++                        jm::joint_matrix_load(sg, ma, pp + (size_t) (ht * 8) * PS + k * 16, PS);
++                        jm::joint_matrix_load(sg, mb, kp + (size_t) (k * 16) * KS + dt * 16, KS);
++                        jm::joint_matrix_mad(sg, mc, ma, mb, mc);
++                    }
++                    float * dst = pO + (((size_t) b * nch + c) * NH + hg * XHG + ht * 8) * D + dt * 16;
++                    jm::joint_matrix_store(sg, mc, sycl::address_space_cast<sycl::access::address_space::global_space,
++                                                                             sycl::access::decorated::no>(dst), D, jm::layout::row_major);
++                }
++            }
++        });
++    });
++    if (first) *first = e1;
++    // 6. combine: one sub-group per (query, head) - the chunks' parts and the sink into O, then the de-RoPE of the
++    // rotated dims (lane L holds dims 128 g + 8 L + e: the last 64 are g = 3, L >= 8, adjacent pairs in-register)
++    constexpr int SGW = 4;
++    const size_t nrows = (size_t) n * NH;
++    return q.parallel_for(sycl::nd_range<1>(sycl::range<1>((nrows + SGW - 1) / SGW * SGW * 16), sycl::range<1>(SGW * 16)),
++                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++        const sycl::sub_group sg = it.get_sub_group();
++        const size_t row = (size_t) it.get_group(0) * SGW + sg.get_group_linear_id();   // b * NH + h
++        if (row >= nrows) return;
++        const int lane = (int) sg.get_local_linear_id();
++        const int b = (int) (row / NH), hh = (int) (row % NH);
++        const float * ob = pO + ((size_t) b * nch * NH + hh) * D;
++        const float * mb = pML + ((size_t) b * nch * NH + hh) * 2;
++        const size_t cs = (size_t) NH * D, ms = (size_t) NH * 2;   // chunk strides
++        constexpr int MAXC = 32;                                  // chunks: <= 2 per lane (M <= 2048)
++        float mc[MAXC / 16], lc[MAXC / 16];
++        float gm = A.sinks ? A.sinks[hh] : -1e30f;
++#pragma unroll
++        for (int r = 0; r < MAXC / 16; ++r) {
++            const int cc = lane + 16 * r;
++            mc[r] = cc < nch ? mb[cc * ms] : -1e30f;
++            lc[r] = cc < nch ? mb[cc * ms + 1] : 0.0f;
++            gm = sycl::fmax(gm, mc[r]);
++        }
++        gm = sycl::reduce_over_group(sg, gm, sycl::maximum<float>());
++        float w[MAXC / 16], ls = 0.0f;
++#pragma unroll
++        for (int r = 0; r < MAXC / 16; ++r) { w[r] = mc[r] > -1e29f ? sycl::exp(mc[r] - gm) : 0.0f; ls += lc[r] * w[r]; }
++        float L = sycl::reduce_over_group(sg, ls, sycl::plus<float>());
++        if (A.sinks) L += sycl::exp(A.sinks[hh] - gm);
++        const float inv = L > 0.0f ? 1.0f / L : 0.0f;
++        // the lane's RoPE table entries (dims 384 + 8 lane .. + 7 are rotated when >= D - n_dims), loaded ahead
++        const int roff = D - A.n_dims;
++        float tv[8];
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            const int iw = 384 + 8 * lane + e - roff;
++            tv[e] = iw >= 0 ? A.tab[(size_t) b * A.n_dims + iw] : 0.0f;
++        }
++        float acc[D / 16];
++#pragma unroll
++        for (int i = 0; i < D / 16; ++i) acc[i] = 0.0f;
++        for (int cc = 0; cc < nch; ++cc) {
++            const float wc = sycl::select_from_group(sg, cc < 16 ? w[0] : w[1], cc % 16);
++            const float * pc = ob + cc * cs;
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(pc + 128 * g + 8 * lane);
++                const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(pc + 128 * g + 8 * lane + 4);
++                acc[8 * g] += x0.x() * wc; acc[8 * g + 1] += x0.y() * wc; acc[8 * g + 2] += x0.z() * wc; acc[8 * g + 3] += x0.w() * wc;
++                acc[8 * g + 4] += x1.x() * wc; acc[8 * g + 5] += x1.y() * wc; acc[8 * g + 6] += x1.z() * wc; acc[8 * g + 7] += x1.w() * wc;
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < D / 16; ++i) acc[i] *= inv;
++#pragma unroll
++        for (int g = 0; g < 4; ++g)
++#pragma unroll
++            for (int e = 0; e < 8; e += 2) {
++                const int d = 128 * g + 8 * lane + e;
++                if (d >= roff) {   // (g = 3 only when roff >= 384: tv holds those dims' entries)
++                    const float cs = tv[e], sn = -tv[e + 1];   // the back rotation: rope_tab(.., false)
++                    const float a0 = acc[8 * g + e], a1 = acc[8 * g + e + 1];
++                    acc[8 * g + e] = a0 * cs - a1 * sn;
++                    acc[8 * g + e + 1] = a0 * sn + a1 * cs;
++                }
++            }
++        float * op = A.o + (size_t) b * A.o_b + (size_t) hh * A.o_h;
++#pragma unroll
++        for (int g = 0; g < 4; ++g) {
++            *reinterpret_cast<sycl::float4 *>(op + 128 * g + 8 * lane) = sycl::float4(acc[8 * g], acc[8 * g + 1], acc[8 * g + 2], acc[8 * g + 3]);
++            *reinterpret_cast<sycl::float4 *>(op + 128 * g + 8 * lane + 4) = sycl::float4(acc[8 * g + 4], acc[8 * g + 5], acc[8 * g + 6], acc[8 * g + 7]);
++        }
++        if (A.hpg) {   // q8: a 32-value block is 4 lanes x 8 dims (lanes 4 j .. 4 j + 3 of one g)
++            const int K8 = A.hpg * D;
++            const size_t r8 = (size_t) (hh / A.hpg) * n + b;
++            const int koff = (hh % A.hpg) * D;
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                float am = 0.0f;
++#pragma unroll
++                for (int e = 0; e < 8; ++e) am = sycl::fmax(am, sycl::fabs(acc[8 * g + e]));
++                am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 1));
++                am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 2));
++                const float id = q8_inv(am);
++                const int k = koff + 128 * g + 8 * lane;
++                *reinterpret_cast<sycl::uint2 *>(A.oq + r8 * K8 + k) =
++                    sycl::uint2(q8_pack4(acc[8 * g], acc[8 * g + 1], acc[8 * g + 2], acc[8 * g + 3], id),
++                                q8_pack4(acc[8 * g + 4], acc[8 * g + 5], acc[8 * g + 6], acc[8 * g + 7], id));
++                if ((lane & 3) == 0) A.od[r8 * (K8 / 32) + k / 32] = am / 127.0f;
++            }
++        }
++    });
++}
++
++// ================================================================== the lightning indexer at decode widths
++// (lightning-indexer.cpp's GGML_SYCL_LI_XMX kernel with its inputs prepared in-kernel): per query b and visible key row
++// i < nvis[b]:  score = sum_h relu(q_h . k_i) * w_h * wscale  (+ -inf outside the candidate blocks when cand is set),
++// -inf for i >= nvis.  q: 32 heads x 128 dims, RoPE'd (pos) on the last n_dims and FP4-rounded (FP4_POW2_32) here.
++constexpr int LIH = 32, LID = 128;
++using li_bf16 = sycl::ext::oneapi::bfloat16;
++
++struct LiArgs {
++    const float * q = nullptr; size_t q_h = 0, q_b = 0;   // q[b * q_b + h * q_h + d] (the indexer's q_b product, raw)
++    const float * tab = nullptr;                           // kv_fin's RoPE table [n][n_dims] (same positions, same angles)
++    int n_dims = 0;
++    bool fq = true;
++    const float * w = nullptr; size_t w_b = 0;            // head weights w[b * w_b + h] (the proj product, raw)
++    float wscale = 1.0f;
++    const li_bf16 * k = nullptr; int64_t ld_k = 0;         // key rows (bf16, ld_k elements apart), NKV of them
++    int64_t NKV = 0;
++    const float * nvis = nullptr;                          // [n] visible rows per query
++    const int32_t * cand = nullptr; size_t cand_b = 0;     // ncb candidate 8-row blocks per query (null: all blocks)
++    int ncb = 0;
++    const float * lastblk = nullptr;                       // block max out: + 1e30 at block lastblk[b] (the newest)
++    float * o = nullptr; int64_t ld_o = 0;                 // scores [n][NKV]
++    float * bmax = nullptr; int64_t ld_bm = 0;             // optional: per 8-row block the max score (+ the pin) [n][NKV / 8]
++    int n = 0;
++    // scratch (li_scratch_bytes): packed q, scaled weights, candidate bitmaps
++    li_bf16 * qp = nullptr;
++    float * ws = nullptr;
++    uint32_t * bits = nullptr;
++};
++
++inline int64_t li_words(int64_t NKV) { return (NKV / 8 + 31) / 32; }
++
++// kernel 1: (query, head, 32-dim block) sub-groups -> q RoPE'd, rounded and packed for the DPAS B tiles (lightning-
++// indexer.cpp's li_xmx_pack_q layout), the scaled head weights; then one work-group per query builds its candidate
++// bitmap (bit = block id) when cand is set
++inline sycl::event li_prep(sycl::queue & q, const LiArgs & a) {
++    const LiArgs A = a;
++    const int64_t nq_sg = (int64_t) A.n * LIH * (LID / 32);   // q sub-groups
++    constexpr int WG = 256;
++    const int64_t nq_wg = (nq_sg * 16 + WG - 1) / WG;
++    const int64_t nwg = nq_wg + (A.cand ? A.n : 0);
++    const int64_t nwords = li_words(A.NKV);
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<uint32_t, 1> lb(sycl::range<1>((size_t) (A.cand ? nwords : 1)), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nwg * WG), sycl::range<1>(WG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int64_t g = (int64_t) it.get_group(0);
++            const int l = (int) it.get_local_id(0);
++            if (g < nq_wg) {
++                const sycl::sub_group sg = it.get_sub_group();
++                const int lane = (int) sg.get_local_linear_id();
++                const int64_t sgg = g * (WG / 16) + (int64_t) sg.get_group_linear_id();
++                if (sgg >= nq_sg) return;   // whole sub-groups
++                const int j = (int) (sgg % (LID / 32)), hh = (int) ((sgg / (LID / 32)) % LIH);
++                const int64_t b = sgg / ((LID / 32) * LIH);
++                const int d = 32 * j + 2 * lane;
++                const float * qr = A.q + b * A.q_b + (size_t) hh * A.q_h;
++                float x0 = qr[d], x1 = qr[d + 1];
++                const int roff = LID - A.n_dims;
++                if (d >= roff) rope_tab(A.tab + (size_t) b * A.n_dims, d - roff, true, x0, x1);
++                if (A.fq) {
++                    const float am = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(x0), sycl::fabs(x1)), sycl::maximum<float>());
++                    const float sc = fq4_scale(am);
++                    x0 = fq4_apply(x0, sc);
++                    x1 = fq4_apply(x1, sc);
++                }
++                const int nt = hh / 16, nn = hh % 16, ks = d / 16, k2 = (d % 16) / 2;
++                li_bf16 * t = A.qp + ((b * 2 + nt) * 8 + ks) * 256;
++                t[(k2 * 16 + nn) * 2 + 0] = (li_bf16) x0;
++                t[(k2 * 16 + nn) * 2 + 1] = (li_bf16) x1;
++                if (j == 0 && lane == 0) A.ws[b * LIH + hh] = A.w[b * A.w_b + hh] * A.wscale;
++                return;
++            }
++            // a query's candidate bitmap
++            const int64_t b = g - nq_wg;
++            for (int64_t i = l; i < nwords; i += WG) lb[i] = 0u;
++            sycl::group_barrier(it.get_group());
++            const int64_t nblk = A.NKV / 8;
++            for (int i = l; i < A.ncb; i += WG) {
++                const int32_t blk = A.cand[b * A.cand_b + i];
++                if (blk >= 0 && blk < nblk) {
++                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
++                                     sycl::access::address_space::local_space> r(lb[blk / 32]);
++                    r.fetch_or(1u << (blk % 32));
++                }
++            }
++            sycl::group_barrier(it.get_group());
++            for (int64_t i = l; i < nwords; i += WG) A.bits[b * nwords + i] = lb[i];
++        });
++    });
++}
++
++// kernel 2: the XMX scores (li_xmx_run's tiles: 8 key rows x 32 heads per sub-group), then per row the head sum, the
++// visibility (i < nvis: score + 0 - normalising -0 as the mask add did; else -inf) and the candidate mask; with bmax
++// the 8-row block's max (+ 0 or + 1e30 for the newest block, as the pin add did)
++inline sycl::event li_run(sycl::queue & q, const LiArgs & a) {
++    namespace mx = sycl::ext::oneapi::experimental::matrix;
++    constexpr int SG = 16, SGPWG = 8, TPS = 4;
++    const LiArgs A = a;
++    const int64_t ntiles = A.NKV / 8;
++    const int64_t nsg = (ntiles + TPS - 1) / TPS;
++    const int64_t nwg = (nsg + SGPWG - 1) / SGPWG;
++    const int64_t nwords = li_words(A.NKV);
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> scr(sycl::range<1>((size_t) SGPWG * 256), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nwg * SGPWG * SG), sycl::range<1>(SGPWG * SG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const sycl::sub_group sg = it.get_sub_group();
++            const int sgi = (int) sg.get_group_linear_id();
++            const int lane = (int) sg.get_local_linear_id();
++            const int64_t gsg = (int64_t) it.get_group(0) * SGPWG + sgi;
++            auto sp = scr.get_multi_ptr<sycl::access::decorated::no>() + (size_t) sgi * 256;
++            for (int tt = 0; tt < TPS; ++tt) {
++                const int64_t tile = gsg * TPS + tt;
++                if (tile >= ntiles) break;   // (uniform across the sub-group)
++                const int64_t row0 = tile * 8;
++                for (int64_t b = 0; b < A.n; ++b) {
++                    mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> c0, c1;
++                    mx::joint_matrix_fill(sg, c0, 0.0f);
++                    mx::joint_matrix_fill(sg, c1, 0.0f);
++                    for (int ks = 0; ks < 8; ++ks) {
++                        mx::joint_matrix<sycl::sub_group, li_bf16, mx::use::a, 8, 16, mx::layout::row_major> ma;
++                        mx::joint_matrix<sycl::sub_group, li_bf16, mx::use::b, 16, 16, mx::layout::ext_intel_packed> mb0, mb1;
++                        mx::joint_matrix_load(sg, ma, sycl::address_space_cast<sycl::access::address_space::global_space,
++                                              sycl::access::decorated::no>(A.k + row0 * A.ld_k + ks * 16), A.ld_k);
++                        mx::joint_matrix_load(sg, mb0, sycl::address_space_cast<sycl::access::address_space::global_space,
++                                              sycl::access::decorated::no>(A.qp + ((b * 2 + 0) * 8 + ks) * 256), 32);
++                        mx::joint_matrix_load(sg, mb1, sycl::address_space_cast<sycl::access::address_space::global_space,
++                                              sycl::access::decorated::no>(A.qp + ((b * 2 + 1) * 8 + ks) * 256), 32);
++                        mx::joint_matrix_mad(sg, c0, ma, mb0, c0);
++                        mx::joint_matrix_mad(sg, c1, ma, mb1, c1);
++                    }
++                    mx::joint_matrix_store(sg, c0, sp, 16, mx::layout::row_major);         // [8 rows][16 heads]
++                    mx::joint_matrix_store(sg, c1, sp + 128, 16, mx::layout::row_major);   // heads 16-31
++                    sycl::group_barrier(sg);
++                    float v = -INFINITY;
++                    if (lane < 8) {
++                        const float * wb = A.ws + b * LIH;
++                        float acc = 0.0f;
++                        for (int nn = 0; nn < 16; ++nn) acc += sycl::fmax(sp[lane * 16 + nn], 0.0f) * wb[nn];
++                        for (int nn = 0; nn < 16; ++nn) acc += sycl::fmax(sp[128 + lane * 16 + nn], 0.0f) * wb[16 + nn];
++                        const int64_t row = row0 + lane;
++                        bool on = (float) row < A.nvis[b];   // the mask's 0 / -inf: visible iff nvis - i > 0
++                        if (on && A.cand) on = (A.bits[b * nwords + tile / 32] >> (tile % 32)) & 1u;
++                        // acc + 0: -0 becomes +0 as the mask add made it (bit test: fast-math may fold a float add of 0)
++                        v = on ? sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(acc) == 0x80000000u ? 0u : sycl::bit_cast<uint32_t>(acc))
++                               : -INFINITY;
++                        A.o[b * A.ld_o + row] = v;
++                    }
++                    if (A.bmax) {   // pool max over the block's 8 rows (lanes 8-15 carry -inf), then the pin add
++                        float m = sycl::reduce_over_group(sg, lane < 8 ? v : -INFINITY, sycl::maximum<float>());
++                        if (m == -INFINITY) m = -3.402823466e+38f;   // pool_2d starts at -FLT_MAX
++                        if (lane == 0) {
++                            const float pin = (float) tile == A.lastblk[b] ? 1e30f : 0.0f;
++                            const float r = m + pin;
++                            A.bmax[b * A.ld_bm + tile] = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(r) == 0x80000000u ? 0u : sycl::bit_cast<uint32_t>(r));
++                        }
++                    }
++                    sycl::group_barrier(sg);
++                }
++            }
++        });
++    });
++}
++
++// ================================================================== the top-k ids, canonicalised
++// per query one work-group: its K top-k ids (any order) sorted ascending (bitonic over 512, padded with INT_MAX) ->
++// sel, and selm = 0 where the row is visible (id < nvis) else -inf
++struct SelArgs {
++    const int32_t * ids = nullptr; size_t ids_b = 0;
++    const float * nvis = nullptr;
++    int32_t * sel = nullptr; size_t sel_b = 0;
++    float * selm = nullptr; size_t selm_b = 0;
++    int K = 0, n = 0;
++};
++
++inline sycl::event sel_fin(sycl::queue & q, const SelArgs & a) {
++    constexpr int NS = 512, WG = 256;
++    const SelArgs A = a;
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<int32_t, 1> v(sycl::range<1>(NS), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) A.n * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
++            const int64_t b = (int64_t) it.get_group(0);
++            const int l = (int) it.get_local_id(0);
++            for (int i = l; i < NS; i += WG) v[i] = i < A.K ? A.ids[b * A.ids_b + i] : 0x7fffffff;
++            sycl::group_barrier(it.get_group());
++            for (int kk = 2; kk <= NS; kk <<= 1) {
++                for (int jj = kk >> 1; jj > 0; jj >>= 1) {
++                    for (int i = l; i < NS; i += WG) {
++                        const int ixj = i ^ jj;
++                        if (ixj > i) {
++                            const int32_t x = v[i], y = v[ixj];
++                            const bool up = (i & kk) == 0;
++                            if (up ? x > y : x < y) { v[i] = y; v[ixj] = x; }
++                        }
++                    }
++                    sycl::group_barrier(it.get_group());
++                }
++            }
++            const float nv = A.nvis[b];
++            for (int i = l; i < A.K; i += WG) {
++                const int32_t s = v[i];
++                A.sel[b * A.sel_b + i] = s;
++                A.selm[b * A.selm_b + i] = (float) s < nv ? 0.0f : -INFINITY;
++            }
++        });
++    });
++}
++
++}  // namespace dsv41dec
 diff --git a/ggml/src/ggml-sycl/dsv41-fused.cpp b/ggml/src/ggml-sycl/dsv41-fused.cpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-fused.cpp
-@@ -0,0 +1,633 @@
+@@ -0,0 +1,1068 @@
 +// ggml-sycl/dsv41-fused.cpp - larry (Strata-DS4 on Intel): the two fused DeepSeek-V4.1 ops of Xolotl's ggml patch
 +// (GGML_OP_DSV41_FAKE_QUANT, GGML_OP_DSV41_HC_MIXES) for the SYCL backend.  The CUDA versions (ggml-cuda/dsv4-hc.cu)
 +// reproduce the stock-op composites of tools/v41/engine with float tricks (x + 1.5*2^23 - 1.5*2^23 for round-half-even,
 +// Veltkamp splitting for powers of two); icpx compiles with fast-math reassociation by default, which may fold those,
 +// so these use rint() and exponent-bit arithmetic instead - the same values for every finite input the ops see.
 +#include "dsv41-fused.hpp"
++#include "dsv41-dec.hpp"
 +
 +#include <cmath>
 +#include <cstdint>
@@ -950,6 +2267,10 @@ new file mode 100644
 +    const float * ps = (const float *) dst->src[2]->data;
 +    float * pd = (float *) dst->data;
 +    const size_t dstride = dst->nb[1] / 4;
++    // larry, ggml_dsv41_write_to: the ids (int) and weights also straight into their tensors
++    int32_t * pid = dst->src[3] ? (int32_t *) dst->src[3]->data : nullptr;
++    float * pwd = dst->src[4] ? (float *) dst->src[4]->data : nullptr;
++    const size_t ids_s = dst->src[3] ? dst->src[3]->nb[1] / 4 : 0, wd_s = dst->src[4] ? dst->src[4]->nb[1] / 4 : 0;
 +    ctx.stream()->submit([&](sycl::handler & h) {
 +        sycl::local_accessor<float, 1> cv(sycl::range<1>(NSG * KMAX), h);   // candidates: selection value
 +        sycl::local_accessor<int, 1> ci(sycl::range<1>(NSG * KMAX), h);     // expert id
@@ -1027,8 +2348,11 @@ new file mode 100644
 +            }
 +            if (lane < k) {
 +                float * o = pd + (size_t) t * dstride;
++                const float wv = (norm ? w_my / (sum + 1e-20f) : w_my) * scale;
 +                o[lane] = (float) id_my;
-+                o[k + lane] = (norm ? w_my / (sum + 1e-20f) : w_my) * scale;
++                o[k + lane] = wv;
++                if (pid) pid[(size_t) t * ids_s + lane] = id_my;
++                if (pwd) pwd[(size_t) t * wd_s + lane] = wv;
 +            }
 +        });
 +    });
@@ -1157,10 +2481,39 @@ new file mode 100644
 +void ggml_sycl_op_dsv41_swiglu_lim(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 +    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
 +    const ggml_tensor * y = dst->src[0];
-+    const int64_t N = dst->ne[0], n = dst->ne[1];
 +    const float lim = ggml_get_op_params_f32(dst, 0);
 +    const float * py = (const float *) y->data;
 +    float * pd = (float *) dst->data;
++    if (ggml_get_op_params_i32(dst, 1)) {
++        // larry, ggml_dsv41_swiglu_q8: one sub-group a 32-value block (2 values a lane), the same arithmetic per value,
++        // then the block's q8 (out [N, n] | q [n][N] | d [n][N / 32])
++        const int64_t N = ggml_get_op_params_i32(dst, 2), n = ggml_get_op_params_i32(dst, 3), nblk = N / 32;
++        int8_t * oq = (int8_t *) (pd + N * n);
++        float * od = (float *) (oq + N * n);
++        ctx.stream()->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * nblk * 16)), sycl::range<1>(16)),
++                                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int64_t g = (int64_t) it.get_group(0), t = g / nblk, bk = g % nblk;
++            const int lane = (int) it.get_local_id(0);
++            const int64_t i = bk * 32 + 2 * lane;
++            float o[2];
++#pragma unroll
++            for (int j = 0; j < 2; ++j) {
++                float gt = py[t * 2 * N + i + j], u = py[t * 2 * N + N + i + j];
++                if (lim > 0.0f) {
++                    gt = gt > lim ? lim : gt;
++                    u = u < -lim ? -lim : (u > lim ? lim : u);
++                }
++                o[j] = gt / (1.0f + sycl::exp(-gt)) * u;
++            }
++            *(sycl::float2 *) (pd + t * N + i) = sycl::float2(o[0], o[1]);
++            const float am = sycl::reduce_over_group(it.get_sub_group(), sycl::fmax(sycl::fabs(o[0]), sycl::fabs(o[1])), sycl::maximum<float>());
++            const float id = dsv41dec::q8_inv(am);
++            *(uint16_t *) (oq + t * N + i) = (uint16_t) (((int) sycl::rint(o[0] * id) & 0xFF) | (((int) sycl::rint(o[1] * id) & 0xFF) << 8));
++            if (lane == 0) od[t * nblk + bk] = am / 127.0f;
++        });
++        return;
++    }
++    const int64_t N = dst->ne[0], n = dst->ne[1];
 +    ctx.stream()->parallel_for(sycl::range<1>((size_t) (N * n)), [=](sycl::id<1> id) {
 +        const int64_t i = (int64_t) id[0] % N, t = (int64_t) id[0] / N;
 +        float g = py[t * 2 * N + i], u = py[t * 2 * N + N + i];
@@ -1216,119 +2569,142 @@ new file mode 100644
 +// GGML_OP_DSV41_HC_FA: one sub-group per (token, 128-column chunk, group of 6 mixes rows); a lane takes 8 columns of
 +// every hc row: h (hc_post, or x itself), z = hc_pre(h, pre), then the 6 rows' fn . h (16-byte weight loads).  Row
 +// group 0 also writes h and z and the chunk's sums of h^2 and z^2.  No SLM, no barriers.
++// one sub-group's share of hc_fa (token t, chunk ch, row group rg) - the body hc_fa_sycl and the merged hc kernel share
 +template <bool W16, bool POST>
-+void hc_fa_sycl(sycl::queue * q, const float * x, int64_t xs1, int64_t xs2, const void * fn, int64_t fs1,
-+                const float * pre, int64_t ps1, const float * y, int64_t ys1, const float * post, int64_t pos1,
-+                const float * comb, int64_t cs1, int64_t cs2, float * out, int64_t D, int64_t n) {
++inline void hc_fa_part(const sycl::sub_group & sg, int lane, int64_t t, int64_t ch, int rg, const float * x, int64_t xs1,
++                       int64_t xs2, const void * fn, int64_t fs1, const float * pre, int64_t ps1, const float * y, int64_t ys1,
++                       const float * post, int64_t pos1, const float * comb, int64_t cs1, int64_t cs2, float * out, int64_t D,
++                       int64_t n, float * hdst, const float * y2, int64_t y2s1) {
 +    constexpr int HC = 4, NR = 24, NRG = 4, RPG = NR / NRG, IPL = 8, SG = 16, NV = 32;
 +    const int64_t nch = D / (SG * IPL);
 +    float * oh = out;
 +    float * oz = out + n * HC * D;
 +    float * op = oz + n * D;
++    const int64_t i0 = ch * (SG * IPL) + lane * IPL;
++    float h[HC][IPL];
++    const float * xt = x + t * xs2 + i0;
++#pragma unroll
++    for (int s = 0; s < HC; ++s) {
++        const sycl::float4 va = *(const sycl::float4 *) (xt + s * xs1), vb = *(const sycl::float4 *) (xt + s * xs1 + 4);
++        h[s][0] = va.x(); h[s][1] = va.y(); h[s][2] = va.z(); h[s][3] = va.w();
++        h[s][4] = vb.x(); h[s][5] = vb.y(); h[s][6] = vb.z(); h[s][7] = vb.w();
++    }
++    if constexpr (POST) {
++        float xr[HC][IPL];
++#pragma unroll
++        for (int s = 0; s < HC; ++s)
++#pragma unroll
++            for (int j = 0; j < IPL; ++j) xr[s][j] = h[s][j];
++        sycl::float4 ya = *(const sycl::float4 *) (y + t * ys1 + i0), yb = *(const sycl::float4 *) (y + t * ys1 + i0 + 4);
++        if (y2) {   // larry, ggml_dsv41_hc_fa2: the finish's shexp + routed (hc_post2's add)
++            ya += *(const sycl::float4 *) (y2 + t * y2s1 + i0);
++            yb += *(const sycl::float4 *) (y2 + t * y2s1 + i0 + 4);
++        }
++        const float yv[IPL] = { ya.x(), ya.y(), ya.z(), ya.w(), yb.x(), yb.y(), yb.z(), yb.w() };
++        const float * pp = post + t * pos1;
++        const float * cc = comb + t * cs2;
++#pragma unroll
++        for (int d = 0; d < HC; ++d) {
++            const float pd = pp[d];
++            float cd[HC];
++#pragma unroll
++            for (int s = 0; s < HC; ++s) cd[s] = cc[d + s * cs1];
++#pragma unroll
++            for (int j = 0; j < IPL; ++j) {
++                float v = yv[j] * pd;
++#pragma unroll
++                for (int s = 0; s < HC; ++s) v += xr[s][j] * cd[s];
++                h[d][j] = v;
++            }
++        }
++    }
++    const float * pw = pre + t * ps1;
++    const float p0 = pw[0], p1 = pw[1], p2 = pw[2], p3 = pw[3];
++    float z[IPL];
++#pragma unroll
++    for (int j = 0; j < IPL; ++j) {
++        float v = h[0][j] * p0;
++        v += h[1][j] * p1;
++        v += h[2][j] * p2;
++        v += h[3][j] * p3;
++        z[j] = v;
++    }
++    float * P = op + (t * nch + ch) * NV;
++    if (rg == 0) {
++        if constexpr (POST) {
++#pragma unroll
++            for (int d = 0; d < HC; ++d) {
++                float * o = oh + t * HC * D + d * D + i0;
++                *(sycl::float4 *) o = sycl::float4(h[d][0], h[d][1], h[d][2], h[d][3]);
++                *(sycl::float4 *) (o + 4) = sycl::float4(h[d][4], h[d][5], h[d][6], h[d][7]);
++                if (hdst) {   // larry, ggml_dsv41_write_to: the FFN residual straight into its state tensor
++                    float * o2 = hdst + t * HC * D + d * D + i0;
++                    *(sycl::float4 *) o2 = sycl::float4(h[d][0], h[d][1], h[d][2], h[d][3]);
++                    *(sycl::float4 *) (o2 + 4) = sycl::float4(h[d][4], h[d][5], h[d][6], h[d][7]);
++                }
++            }
++        }
++        *(sycl::float4 *) (oz + t * D + i0) = sycl::float4(z[0], z[1], z[2], z[3]);
++        *(sycl::float4 *) (oz + t * D + i0 + 4) = sycl::float4(z[4], z[5], z[6], z[7]);
++        float sh = 0.0f, sz = 0.0f;
++#pragma unroll
++        for (int j = 0; j < IPL; ++j) {
++#pragma unroll
++            for (int d = 0; d < HC; ++d) sh += h[d][j] * h[d][j];
++            sz += z[j] * z[j];
++        }
++        sh = sycl::reduce_over_group(sg, sh, sycl::plus<float>());
++        sz = sycl::reduce_over_group(sg, sz, sycl::plus<float>());
++        if (lane == 0) { P[NR] = sh; P[NR + 1] = sz; }
++    }
++    float acc[RPG];
++#pragma unroll
++    for (int rr = 0; rr < RPG; ++rr) {
++        const int64_t r = rg * RPG + rr;
++        float a = 0.0f;
++#pragma unroll
++        for (int d = 0; d < HC; ++d) {
++            float wv[IPL];
++            if constexpr (W16) {
++                const sycl::vec<sycl::half, 8> hv = *(const sycl::vec<sycl::half, 8> *) ((const sycl::half *) fn + r * fs1 + d * D + i0);
++#pragma unroll
++                for (int j = 0; j < IPL; ++j) wv[j] = (float) hv[j];
++            } else {
++                const float * wr = (const float *) fn + r * fs1 + d * D + i0;
++                const sycl::float4 wa = *(const sycl::float4 *) wr, wb = *(const sycl::float4 *) (wr + 4);
++                wv[0] = wa.x(); wv[1] = wa.y(); wv[2] = wa.z(); wv[3] = wa.w();
++                wv[4] = wb.x(); wv[5] = wb.y(); wv[6] = wb.z(); wv[7] = wb.w();
++            }
++#pragma unroll
++            for (int j = 0; j < IPL; ++j) a += wv[j] * h[d][j];
++        }
++        acc[rr] = a;
++    }
++#pragma unroll
++    for (int rr = 0; rr < RPG; ++rr) acc[rr] = sycl::reduce_over_group(sg, acc[rr], sycl::plus<float>());
++    if (lane == 0) {
++#pragma unroll
++        for (int rr = 0; rr < RPG; ++rr) P[rg * RPG + rr] = acc[rr];
++    }
++}
++
++// GGML_OP_DSV41_HC_FA: one sub-group per (token, 128-column chunk, group of 6 mixes rows); a lane takes 8 columns of
++// every hc row: h (hc_post, or x itself), z = hc_pre(h, pre), then the 6 rows' fn . h (16-byte weight loads).  Row
++// group 0 also writes h and z and the chunk's sums of h^2 and z^2.  No SLM, no barriers.
++template <bool W16, bool POST>
++void hc_fa_sycl(sycl::queue * q, const float * x, int64_t xs1, int64_t xs2, const void * fn, int64_t fs1,
++                const float * pre, int64_t ps1, const float * y, int64_t ys1, const float * post, int64_t pos1,
++                const float * comb, int64_t cs1, int64_t cs2, float * out, int64_t D, int64_t n, float * hdst = nullptr,
++                const float * y2 = nullptr, int64_t y2s1 = 0) {
++    constexpr int NRG = 4, IPL = 8, SG = 16;
++    const int64_t nch = D / (SG * IPL);
 +    q->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * nch * NRG * SG)), sycl::range<1>(SG)),
 +                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
 +        const int64_t g = (int64_t) it.get_group(0);
 +        const int rg = (int) (g % NRG);
 +        const int64_t ch = (g / NRG) % nch, t = g / (NRG * nch);
-+        const int lane = (int) it.get_local_id(0);
-+        const int64_t i0 = ch * (SG * IPL) + lane * IPL;
-+        float h[HC][IPL];
-+        const float * xt = x + t * xs2 + i0;
-+#pragma unroll
-+        for (int s = 0; s < HC; ++s) {
-+            const sycl::float4 va = *(const sycl::float4 *) (xt + s * xs1), vb = *(const sycl::float4 *) (xt + s * xs1 + 4);
-+            h[s][0] = va.x(); h[s][1] = va.y(); h[s][2] = va.z(); h[s][3] = va.w();
-+            h[s][4] = vb.x(); h[s][5] = vb.y(); h[s][6] = vb.z(); h[s][7] = vb.w();
-+        }
-+        if constexpr (POST) {
-+            float xr[HC][IPL];
-+#pragma unroll
-+            for (int s = 0; s < HC; ++s)
-+#pragma unroll
-+                for (int j = 0; j < IPL; ++j) xr[s][j] = h[s][j];
-+            const sycl::float4 ya = *(const sycl::float4 *) (y + t * ys1 + i0), yb = *(const sycl::float4 *) (y + t * ys1 + i0 + 4);
-+            const float yv[IPL] = { ya.x(), ya.y(), ya.z(), ya.w(), yb.x(), yb.y(), yb.z(), yb.w() };
-+            const float * pp = post + t * pos1;
-+            const float * cc = comb + t * cs2;
-+#pragma unroll
-+            for (int d = 0; d < HC; ++d) {
-+                const float pd = pp[d];
-+                float cd[HC];
-+#pragma unroll
-+                for (int s = 0; s < HC; ++s) cd[s] = cc[d + s * cs1];
-+#pragma unroll
-+                for (int j = 0; j < IPL; ++j) {
-+                    float v = yv[j] * pd;
-+#pragma unroll
-+                    for (int s = 0; s < HC; ++s) v += xr[s][j] * cd[s];
-+                    h[d][j] = v;
-+                }
-+            }
-+        }
-+        const float * pw = pre + t * ps1;
-+        const float p0 = pw[0], p1 = pw[1], p2 = pw[2], p3 = pw[3];
-+        float z[IPL];
-+#pragma unroll
-+        for (int j = 0; j < IPL; ++j) {
-+            float v = h[0][j] * p0;
-+            v += h[1][j] * p1;
-+            v += h[2][j] * p2;
-+            v += h[3][j] * p3;
-+            z[j] = v;
-+        }
-+        const sycl::sub_group sg = it.get_sub_group();
-+        float * P = op + (t * nch + ch) * NV;
-+        if (rg == 0) {
-+            if constexpr (POST) {
-+#pragma unroll
-+                for (int d = 0; d < HC; ++d) {
-+                    float * o = oh + t * HC * D + d * D + i0;
-+                    *(sycl::float4 *) o = sycl::float4(h[d][0], h[d][1], h[d][2], h[d][3]);
-+                    *(sycl::float4 *) (o + 4) = sycl::float4(h[d][4], h[d][5], h[d][6], h[d][7]);
-+                }
-+            }
-+            *(sycl::float4 *) (oz + t * D + i0) = sycl::float4(z[0], z[1], z[2], z[3]);
-+            *(sycl::float4 *) (oz + t * D + i0 + 4) = sycl::float4(z[4], z[5], z[6], z[7]);
-+            float sh = 0.0f, sz = 0.0f;
-+#pragma unroll
-+            for (int j = 0; j < IPL; ++j) {
-+#pragma unroll
-+                for (int d = 0; d < HC; ++d) sh += h[d][j] * h[d][j];
-+                sz += z[j] * z[j];
-+            }
-+            sh = sycl::reduce_over_group(sg, sh, sycl::plus<float>());
-+            sz = sycl::reduce_over_group(sg, sz, sycl::plus<float>());
-+            if (lane == 0) { P[NR] = sh; P[NR + 1] = sz; }
-+        }
-+        float acc[RPG];
-+#pragma unroll
-+        for (int rr = 0; rr < RPG; ++rr) {
-+            const int64_t r = rg * RPG + rr;
-+            float a = 0.0f;
-+#pragma unroll
-+            for (int d = 0; d < HC; ++d) {
-+                float wv[IPL];
-+                if constexpr (W16) {
-+                    const sycl::vec<sycl::half, 8> hv = *(const sycl::vec<sycl::half, 8> *) ((const sycl::half *) fn + r * fs1 + d * D + i0);
-+#pragma unroll
-+                    for (int j = 0; j < IPL; ++j) wv[j] = (float) hv[j];
-+                } else {
-+                    const float * wr = (const float *) fn + r * fs1 + d * D + i0;
-+                    const sycl::float4 wa = *(const sycl::float4 *) wr, wb = *(const sycl::float4 *) (wr + 4);
-+                    wv[0] = wa.x(); wv[1] = wa.y(); wv[2] = wa.z(); wv[3] = wa.w();
-+                    wv[4] = wb.x(); wv[5] = wb.y(); wv[6] = wb.z(); wv[7] = wb.w();
-+                }
-+#pragma unroll
-+                for (int j = 0; j < IPL; ++j) a += wv[j] * h[d][j];
-+            }
-+            acc[rr] = a;
-+        }
-+#pragma unroll
-+        for (int rr = 0; rr < RPG; ++rr) acc[rr] = sycl::reduce_over_group(sg, acc[rr], sycl::plus<float>());
-+        if (lane == 0) {
-+#pragma unroll
-+            for (int rr = 0; rr < RPG; ++rr) P[rg * RPG + rr] = acc[rr];
-+        }
++        hc_fa_part<W16, POST>(it.get_sub_group(), (int) it.get_local_id(0), t, ch, rg, x, xs1, xs2, fn, fs1, pre, ps1, y, ys1,
++                              post, pos1, comb, cs1, cs2, out, D, n, hdst, y2, y2s1);
 +    });
 +}
 +
@@ -1340,6 +2716,7 @@ new file mode 100644
 +    const ggml_tensor * y = dst->src[3], * post = dst->src[4], * comb = dst->src[5];
 +    const int64_t D = ggml_get_op_params_i32(dst, 0), hc = ggml_get_op_params_i32(dst, 1), n = ggml_get_op_params_i32(dst, 2);
 +    GGML_ASSERT(hc == 4 && D % 128 == 0 && fn->ne[1] == 24);
++    if (ggml_get_op_params_i32(dst, 3)) return;   // larry, ggml_dsv41_hc_merge: its hc_fb runs this work in the same kernel
 +    const bool w16 = fn->type == GGML_TYPE_F16;
 +    const int64_t fs1 = fn->nb[1] / ggml_type_size(fn->type);
 +    const float * px = (const float *) x->data;
@@ -1352,12 +2729,145 @@ new file mode 100644
 +        const float * po = (const float *) post->data;
 +        const float * pc = (const float *) comb->data;
 +        const int64_t ys1 = y->nb[1] / 4, pos1 = post->nb[1] / 4, cs1 = comb->nb[1] / 4, cs2 = comb->nb[2] / 4;
-+        if (w16) hc_fa_sycl<true, true>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, py, ys1, po, pos1, pc, cs1, cs2, out, D, n);
-+        else     hc_fa_sycl<false, true>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, py, ys1, po, pos1, pc, cs1, cs2, out, D, n);
++        float * hd = dst->src[6] ? (float *) dst->src[6]->data : nullptr;
++        const float * py2 = dst->src[7] ? (const float *) dst->src[7]->data : nullptr;
++        const int64_t y2s1 = dst->src[7] ? dst->src[7]->nb[1] / 4 : 0;
++        if (w16) hc_fa_sycl<true, true>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, py, ys1, po, pos1, pc, cs1, cs2, out, D, n, hd, py2, y2s1);
++        else     hc_fa_sycl<false, true>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, py, ys1, po, pos1, pc, cs1, cs2, out, D, n, hd, py2, y2s1);
 +    } else {
 +        if (w16) hc_fa_sycl<true, false>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, nullptr, 0, nullptr, 0, nullptr, 0, 0, out, D, n);
 +        else     hc_fa_sycl<false, false>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, nullptr, 0, nullptr, 0, nullptr, 0, 0, out, D, n);
 +    }
++}
++
++// larry, ggml_dsv41_hc_merge: HC_FA + HC_FB as ONE kernel.  256-lane work-groups of 16 hc_fa sub-groups (a token's
++// nch * 4 of them), then the token's last work-group to finish (one atomic count per token, reset by that group) runs
++// hc_fb's work for the whole token - the chunk partials summed in hc_fb's order, every 1024-column block of xn (+ q8),
++// the mixes and the Sinkhorn: the same arithmetic as the two kernels, one launch less (twice a layer).
++struct HcFbOut {
++    const float * sc = nullptr, * bs = nullptr, * pw = nullptr;
++    float eps = 0.0f, hc_eps = 0.0f;
++    int n_iter = 0;
++    bool q8 = false;
++    float * oxn = nullptr, * opre = nullptr, * opost = nullptr, * ocomb = nullptr;
++    int8_t * oq = nullptr;
++    float * od = nullptr;
++    float * dxn = nullptr, * dpre = nullptr, * dpost = nullptr, * dcomb = nullptr;
++    int8_t * dq = nullptr;
++    float * dqd = nullptr;
++};
++
++template <bool W16, bool POST>
++void hc_fab_sycl(sycl::queue * q, const float * x, int64_t xs1, int64_t xs2, const void * fn, int64_t fs1,
++                 const float * pre, int64_t ps1, const float * y, int64_t ys1, const float * post, int64_t pos1,
++                 const float * comb, int64_t cs1, int64_t cs2, float * out, int64_t D, int64_t n, float * hdst,
++                 const HcFbOut & F, uint32_t * cnt, const float * y2 = nullptr, int64_t y2s1 = 0) {
++    constexpr int HC = 4, NR = 24, NRG = 4, IPL = 8, SG = 16, WG = 256, NV = 32, NCG = WG / NV;
++    const int64_t nch = D / (SG * IPL), nwgt = nch * NRG / (WG / SG), nb = (D + 4 * WG - 1) / (4 * WG);
++    const float * fz = out + n * HC * D;
++    const float * fp = fz + n * D;
++    const HcFbOut O = F;
++    q->submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> part(sycl::range<1>(WG), h), tot(sycl::range<1>(NV), h);
++        sycl::local_accessor<int, 1> lastf(sycl::range<1>(1), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * nwgt * WG)), sycl::range<1>(WG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const int64_t g = (int64_t) it.get_group(0), t = g / nwgt, wt = g % nwgt;
++            const int l = (int) it.get_local_id(0);
++            const sycl::sub_group sg = it.get_sub_group();
++            const int64_t sgg = wt * (WG / SG) + (int64_t) sg.get_group_linear_id();
++            hc_fa_part<W16, POST>(sg, (int) sg.get_local_linear_id(), t, sgg / NRG, (int) (sgg % NRG), x, xs1, xs2, fn, fs1, pre, ps1,
++                                  y, ys1, post, pos1, comb, cs1, cs2, out, D, n, hdst, y2, y2s1);
++            // this group's writes out, then count it; the token's last group continues
++            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
++            sycl::group_barrier(it.get_group());
++            if (l == 0) {
++                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
++                                 sycl::access::address_space::global_space> a(cnt[t]);
++                lastf[0] = a.fetch_add(1u) == (uint32_t) (nwgt - 1) ? 1 : 0;
++            }
++            sycl::group_barrier(it.get_group());
++            if (!lastf[0]) return;
++            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
++            // ---- hc_fb for token t (its per-block work-groups' code, the blocks in a loop)
++            const int v = l % NV, cg = l / NV;
++            float s = 0.0f;
++            if (v < NR + 2)
++                for (int64_t c = cg; c < nch; c += NCG) s += fp[(t * nch + c) * NV + v];
++            part[l] = s;
++            it.barrier(sycl::access::fence_space::local_space);
++            if (l < NV) {
++                float a = 0.0f;
++#pragma unroll
++                for (int k = 0; k < NCG; ++k) a += part[k * NV + l];
++                tot[l] = a;
++            }
++            it.barrier(sycl::access::fence_space::local_space);
++            const float rz = sycl::rsqrt(tot[NR + 1] / (float) D + O.eps);
++            for (int64_t blk = 0; blk < nb; ++blk) {
++                const int64_t i = blk * 4 * WG + (int64_t) l * 4;
++                sycl::float4 xv(0.0f, 0.0f, 0.0f, 0.0f);
++                if (i < D) {
++                    const sycl::float4 zv = *(const sycl::float4 *) (fz + t * D + i);
++                    const sycl::float4 wv = *(const sycl::float4 *) (O.pw + i);
++                    xv = zv * rz * wv;
++                    *(sycl::float4 *) (O.oxn + t * D + i) = xv;
++                    if (O.dxn) *(sycl::float4 *) (O.dxn + t * D + i) = xv;
++                }
++                if (O.q8) {
++                    float am = sycl::fmax(sycl::fmax(sycl::fabs(xv.x()), sycl::fabs(xv.y())), sycl::fmax(sycl::fabs(xv.z()), sycl::fabs(xv.w())));
++                    am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 1));
++                    am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 2));
++                    am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 4));
++                    if (i < D) {
++                        const uint32_t pk = dsv41dec::q8_pack4(xv.x(), xv.y(), xv.z(), xv.w(), dsv41dec::q8_inv(am));
++                        *(uint32_t *) (O.oq + t * D + i) = pk;
++                        if ((l & 7) == 0) O.od[t * (D / 32) + i / 32] = am / 127.0f;
++                        if (O.dq) {
++                            *(uint32_t *) (O.dq + t * D + i) = pk;
++                            if ((l & 7) == 0) O.dqd[t * (D / 32) + i / 32] = am / 127.0f;
++                        }
++                    }
++                }
++            }
++            if (l < 16) {   // the whole first sub-group: the mixes and the Sinkhorn
++                const float rh = sycl::rsqrt(tot[NR] / (float) (HC * D) + O.eps);
++                if (l < 2 * HC) {
++                    const bool is_post = l >= HC;
++                    const float m = tot[l] * rh * O.sc[is_post ? 1 : 0] + O.bs[l];
++                    const float sgm = 1.0f / (1.0f + sycl::exp(-m));
++                    if (is_post) {
++                        O.opost[t * HC + (l - HC)] = 2.0f * sgm;
++                        if (O.dpost) O.dpost[t * HC + (l - HC)] = 2.0f * sgm;
++                    } else {
++                        O.opre[t * HC + l] = sgm + O.hc_eps;
++                        if (O.dpre) O.dpre[t * HC + l] = sgm + O.hc_eps;
++                    }
++                }
++                float c = tot[2 * HC + l] * rh * O.sc[2] + O.bs[2 * HC + l];
++                float mx = sycl::fmax(c, sycl::permute_group_by_xor(sg, c, 1));
++                mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, 2));
++                c = sycl::exp(c - mx);
++                float sm = c + sycl::permute_group_by_xor(sg, c, 1);
++                sm += sycl::permute_group_by_xor(sg, sm, 2);
++                c = c * (1.0f / sm) + O.hc_eps;
++                float cs = c + sycl::permute_group_by_xor(sg, c, 4);
++                cs += sycl::permute_group_by_xor(sg, cs, 8);
++                c *= 1.0f / (cs + O.hc_eps);
++                for (int k = 1; k < O.n_iter; ++k) {
++                    float rs = c + sycl::permute_group_by_xor(sg, c, 1);
++                    rs += sycl::permute_group_by_xor(sg, rs, 2);
++                    c *= 1.0f / (rs + O.hc_eps);
++                    cs = c + sycl::permute_group_by_xor(sg, c, 4);
++                    cs += sycl::permute_group_by_xor(sg, cs, 8);
++                    c *= 1.0f / (cs + O.hc_eps);
++                }
++                O.ocomb[t * HC * HC + l] = c;
++                if (O.dcomb) O.dcomb[t * HC * HC + l] = c;
++                if (l == 0) cnt[t] = 0u;   // ready for the next launch
++            }
++        });
++    });
 +}
 +
 +// GGML_OP_DSV41_HC_FB: (token, 1024-column block) work-groups of 256.  Each sums the token's chunk partials (8 lanes a
@@ -1370,6 +2880,7 @@ new file mode 100644
 +    const int64_t D = ggml_get_op_params_i32(dst, 0), hc = ggml_get_op_params_i32(dst, 1), n = ggml_get_op_params_i32(dst, 2);
 +    const float eps = ggml_get_op_params_f32(dst, 3), hc_eps = ggml_get_op_params_f32(dst, 4);
 +    const int n_iter = ggml_get_op_params_i32(dst, 5);
++    const bool q8 = ggml_get_op_params_i32(dst, 6) != 0;   // larry, ggml_dsv41_hc_fb_q8: xn's q8 after comb
 +    constexpr int HC = 4, NR = 24, WG = 256, NV = 32, NCG = WG / NV;
 +    GGML_ASSERT(hc == HC && D % 4 == 0);
 +    const int64_t nch = D / 128, nb = (D + 4 * WG - 1) / (4 * WG);
@@ -1382,6 +2893,52 @@ new file mode 100644
 +    float * opre = oxn + n * D;
 +    float * opost = opre + n * HC;
 +    float * ocomb = opost + n * HC;
++    int8_t * oq = (int8_t *) (ocomb + n * HC * HC);
++    float * od = (float *) (oq + n * D);
++    GGML_ASSERT(!q8 || D % 32 == 0);
++    // larry, ggml_dsv41_write_to: xn / pre / post / comb / q8(xn) also straight into their tensors (null: not written)
++    float * dxn = dst->src[4] ? (float *) dst->src[4]->data : nullptr;
++    float * dpre = dst->src[5] ? (float *) dst->src[5]->data : nullptr;
++    float * dpost = dst->src[6] ? (float *) dst->src[6]->data : nullptr;
++    float * dcomb = dst->src[7] ? (float *) dst->src[7]->data : nullptr;
++    int8_t * dq = q8 && dst->src[8] ? (int8_t *) dst->src[8]->data : nullptr;
++    float * dqd = dq ? (float *) (dq + n * D) : nullptr;
++    if (ggml_get_op_params_i32(dst, 7)) {   // larry, ggml_dsv41_hc_merge: hc_fa's work too, in one kernel
++        const ggml_tensor * x = fa->src[0], * fn = fa->src[1], * pre = fa->src[2];
++        const ggml_tensor * y = fa->src[3], * post = fa->src[4], * comb = fa->src[5];
++        GGML_ASSERT(n <= 64 && (D / 128) % 4 == 0 && fn->ne[1] == NR);
++        static uint32_t * cnt[GGML_SYCL_MAX_DEVICES] = {};   // per token: the hc_fa work-groups done (back to 0 each time)
++        if (!cnt[ctx.device]) {
++            cnt[ctx.device] = sycl::malloc_device<uint32_t>(64, *ctx.stream());
++            ctx.stream()->memset(cnt[ctx.device], 0, 64 * sizeof(uint32_t)).wait();
++        }
++        HcFbOut F;
++        F.sc = sc; F.bs = bs; F.pw = pw; F.eps = eps; F.hc_eps = hc_eps; F.n_iter = n_iter; F.q8 = q8;
++        F.oxn = oxn; F.opre = opre; F.opost = opost; F.ocomb = ocomb; F.oq = oq; F.od = od;
++        F.dxn = dxn; F.dpre = dpre; F.dpost = dpost; F.dcomb = dcomb; F.dq = dq; F.dqd = dqd;
++        const bool w16 = fn->type == GGML_TYPE_F16;
++        const int64_t fs1 = fn->nb[1] / ggml_type_size(fn->type);
++        const float * px = (const float *) x->data;
++        const int64_t xs1 = x->nb[1] / 4, xs2 = x->nb[2] / 4, ps1 = pre->nb[1] / 4;
++        const float * pp = (const float *) pre->data;
++        float * out = (float *) fa->data;
++        sycl::queue * q = ctx.stream();
++        if (y) {
++            const float * py = (const float *) y->data;
++            const float * po = (const float *) post->data;
++            const float * pc = (const float *) comb->data;
++            const int64_t ys1 = y->nb[1] / 4, pos1 = post->nb[1] / 4, cs1 = comb->nb[1] / 4, cs2 = comb->nb[2] / 4;
++            float * hd = fa->src[6] ? (float *) fa->src[6]->data : nullptr;
++            const float * py2 = fa->src[7] ? (const float *) fa->src[7]->data : nullptr;
++            const int64_t y2s1 = fa->src[7] ? fa->src[7]->nb[1] / 4 : 0;
++            if (w16) hc_fab_sycl<true, true>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, py, ys1, po, pos1, pc, cs1, cs2, out, D, n, hd, F, cnt[ctx.device], py2, y2s1);
++            else     hc_fab_sycl<false, true>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, py, ys1, po, pos1, pc, cs1, cs2, out, D, n, hd, F, cnt[ctx.device], py2, y2s1);
++        } else {
++            if (w16) hc_fab_sycl<true, false>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, nullptr, 0, nullptr, 0, nullptr, 0, 0, out, D, n, nullptr, F, cnt[ctx.device]);
++            else     hc_fab_sycl<false, false>(q, px, xs1, xs2, fn->data, fs1, pp, ps1, nullptr, 0, nullptr, 0, nullptr, 0, 0, out, D, n, nullptr, F, cnt[ctx.device]);
++        }
++        return;
++    }
 +    ctx.stream()->submit([&](sycl::handler & h) {
 +        sycl::local_accessor<float, 1> part(sycl::range<1>(WG), h), tot(sycl::range<1>(NV), h);
 +        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * nb * WG)), sycl::range<1>(WG)),
@@ -1403,10 +2960,29 @@ new file mode 100644
 +            it.barrier(sycl::access::fence_space::local_space);
 +            const float rz = sycl::rsqrt(tot[NR + 1] / (float) D + eps);
 +            const int64_t i = blk * 4 * WG + (int64_t) l * 4;
++            sycl::float4 xv(0.0f, 0.0f, 0.0f, 0.0f);
 +            if (i < D) {
 +                const sycl::float4 zv = *(const sycl::float4 *) (fz + t * D + i);
 +                const sycl::float4 wv = *(const sycl::float4 *) (pw + i);
-+                *(sycl::float4 *) (oxn + t * D + i) = zv * rz * wv;
++                xv = zv * rz * wv;
++                *(sycl::float4 *) (oxn + t * D + i) = xv;
++                if (dxn) *(sycl::float4 *) (dxn + t * D + i) = xv;
++            }
++            if (q8) {   // a 32-value block = 8 lanes x 4 values (xor 1, 2, 4 stay inside it)
++                const sycl::sub_group qs = it.get_sub_group();
++                float am = sycl::fmax(sycl::fmax(sycl::fabs(xv.x()), sycl::fabs(xv.y())), sycl::fmax(sycl::fabs(xv.z()), sycl::fabs(xv.w())));
++                am = sycl::fmax(am, sycl::permute_group_by_xor(qs, am, 1));
++                am = sycl::fmax(am, sycl::permute_group_by_xor(qs, am, 2));
++                am = sycl::fmax(am, sycl::permute_group_by_xor(qs, am, 4));
++                if (i < D) {
++                    const uint32_t pk = dsv41dec::q8_pack4(xv.x(), xv.y(), xv.z(), xv.w(), dsv41dec::q8_inv(am));
++                    *(uint32_t *) (oq + t * D + i) = pk;
++                    if ((l & 7) == 0) od[t * (D / 32) + i / 32] = am / 127.0f;
++                    if (dq) {
++                        *(uint32_t *) (dq + t * D + i) = pk;
++                        if ((l & 7) == 0) dqd[t * (D / 32) + i / 32] = am / 127.0f;
++                    }
++                }
 +            }
 +            if (blk == 0 && l < 16) {   // the whole first sub-group: its shuffles below are convergent
 +                const sycl::sub_group sg = it.get_sub_group();
@@ -1415,8 +2991,13 @@ new file mode 100644
 +                    const bool is_post = l >= HC;
 +                    const float m = tot[l] * rh * sc[is_post ? 1 : 0] + bs[l];
 +                    const float sgm = 1.0f / (1.0f + sycl::exp(-m));
-+                    if (is_post) opost[t * HC + (l - HC)] = 2.0f * sgm;
-+                    else opre[t * HC + l] = sgm + hc_eps;
++                    if (is_post) {
++                        opost[t * HC + (l - HC)] = 2.0f * sgm;
++                        if (dpost) dpost[t * HC + (l - HC)] = 2.0f * sgm;
++                    } else {
++                        opre[t * HC + l] = sgm + hc_eps;
++                        if (dpre) dpre[t * HC + l] = sgm + hc_eps;
++                    }
 +                }
 +                float c = tot[2 * HC + l] * rh * sc[2] + bs[2 * HC + l];
 +                // per src (lanes 4 src .. 4 src + 3): softmax over dst, + eps
@@ -1439,15 +3020,185 @@ new file mode 100644
 +                    c *= 1.0f / (cs + hc_eps);
 +                }
 +                ocomb[t * HC * HC + l] = c;
++                if (dcomb) dcomb[t * HC * HC + l] = c;
 +            }
 +        });
 +    });
++}
++
++// ---- larry: the decode-width attention core (dsv41-dec.hpp).  The RoPE parameters sit in the op params from i0 as
++// ggml.c's ggml_dsv41_set_rope wrote them; theta_scale and the YaRN corr dims are derived on the host as ggml-sycl's rope
++// does.
++static dsv41dec::Rope dsv41_rope_params(const ggml_tensor * t, int i0) {
++    dsv41dec::Rope r;
++    r.n_dims = ggml_get_op_params_i32(t, i0 + 0);
++    const int n_ctx_orig = ggml_get_op_params_i32(t, i0 + 1);
++    const float freq_base = ggml_get_op_params_f32(t, i0 + 2);
++    r.freq_scale = ggml_get_op_params_f32(t, i0 + 3);
++    r.ext_factor = ggml_get_op_params_f32(t, i0 + 4);
++    r.attn_factor = ggml_get_op_params_f32(t, i0 + 5);
++    const float beta_fast = ggml_get_op_params_f32(t, i0 + 6), beta_slow = ggml_get_op_params_f32(t, i0 + 7);
++    r.theta_scale = powf(freq_base, -2.0f / r.n_dims);
++    float corr[2];
++    ggml_rope_yarn_corr_dims(r.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr);
++    r.corr0 = corr[0];
++    r.corr1 = corr[1];
++    return r;
++}
++
++void ggml_sycl_op_dsv41_kv_fin(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/5);
++    const ggml_tensor * x = dst->src[0], * w = dst->src[1], * pos = dst->src[2], * ring = dst->src[3], * slot = dst->src[4];
++    GGML_ASSERT(x->ne[0] == 512);
++    dsv41dec::KvFinArgs a;
++    a.x = (const float *) x->data;
++    a.x_cs = (int64_t) (x->nb[1] / 4);
++    a.w = (const float *) w->data;
++    a.pos = (const int32_t *) pos->data;
++    a.eps = ggml_get_op_params_f32(dst, 0);
++    a.fq = ggml_get_op_params_i32(dst, 1) != 0;
++    a.rope = dsv41_rope_params(dst, 2);
++    a.y = (float *) dst->data;   // y [512, n], then the RoPE table [n_dims, n]
++    a.y_cs = 512;
++    a.tab = a.y + (size_t) 512 * x->ne[1];
++    a.ring = (float *) ring->data;
++    a.ring_cs = (int64_t) (ring->nb[1] / 4);
++    a.slot = (const int32_t *) slot->data;
++    a.D = (int) x->ne[0];
++    a.n = (int) x->ne[1];
++    a.slot_from = a.n - (int) ggml_nelements(slot);
++    dsv41dec::kv_fin(*ctx.stream(), a);
++}
++
++void ggml_sycl_op_dsv41_attn_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/10);
++    const ggml_tensor * q = dst->src[0], * ring = dst->src[1], * rows = dst->src[2], * widx = dst->src[3], * wmask = dst->src[4];
++    const ggml_tensor * comp = dst->src[5], * sel = dst->src[6], * selm = dst->src[7], * sinks = dst->src[8], * tab = dst->src[9];
++    dsv41dec::AttnArgs a;
++    a.q = (const float *) q->data;
++    a.q_h = q->nb[1] / 4;
++    a.q_b = q->nb[2] / 4;
++    a.tab = (const float *) tab->data;
++    a.n_dims = ggml_get_op_params_i32(dst, 2);
++    a.ring = (const float *) ring->data;
++    a.ring_cs = (int64_t) (ring->nb[1] / 4);
++    a.RAW = (int) ring->ne[1];
++    a.rows = (const float *) rows->data;
++    a.rows_cs = (int64_t) (rows->nb[1] / 4);
++    a.swa = ggml_get_op_params_i32(dst, 0);
++    a.widx = (const int32_t *) widx->data;
++    a.wi_b = a.swa;
++    a.wmask = (const float *) wmask->data;
++    a.wm_b = (int64_t) (wmask->nb[1] / 4);
++    if (comp) {
++        a.comp = comp->data;
++        a.comp_t = comp->type == GGML_TYPE_BF16 ? 1 : comp->type == GGML_TYPE_F16 ? 2 : 0;
++        a.comp_rb = comp->nb[1];
++        a.sel = (const int32_t *) sel->data;
++        a.sel_b = (int64_t) (sel->nb[1] / 4);
++        a.selm = (const float *) selm->data;
++        a.sm_b = (int64_t) (selm->nb[1] / 4);
++        a.K = (int) sel->ne[0];
++    }
++    a.sinks = sinks ? (const float *) sinks->data : nullptr;
++    a.NH = (int) q->ne[1];
++    a.n = (int) q->ne[2];
++    a.o = (float *) dst->data;
++    a.hpg = ggml_get_op_params_i32(dst, 10);
++    if (a.hpg) {   // ggml_dsv41_attn_dec_q8: o [512, NH, n] | q8 of the head groups
++        a.o_h = 512;
++        a.o_b = (size_t) a.NH * 512;
++        a.oq = (int8_t *) (a.o + (size_t) 512 * a.NH * a.n);
++        a.od = (float *) (a.oq + (size_t) 512 * a.NH * a.n);
++    } else {
++        a.o_h = dst->nb[1] / 4;
++        a.o_b = dst->nb[2] / 4;
++    }
++    a.scale = ggml_get_op_params_f32(dst, 1);
++    GGML_ASSERT(dsv41dec::covered(a.NH, a.swa + a.K) && a.n < 8);
++    ggml_sycl_pool_alloc<float> part(ctx.pool(), dsv41dec::scratch_floats(a.NH, a.swa + a.K, a.n));
++    a.part = part.get();
++    dsv41dec::attn_dec(*ctx.stream(), a);
++}
++
++void ggml_sycl_op_dsv41_rms_q8(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
++    const ggml_tensor * x = dst->src[0], * w = dst->src[1];
++    dsv41dec::RmsQ8Args a;
++    a.K = ggml_get_op_params_i32(dst, 1);
++    a.n = ggml_get_op_params_i32(dst, 2);
++    a.eps = ggml_get_op_params_f32(dst, 0);
++    a.x = (const float *) x->data;
++    a.x_cs = (int64_t) (x->nb[1] / 4);
++    a.w = (const float *) w->data;
++    a.y = (float *) dst->data;
++    a.q = (int8_t *) (a.y + (size_t) a.K * a.n);
++    a.d = (float *) (a.q + (size_t) a.K * a.n);
++    dsv41dec::rms_q8(*ctx.stream(), a);
++}
++
++void ggml_sycl_op_dsv41_li_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/7);
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * w = dst->src[2], * nvis = dst->src[3], * tab = dst->src[4];
++    const ggml_tensor * cand = dst->src[5], * lastblk = dst->src[6];
++    dsv41dec::LiArgs a;
++    a.n = (int) q->ne[2];
++    a.q = (const float *) q->data;
++    a.q_h = q->nb[1] / 4;
++    a.q_b = q->nb[2] / 4;
++    a.tab = (const float *) tab->data;
++    a.n_dims = ggml_get_op_params_i32(dst, 0);
++    a.fq = ggml_get_op_params_i32(dst, 8) != 0;
++    a.w = (const float *) w->data;
++    a.w_b = w->nb[1] / 4;
++    a.wscale = ggml_get_op_params_f32(dst, 9);
++    a.k = (const dsv41dec::li_bf16 *) k->data;
++    a.ld_k = (int64_t) (k->nb[1] / 2);
++    a.NKV = k->ne[1];
++    a.nvis = (const float *) nvis->data;
++    if (cand) {
++        a.cand = (const int32_t *) cand->data;
++        a.cand_b = cand->nb[1] / 4;
++        a.ncb = (int) cand->ne[0];
++    }
++    a.o = (float *) dst->data;
++    a.ld_o = a.NKV;
++    if (lastblk) {
++        a.lastblk = (const float *) lastblk->data;
++        a.bmax = a.o + a.NKV * a.n;
++        a.ld_bm = a.NKV / 8;
++    }
++    // scratch, freed in reverse order (the VMM pool frees in stack order)
++    ggml_sycl_pool_alloc<dsv41dec::li_bf16> qp(ctx.pool(), (size_t) a.n * 4096);
++    ggml_sycl_pool_alloc<float> ws(ctx.pool(), (size_t) a.n * dsv41dec::LIH);
++    ggml_sycl_pool_alloc<uint32_t> bits(ctx.pool(), (size_t) (cand ? a.n * dsv41dec::li_words(a.NKV) : 1));
++    a.qp = qp.get();
++    a.ws = ws.get();
++    a.bits = bits.get();
++    dsv41dec::li_prep(*ctx.stream(), a);
++    dsv41dec::li_run(*ctx.stream(), a);
++}
++
++void ggml_sycl_op_dsv41_sel_fin(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
++    const ggml_tensor * ids = dst->src[0], * nvis = dst->src[1], * sel = dst->src[2], * selm = dst->src[3];
++    dsv41dec::SelArgs a;
++    a.ids = (const int32_t *) ids->data;
++    a.ids_b = ids->nb[1] / 4;
++    a.nvis = (const float *) nvis->data;
++    a.sel = (int32_t *) sel->data;
++    a.sel_b = sel->nb[1] / 4;
++    a.selm = (float *) selm->data;
++    a.selm_b = selm->nb[1] / 4;
++    a.K = (int) ids->ne[0];
++    a.n = (int) ids->ne[1];
++    dsv41dec::sel_fin(*ctx.stream(), a);
 +}
 diff --git a/ggml/src/ggml-sycl/dsv41-fused.hpp b/ggml/src/ggml-sycl/dsv41-fused.hpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-fused.hpp
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,29 @@
 +#ifndef GGML_SYCL_DSV41_FUSED_HPP
 +#define GGML_SYCL_DSV41_FUSED_HPP
 +
@@ -1467,6 +3218,14 @@ new file mode 100644
 +void ggml_sycl_op_dsv41_hc_post2(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +void ggml_sycl_op_dsv41_hc_fa(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +void ggml_sycl_op_dsv41_hc_fb(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// larry: DeepSeek-V4.1's decode-width window row and attention (GGML_OP_DSV41_KV_FIN / _ATTN_DEC; dsv41-dec.hpp)
++void ggml_sycl_op_dsv41_kv_fin(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++void ggml_sycl_op_dsv41_attn_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// larry: rms_norm * w with the result's int8 form for the next mat-vec (GGML_OP_DSV41_RMS_Q8)
++void ggml_sycl_op_dsv41_rms_q8(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// larry: the decode-width lightning indexer and its top-k canonicalisation (GGML_OP_DSV41_LI_DEC / _SEL_FIN)
++void ggml_sycl_op_dsv41_li_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++void ggml_sycl_op_dsv41_sel_fin(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +
 +#endif  // GGML_SYCL_DSV41_FUSED_HPP
 diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
@@ -3191,7 +4950,14 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
      argmax_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
  }
  
-@@ -4667,6 +4842,18 @@
+@@ -4661,12 +4836,24 @@
+ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
+     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
+            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
+-           dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
++           (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_DSV41_MVQ) &&   //limit to some supported cases of Q4_0, to do for more cases.
+            // ne[1] <= 8 so multi-column decode (spec / MTP verify) also bootstraps the reorder;
+            // all reorderable types have a _switch_ncols kernel.
             dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
  }
  
@@ -3210,7 +4976,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4921,342 @@
+@@ -4734,6 +4921,359 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -3313,12 +5079,16 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +};
 +static std::unordered_map<const void *, larry_qcache_set> g_larry_qcache;
 +static uint64_t g_larry_graph_epoch = 1;
++// larry: GGML_OP_DSV41_MVQ - the int8 activations its producer already wrote (quant_x's layout), for the one mat-vec
++// being queued: larry_fastmv's Q6K_R8 path takes them instead of quantising src1 again
++static const int8_t * g_larry_pre_xq = nullptr;
++static const float * g_larry_pre_xd = nullptr;
 +
 +static bool larry_fastmv(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 +    static const int on = ggml_sycl_get_env("GGML_SYCL_LARRY_FASTMV", 1);
 +    static const int f16_max_rows = ggml_sycl_get_env("GGML_SYCL_LARRY_FASTMV_F16_ROWS", 1 << 30);
 +    static const int q6r8 = ggml_sycl_get_env("GGML_SYCL_LARRY_Q6R8", 1);
-+    if (!on || dst->op != GGML_OP_MUL_MAT) return false;
++    if (!on || (dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_DSV41_MVQ)) return false;
 +    if (!src0->buffer || ggml_backend_buffer_is_sycl_split(src0->buffer)) return false;
 +    static const int woa = ggml_sycl_get_env("GGML_SYCL_LARRY_WOA", 1);
 +    const bool slice_planar = src0->type == GGML_TYPE_Q6_K && g_larry_slice_planar.count(src0->data) != 0;
@@ -3389,6 +5159,11 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    a.y = (float *) dst->data;
 +    a.y_col_stride = (int64_t) (dst->nb[1] / 4); a.y_batch_stride = (int64_t) (dst->nb[2] / 4);
 +    a.ncols = (int) ncols;
++    if (t == fastmv::WType::Q6K_R8 && g_larry_pre_xq) {   // DSV41_MVQ: the producer quantised x already
++        a.xq = g_larry_pre_xq;
++        a.xd = g_larry_pre_xd;
++        return fastmv::launch(*ctx.stream(), t, a);
++    }
 +    if (t == fastmv::WType::Q6K_R8 && fastmv::xmx_wants(a)) {
 +        // larry, GGML_SYCL_LARRY_XMXMV: XMX for the latency-bound verify shapes; the transposed activations are kept
 +        // per graph like the int8 ones (same input = q_a / kv's attn_norm, quantised once)
@@ -3497,7 +5272,8 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +// (quant_x + fastmv Q6K_R8 for wo_a's slices and for wo_b: the same numbers)
 +// wa: wo_a's 2-D weight (its slices: sb bytes apart); x / y: n columns (OGD * OG / y_cs floats apart)
 +static bool larry_oproj_core(ggml_backend_sycl_context & ctx, const ggml_tensor * wa, size_t sb, int64_t OGD, int64_t OL,
-+                             int64_t OG, const ggml_tensor * wb, const float * x, int64_t n, float * y, int64_t y_cs) {
++                             int64_t OG, const ggml_tensor * wb, const float * x, int64_t n, float * y, int64_t y_cs,
++                             const int8_t * x8q = nullptr, const float * x8d = nullptr) {
 +    const int64_t D = wb->ne[1], KA = OL * OG;
 +    if (n < 1 || n > 8 || wa->type != GGML_TYPE_Q6_K || wb->type != GGML_TYPE_Q6_K || OGD % QK_K || KA % QK_K) return false;
 +    queue_ptr st = ctx.stream();
@@ -3514,18 +5290,22 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +    if (g_larry_oproj_hook &&
 +        g_larry_oproj_hook(st, wa->data, sb, wb->data, OGD, OL, OG, D, (int) n, x, OGD * OG, y, y_cs, g_larry_oproj_user))
 +        return true;
-+    ggml_sycl_pool_alloc<int8_t> xq(ctx.pool(), (size_t) (OG * n * OGD));
-+    ggml_sycl_pool_alloc<float> xd(ctx.pool(), (size_t) (OG * n * OGD / 32));
++    // (x8q / x8d: o's int8 form from its producer, GGML_OP_DSV41_ATTN_DEC's q8 - the first quant_x skipped; the pool
++    // allocations stay in the same order either way: the VMM pool frees in stack order)
++    ggml_sycl_pool_alloc<int8_t> xq(ctx.pool(), x8q ? (size_t) 1 : (size_t) (OG * n * OGD));
++    ggml_sycl_pool_alloc<float> xd(ctx.pool(), x8q ? (size_t) 1 : (size_t) (OG * n * OGD / 32));
 +    ggml_sycl_pool_alloc<float> oa(ctx.pool(), (size_t) (KA * n));
 +    ggml_sycl_pool_alloc<int8_t> aq(ctx.pool(), (size_t) (KA * n));
 +    ggml_sycl_pool_alloc<float> ad(ctx.pool(), (size_t) (KA * n / 32));
-+    fastmv::quant_x(*st, x, OGD * OG, OGD, (int) n, OG, OGD, xq.get(), xd.get());
++    if (!x8q) fastmv::quant_x(*st, x, OGD * OG, OGD, (int) n, OG, OGD, xq.get(), xd.get());
 +    fastmv::Args a;   // wo_a: slice g of o's column c -> oa[c * KA + g * OL + r] (wo_b's input column)
++    // (sb, not wa->nb[2]: wa is the 2-D parent here - its nb[2] is the whole tensor, every slice past the first was read
++    // out of bounds; only the tier's hook ever took this op before)
 +    a.w = wa->data; a.K = OGD; a.N = OL; a.G = OG; a.g_div = 1;
-+    a.n_blocks_total = OL * (OGD / QK_K); a.w_batch_bytes = wa->nb[2];
++    a.n_blocks_total = OL * (OGD / QK_K); a.w_batch_bytes = sb;
 +    a.x = x; a.x_col_stride = OGD * OG; a.x_batch_stride = OGD;
 +    a.y = oa.get(); a.y_col_stride = KA; a.y_batch_stride = OL;
-+    a.ncols = (int) n; a.xq = xq.get(); a.xd = xd.get();
++    a.ncols = (int) n; a.xq = x8q ? x8q : xq.get(); a.xd = x8q ? x8d : xd.get();
 +    if (!fastmv::launch(*st, fastmv::WType::Q6K_R8, a)) return false;
 +    fastmv::quant_x(*st, oa.get(), KA, KA, (int) n, 1, KA, aq.get(), ad.get());
 +    fastmv::Args b;
@@ -3539,8 +5319,11 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +
 +static bool larry_oproj(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 +    const ggml_tensor * wa = dst->src[1];   // the 3-D view: its parent holds the slices
++    const ggml_tensor * o8 = dst->src[3];   // ggml_dsv41_oproj_q8: o's int8 form (rows OG * n of OGD, then the scales)
++    const int8_t * x8q = o8 ? (const int8_t *) o8->data : nullptr;
++    const float * x8d = o8 ? (const float *) ((const char *) o8->data + (size_t) (wa->ne[2] * dst->ne[1] * wa->ne[0])) : nullptr;
 +    return larry_oproj_core(ctx, wa->view_src ? wa->view_src : wa, wa->nb[2], wa->ne[0], wa->ne[1], wa->ne[2], dst->src[2],
-+                            (const float *) dst->src[0]->data, dst->ne[1], (float *) dst->data, (int64_t) (dst->nb[1] / 4));
++                            (const float *) dst->src[0]->data, dst->ne[1], (float *) dst->data, (int64_t) (dst->nb[1] / 4), x8q, x8d);
 +}
 +
 +bool ggml_backend_sycl_oproj(ggml_backend_t backend, const ggml_tensor * wo_a, int64_t OGD, int64_t OL, int64_t OG,
@@ -3553,7 +5336,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +5270,9 @@
+@@ -4747,6 +5287,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -3563,7 +5346,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5114,6 +5640,108 @@
+@@ -5114,6 +5657,108 @@
      }
  }
  
@@ -3672,7 +5455,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5134,6 +5762,48 @@
+@@ -5134,6 +5779,48 @@
              return;
          }
      }
@@ -3721,7 +5504,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +6104,36 @@
+@@ -5434,6 +6121,61 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -3755,10 +5538,35 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +        case GGML_OP_DSV41_OPROJ:
 +            if (!larry_oproj(ctx, dst)) GGML_ABORT("DSV41_OPROJ: shape or layout not covered");
 +            break;
++        case GGML_OP_DSV41_KV_FIN:
++            ggml_sycl_op_dsv41_kv_fin(ctx, dst);
++            break;
++        case GGML_OP_DSV41_MVQ: {   // ggml_sycl_mul_mat with the producer's int8 activations (larry_fastmv takes them)
++            const ggml_tensor * x = dst->src[1], * x8 = dst->src[2];
++            const int64_t rows = x->ne[1] * x->ne[2] * x->ne[3];
++            g_larry_pre_xq = (const int8_t *) x8->data;
++            g_larry_pre_xd = (const float *) ((const char *) x8->data + (size_t) (rows * x->ne[0]));
++            ggml_sycl_mul_mat(ctx, dst->src[0], dst->src[1], dst);
++            g_larry_pre_xq = nullptr;
++            g_larry_pre_xd = nullptr;
++            break;
++        }
++        case GGML_OP_DSV41_RMS_Q8:
++            ggml_sycl_op_dsv41_rms_q8(ctx, dst);
++            break;
++        case GGML_OP_DSV41_LI_DEC:
++            ggml_sycl_op_dsv41_li_dec(ctx, dst);
++            break;
++        case GGML_OP_DSV41_SEL_FIN:
++            ggml_sycl_op_dsv41_sel_fin(ctx, dst);
++            break;
++        case GGML_OP_DSV41_ATTN_DEC:
++            ggml_sycl_op_dsv41_attn_dec(ctx, dst);
++            break;
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6676,33 @@
+@@ -5976,6 +6718,33 @@
      return skip;
  }
  
@@ -3792,7 +5600,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6793,29 @@
+@@ -6066,6 +6835,29 @@
              continue;
          }
  
@@ -3822,7 +5630,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6869,64 @@
+@@ -6119,6 +6911,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -3887,7 +5695,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +7037,12 @@
+@@ -6229,6 +7079,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -3900,7 +5708,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7283,26 @@
+@@ -6469,6 +7325,39 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -3924,6 +5732,19 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +            return true;
 +        case GGML_OP_DSV41_OPROJ:
 +            return op->src[1]->type == GGML_TYPE_Q6_K && op->src[2]->type == GGML_TYPE_Q6_K && op->ne[1] <= 8;
++        case GGML_OP_DSV41_KV_FIN:
++            return op->ne[0] == 512 && op->src[0]->nb[1] % 8 == 0 && op->src[3]->nb[1] % 8 == 0;
++        case GGML_OP_DSV41_MVQ:
++            return op->src[0]->ne[3] == op->src[1]->ne[3] && (op->src[0]->type == GGML_TYPE_Q6_K ||
++                   op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
++        case GGML_OP_DSV41_RMS_Q8:
++        case GGML_OP_DSV41_SEL_FIN:
++            return true;
++        case GGML_OP_DSV41_LI_DEC:
++            return op->src[1]->nb[1] % 64 == 0 && ((uintptr_t) op->src[1]->data) % 64 == 0;
++        case GGML_OP_DSV41_ATTN_DEC:
++            return op->ne[2] < 8 && op->src[1]->nb[1] % 16 == 0 && op->src[2]->nb[1] % 16 == 0 &&
++                   (!op->src[5] || op->src[5]->nb[1] % 16 == 0);
          case GGML_OP_LIGHTNING_INDEXER:
              return op->src[0]->type == GGML_TYPE_F32 &&
                  (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
