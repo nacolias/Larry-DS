@@ -118,6 +118,10 @@ public:
     /// larry: called right before a decode / verify layer's host waits for its router readback (layer, width) - the
     /// tier queues its cards' share then (Ds41XeTier::arm)
     void set_pre_wait_hook(std::function<void(int, int)> h);
+    /// larry, STRATA_XE_GROUTE: called right after a decode / verify layer's fn readback is queued (layer, width, the
+    /// router's ids / wts and fn on the device, the readback's host mirror) - the tier queues its route kernel there
+    /// (Ds41XeTier::route)
+    void set_route_hook(std::function<void(int, int, const void *, const void *, const void *, const float *)> h);
     /// larry, STRATA_TP_OPROJ=2: the attention output projection of a decode / verify layer, queued between the two
     /// halves of its attention graph (layer, width, wo_a, wo_b, o: OGD * OG floats a column, dst: n_embd a column)
     void set_oproj_hook(std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> h);

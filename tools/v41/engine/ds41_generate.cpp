@@ -429,6 +429,7 @@ int main(int argc, char ** argv) {
         tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
 #if defined(DS41_XE)
         dense.set_pre_wait_hook([&tier](int il, int n) { tier.arm(il, n); });   // larry: STRATA_XE_ARM
+        dense.set_route_hook([&tier](int il, int n, const void * i, const void * w, const void * f, const float * fh) { tier.route(il, n, i, w, f, fh); });
 #endif
     }
     // STRATA_GPU_TL=1: the decode layer's stage boundaries as device timestamps on the dense queue (diagnostic)
@@ -598,6 +599,9 @@ int main(int argc, char ** argv) {
             }
             if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
             const float * fn = nullptr;
+#if defined(DS41_XE)
+            if (rdev1) tier.groute_next();   // larry, STRATA_XE_GROUTE: this layer's tier call (run_to_dev) may take the routing
+#endif
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (file_pred) {
@@ -751,6 +755,9 @@ int main(int argc, char ** argv) {
                 }
             }
             const float * fn = nullptr;
+#if defined(DS41_XE)
+            if (rdev1 && !no_tier_batch && m <= Ds41Tier::kMaxMulti) tier.groute_next();   // larry, STRATA_XE_GROUTE: one run_multi_to_dev
+#endif
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
             lap(0);
             if (rdev1 && !no_tier_batch) {

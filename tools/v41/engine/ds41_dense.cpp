@@ -299,6 +299,7 @@ struct Ds41Dense::Impl {
     std::mutex * sub_mu = nullptr;            // larry: set_submit_lock
     bool fn_host = true;                      // larry: set_fn_host
     std::function<void(int, int)> pre_wait;   // larry: set_pre_wait_hook
+    std::function<void(int, int, const void *, const void *, const void *, const float *)> route_hook;   // larry: set_route_hook
     std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> oproj_hook;   // larry
     std::atomic<int> * sub_prio = nullptr;    // larry: raised while waiting for sub_mu (the tier's threads hold off)
     ggml_backend_event_t rb_ev = nullptr;   // larry: the router readbacks' event (async decode / verify layers)
@@ -410,10 +411,24 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             return -1;
         };
         size_t rq_n = 0, rq_from = 0, rq_to = 0, pq_n = 0;
+        // larry, STRATA_QKV_FUSE (default 0): each layer's attn_kv created right after its attn_q_a - the allocator then
+        // puts them back to back (one [K, Nq + Nkv] weight over both, below)
+        const bool qkv_fuse = im.sycl && env_on("STRATA_QKV_FUSE", false);
+        std::map<std::string, const TensorInfo *> kv_info;
+        if (qkv_fuse)
+            for (size_t s = 0; s < model.size(); ++s)
+                for (const auto & ti : model.shard(s).tensors())
+                    if (ends_with(ti.name, ".attn_kv.weight")) kv_info[ti.name] = &ti;
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
+                if (qkv_fuse && w.t.count(ti.name)) continue;   // an attn_kv created early
                 w.t[ti.name] = make(ti, mem_type(ti));
+                if (qkv_fuse && ends_with(ti.name, ".attn_q_a.weight")) {
+                    const std::string kn = ti.name.substr(0, ti.name.size() - std::strlen("attn_q_a.weight")) + "attn_kv.weight";
+                    auto ik = kv_info.find(kn);
+                    if (ik != kv_info.end() && !skip(kn)) w.t[kn] = make(*ik->second, mem_type(*ik->second));
+                }
                 if (const std::string pn = pred_name(ti); !pn.empty()) {
                     ggml_tensor * tp = make(ti, (int) pq);
                     ggml_set_name(tp, pn.c_str());
@@ -486,6 +501,23 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             }
             for (auto & a : add) w.t[a.first] = a.second;
             std::fprintf(stderr, "shared expert: %zu gate+up pairs as one weight\n", add.size());
+        }
+        if (qkv_fuse) {   // STRATA_QKV_FUSE: q_a | kv as one weight over their bytes (same type, rows, buffer, adjacent)
+            size_t nf = 0;
+            for (int64_t il = 0;; ++il) {
+                const std::string pre = "blk." + std::to_string(il) + ".";
+                auto iq = w.t.find(pre + "attn_q_a.weight"), ik = w.t.find(pre + "attn_kv.weight");
+                if (iq == w.t.end() || ik == w.t.end()) break;
+                ggml_tensor * q = iq->second, * k = ik->second;
+                if (q->type != k->type || q->ne[0] != k->ne[0] || q->ne[2] != 1 || k->ne[2] != 1 || q->buffer != k->buffer ||
+                    (const char *) k->data != (const char *) q->data + ggml_nbytes(q)) continue;
+                ggml_tensor * f = ggml_new_tensor_2d(w.ctx, q->type, q->ne[0], q->ne[1] + k->ne[1]);
+                ggml_set_name(f, (pre + "attn_qkv_a.weight").c_str());
+                if (ggml_backend_tensor_alloc(q->buffer, f, q->data) != GGML_STATUS_SUCCESS) continue;
+                w.t[f->name] = f;
+                ++nf;
+            }
+            std::fprintf(stderr, "attention: %zu q_a+kv pairs as one weight (STRATA_QKV_FUSE)\n", nf);
         }
     }
     size_t si = 0;
@@ -647,6 +679,13 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async, bool no
 // -DSTRATA_DSV41_FQ_OP=ON on a llama.cpp tree patched with tools/v41/ggml/dsv41-fake-quant.patch - the fused
 // GGML_OP_DSV41_FAKE_QUANT, one kernel per call (bit-identical on CUDA and CPU: test_ds41_fq; ~3,000 fewer tiny
 // kernels per decode token).  STRATA_FQ_COMPOSITE=1 in such a build: the composite.
+// larry, STRATA_CONT_SKIP (default 1): a ggml_cont only where the tensor is not contiguous already (ggml_cont is
+// always an op - a copy - even of a contiguous tensor)
+static ggml_tensor * cont_if(ggml_context * gc, ggml_tensor * x) {
+    static const bool skip = env_on("STRATA_CONT_SKIP", true);
+    return skip && ggml_is_contiguous(x) ? x : ggml_cont(gc, x);
+}
+
 static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mode) {
 #if defined(STRATA_DSV41_FQ_OP)
     static const bool composite = std::getenv("STRATA_FQ_COMPOSITE") != nullptr;
@@ -746,16 +785,27 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
     }
 
-    // ---- q (no per-head norm in V4.1)
-    ggml_tensor * qr = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_q_a.weight"), xn), im.BL(il, "attn_q_a_norm.weight"));
+    // ---- q (no per-head norm in V4.1).  larry, STRATA_QKV_FUSE: q_a and kv as one product (rows: q_a, then kv)
+    ggml_tensor * qa_y = nullptr, * kv_y = nullptr;
+    if (im.w.has("blk." + std::to_string(il) + ".attn_qkv_a.weight")) {
+        ggml_tensor * wf = im.BL(il, "attn_qkv_a.weight");
+        const int64_t nq = im.BL(il, "attn_q_a.weight")->ne[1], nk = wf->ne[1] - nq;
+        ggml_tensor * y = ggml_mul_mat(gc, wf, xn);                                             // [nq + nk, n]
+        qa_y = ggml_view_2d(gc, y, nq, n, y->nb[1], 0);
+        kv_y = ggml_view_2d(gc, y, nk, n, y->nb[1], (size_t) nq * ggml_element_size(y));
+    } else {
+        qa_y = ggml_mul_mat(gc, im.BL(il, "attn_q_a.weight"), xn);
+        kv_y = ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn);
+    }
+    ggml_tensor * qr = b.rms_w(qa_y, im.BL(il, "attn_q_a_norm.weight"));
     ggml_tensor * q = ggml_reshape_3d(gc, ggml_mul_mat(gc, im.BL(il, "attn_q_b.weight"), qr), DH, NH, n);
     q = b.rope(q, pos, r);
 
     // ---- window K (= V): [ring | this pass's rows] -> each query's SWA rows; the ring keeps the last RAW
-    ggml_tensor * kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
+    ggml_tensor * kv = b.rms_w(kv_y, im.BL(il, "attn_kv_a_norm.weight"));
     kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
-    if (im.cfg.act_quant) kv2 = fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
+    if (im.cfg.act_quant) kv2 = fake_quant(gc, cont_if(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
     ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
     ggml_tensor * widx_v = b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4);
     ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, widx_v), DH, SWA, n);
@@ -800,11 +850,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             // indexer keys from the UNROTATED latent (model.py Indexer.forward, owns_k)
             ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
             ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
-            if (im.cfg.act_quant) ik = fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
+            if (im.cfg.act_quant) ik = fake_quant(gc, cont_if(gc, ik), Ds41Quant::FP4_POW2_32);
             idxk_w = ggml_set_rows(gc, L.idxk, ik, cslot);
             outs.push_back(idxk_w);
             ggml_tensor * lr = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, latent, DH, 1, n), cpos, r), DH, n);
-            if (im.cfg.act_quant) lr = fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
+            if (im.cfg.act_quant) lr = fake_quant(gc, cont_if(gc, lr), Ds41Quant::FP4_E4M3_16);
             comp_w = ggml_set_rows(gc, L.comp, lr, cslot);
             outs.push_back(comp_w);
         }
@@ -818,7 +868,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 // ---- indexer (model.py Indexer.forward): scores over the visible rows of the shared index keys
                 ggml_tensor * iq = ggml_mul_mat(gc, im.BL(il, "indexer.attn_q_b.weight"), qr);
                 iq = b.rope(ggml_reshape_3d(gc, iq, im.ID, im.IH, n), pos, r);
-                if (im.cfg.act_quant) iq = fake_quant(gc, ggml_cont(gc, iq), Ds41Quant::FP4_POW2_32);
+                if (im.cfg.act_quant) iq = fake_quant(gc, cont_if(gc, iq), Ds41Quant::FP4_POW2_32);
                 ggml_tensor * iw = ggml_mul_mat(gc, im.BL(il, "indexer.proj.weight"), xn);
                 iw = ggml_scale(gc, iw, 1.0f / std::sqrt((float) (im.ID * im.IH)));         // softmax_scale * heads^-0.5
                 ggml_tensor * ksrc = ggml_view_3d(gc, idxk, im.ID, 1, cap, idxk->nb[1], idxk->nb[1], 0);
@@ -869,7 +919,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             Kc = ggml_reshape_3d(gc, ggml_get_rows(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * n))), DH, K, n);
             kg_comp = comp;
             kg_sel = sel;
-            Mc = ggml_cont(gc, selm);
+            Mc = cont_if(gc, selm);
             // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
         }
     }
@@ -1068,11 +1118,21 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
     ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));
     ggml_tensor * xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
 
-    // ---- window K (= V): the same post-RoPE raw row build_attn writes into the ring
-    ggml_tensor * kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
+    // ---- window K (= V): the same post-RoPE raw row build_attn writes into the ring.  STRATA_QKV_FUSE: through the fused
+    // weight (attn_kv alone is not usable once the pair is reordered) - its q_a rows are computed and dropped
+    ggml_tensor * kv_y = nullptr;
+    if (im.w.has("blk." + std::to_string(il) + ".attn_qkv_a.weight")) {
+        ggml_tensor * wf = im.BL(il, "attn_qkv_a.weight");
+        const int64_t nq = im.BL(il, "attn_q_a.weight")->ne[1], nk = wf->ne[1] - nq;
+        ggml_tensor * y = ggml_mul_mat(gc, wf, xn);
+        kv_y = ggml_view_2d(gc, y, nk, n, y->nb[1], (size_t) nq * ggml_element_size(y));
+    } else {
+        kv_y = ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn);
+    }
+    ggml_tensor * kv = b.rms_w(kv_y, im.BL(il, "attn_kv_a_norm.weight"));
     kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
-    if (im.cfg.act_quant) kv2 = fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);
+    if (im.cfg.act_quant) kv2 = fake_quant(gc, cont_if(gc, kv2), Ds41Quant::FP8_POW2_32);
     {
         const int64_t k = std::min<int64_t>(n, im.RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
@@ -1108,10 +1168,10 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
         ggml_tensor * cslot = b.v1(im.i_cslot[r], n, (size_t) col0 * 4);
         ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
         ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
-        if (im.cfg.act_quant) ik = fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
+        if (im.cfg.act_quant) ik = fake_quant(gc, cont_if(gc, ik), Ds41Quant::FP4_POW2_32);
         outs.push_back(ggml_set_rows(gc, L.idxk, ik, cslot));
         ggml_tensor * lr = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, latent, DH, 1, n), cpos, r), DH, n);
-        if (im.cfg.act_quant) lr = fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
+        if (im.cfg.act_quant) lr = fake_quant(gc, cont_if(gc, lr), Ds41Quant::FP4_E4M3_16);
         outs.push_back(ggml_set_rows(gc, L.comp, lr, cslot));
     }
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
@@ -1251,6 +1311,10 @@ std::vector<ggml_tensor *> Ds41Dense::reorder_weights() const {
         if (ends(kv.first, "ffn_gate_shexp.weight") || ends(kv.first, "ffn_up_shexp.weight")) {
             const std::string pre = kv.first.substr(0, kv.first.size() - (ends(kv.first, "ffn_gate_shexp.weight") ? 21 : 19));
             if (p_->w.t.count(pre + "ffn_gate_up_shexp.weight")) continue;
+        }
+        if (ends(kv.first, "attn_q_a.weight") || ends(kv.first, "attn_kv.weight")) {   // STRATA_QKV_FUSE: the pair as one
+            const std::string pre = kv.first.substr(0, kv.first.size() - (ends(kv.first, "attn_q_a.weight") ? 15 : 14));
+            if (p_->w.t.count(pre + "attn_qkv_a.weight")) continue;
         }
         v.push_back(t);
     }
@@ -2010,6 +2074,7 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
 }
 
 void Ds41Dense::set_pre_wait_hook(std::function<void(int, int)> h) { p_->pre_wait = std::move(h); }
+void Ds41Dense::set_route_hook(std::function<void(int, int, const void *, const void *, const void *, const float *)> h) { p_->route_hook = std::move(h); }
 void Ds41Dense::set_oproj_hook(std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> h) {
     p_->oproj_hook = std::move(h);
 }
@@ -2129,6 +2194,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const double tp1 = g_decprof_on ? dprof_now() : 0;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
     ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
+    // larry, STRATA_XE_GROUTE: the tier's route kernel behind the fn readback (the expert cards read that copy)
+    if (async && im.rb_ev && im.route_hook) im.route_hook(il, (int) n, im.o_ids->data, im.o_wts->data, im.o_fn->data, im.host_fn.data());
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
     if (async && im.rb_ev) ggml_backend_event_record(im.rb_ev, im.backend);

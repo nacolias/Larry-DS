@@ -320,8 +320,8 @@ int main(int argc, char** argv) {
             for (float& v : X8) v = nd(rng);
             q.memcpy(dX, X8.data(), X8.size() * 4).wait();
         }
-        std::printf("bench-q8: layer %d, %d experts (%.1f MiB) rotated (gate/up type %d)\n", l, (int) pl.size(), bench_q8_gu,
-                    std::accumulate(nbytes.begin(), nbytes.end(), (size_t) 0) / 1048576.0);
+        std::printf("bench-q8: layer %d, %d experts (%.1f MiB) rotated (gate/up type %d)\n", l, (int) pl.size(),
+                    std::accumulate(nbytes.begin(), nbytes.end(), (size_t) 0) / 1048576.0, bench_q8_gu);
         // (nj experts a call, nt tokens a job, the call's tokens ntok): the job lists of NE / nj calls, staged once
         struct Cfg { int nj, nt, ntok, mnt; };
         for (const Cfg cf : {Cfg{3, 1, 1, 1}, Cfg{3, 1, 3, 1}, Cfg{3, 1, 3, 2}, Cfg{3, 1, 3, 4}, Cfg{3, 1, 5, 8},
@@ -355,14 +355,25 @@ int main(int argc, char** argv) {
                 return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / bench_q8;
             };
             const double us = timed(call), ux = timed(callx);
+            // call 0 in the jobs' own form (max_nt = their token count): the wider form must give the same bits
+            std::vector<float> aref((size_t) cf.ntok * E);
+            xe::xe_quant_rows(q, dX, cf.ntok, (int) E, Xq);
+            xe::xe_experts_q8(q, djs, cf.nj, cf.ntok, Xq, Hq, dO, (int) E, (int) F, L, false, cf.nt);
+            q.wait();
+            q.memcpy(aref.data(), dO, aref.size() * 4).wait();
             call(0); callx(0); q.wait();   // the same call both ways: the largest difference vs the largest value
             std::vector<float> a((size_t) cf.ntok * E), b2((size_t) cf.ntok * E);
             q.memcpy(a.data(), dO, a.size() * 4).wait();
             q.memcpy(b2.data(), dO2, b2.size() * 4).wait();
             double md = 0, mx = 0;
-            for (size_t i = 0; i < a.size(); ++i) { md = std::max(md, (double) std::fabs(a[i] - b2[i])); mx = std::max(mx, (double) std::fabs(a[i])); }
-            std::printf("  %d experts x %d tokens (call of %d, template %d): dp4a %6.1f us = %4.0f GB/s | xmx %6.1f us = %4.0f GB/s | max|diff| %.2e of %.2e\n",
-                        cf.nj, cf.nt, cf.ntok, cf.mnt, us, bytes / us / 1e3, ux, bytes / ux / 1e3, md, mx);
+            size_t nbits = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                md = std::max(md, (double) std::fabs(a[i] - b2[i]));
+                mx = std::max(mx, (double) std::fabs(a[i]));
+                if (std::memcmp(&a[i], &aref[i], 4) != 0) ++nbits;
+            }
+            std::printf("  %d experts x %d tokens (call of %d, template %d): dp4a %6.1f us = %4.0f GB/s | xmx %6.1f us = %4.0f GB/s | max|diff| %.2e of %.2e | bits %s%zu\n",
+                        cf.nj, cf.nt, cf.ntok, cf.mnt, us, bytes / us / 1e3, ux, bytes / ux / 1e3, md, mx, nbits ? "DIFFER " : "ok ", nbits);
         }
         for (uint8_t* p : pl) sycl::free(p, q);
     }

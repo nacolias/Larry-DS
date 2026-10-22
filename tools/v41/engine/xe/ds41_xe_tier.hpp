@@ -122,6 +122,13 @@ public:
     /// before its routing is known - they wait on a release that run_to_dev / run_multi_to_dev give them once the
     /// routing is in (anything else releases them with null jobs).  The dense half calls it before its readback wait.
     void arm(int64_t layer, int nt);
+    /// larry, STRATA_XE_GROUTE (default 0): the dense card routes the call itself - the dense half calls this right
+    /// after queueing the layer's fn readback (ids / wts / fn: the router's outputs on the dense card); a route kernel
+    /// on its queue writes every card's jobs and the CPU pool's entries, the expert cards are armed and released by the
+    /// dense card, and the matching run_to_dev / run_multi_to_dev only runs the CPU part and the sum.  Only for the call
+    /// right after groute_next() (the generate loop's decode / verify paths: their tier call matches the pass).
+    void route(int64_t layer, int nt, const void* ids_dev, const void* wts_dev, const void* fn_dev, const float* fn_host);
+    void groute_next();
     bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
 
