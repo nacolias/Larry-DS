@@ -1331,9 +1331,12 @@ void cpu_ents(Ds41XeImpl& im, int64_t l, const std::vector<const Ent*>& ents, co
 
 // the CPU-pool helper (STRATA_XE_CPU_ASYNC): spins ~100 us for a task, then sleeps on the condition variable
 void cpu_worker(Ds41XeImpl& im) {
+    // STRATA_XE_CPU_SPIN: pause iterations before the helper sleeps (20000 ~ 100 us; a CPU-pool task comes every few
+    // ms in decode, so with the default nearly every task first pays the condition variable's wake-up)
+    static const int spin = env_i("STRATA_XE_CPU_SPIN", 20000);
     for (;;) {
         int st = im.cpu_state.load(std::memory_order_acquire);
-        for (int i = 0; st == 0 && i < 20000; ++i) {
+        for (int i = 0; st == 0 && i < spin; ++i) {
 #if defined(__x86_64__)
             __builtin_ia32_pause();
 #endif
@@ -1893,6 +1896,8 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             cpu_list.push_back(&en);
             continue;
         }
+        static const bool skip_dense_dbg = env_i("STRATA_XE_DEBUG_SKIP_DENSE", 0) != 0;   // DEBUG: timing bound only (wrong output)
+        if (skip_dense_dbg && c == im.dense) continue;   // the dense card's own expert jobs left out
         if (im.pc_ready && im.pc_where[key] >= 0) {   // a promoted expert: its slot used now
             im.cards[(size_t) (im.pc_where[key] >> 16)]->pc_tick[(size_t) (im.pc_where[key] & 0xFFFF)] = im.pc_clock;
             ++im.pc_hit;
@@ -2089,11 +2094,27 @@ bool run_small(Ds41XeImpl& im, int64_t l, int nt, const int32_t* ids, const floa
             int64_t& sp_jobs = spa_jobs[spk];
             for (int c = 0; c < (int) NC; ++c) sp_jobs += nj[(size_t) c];
             sp[4] += cpu_list.size();
-            if (++sp_n % 1000 == 0)
+            static int64_t cpu_hist[2][5] = {};   // calls with 0, 1, 2, 3, 4+ CPU-pool experts
+            ++cpu_hist[spk][std::min<size_t>(cpu_list.size(), 4)];
+            if (++sp_n % 1000 == 0) {
                 std::fprintf(stderr, "xe %s prof (%lld calls, %.2f card jobs/call, %.2f cpu experts/call): per call prep %.1f us, "
                              "submit %.1f us, cpu %.1f us, sum+wait %.1f us = %.1f us\n", spk ? "verify" : "decode", (long long) sp_n,
                              (double) sp_jobs / sp_n, sp[4] / sp_n, 1e3 * sp[0] / sp_n, 1e3 * sp[1] / sp_n, 1e3 * sp[2] / sp_n,
                              1e3 * sp[3] / sp_n, 1e3 * (sp[0] + sp[1] + sp[2] + sp[3]) / sp_n);
+                const int64_t* ch = cpu_hist[spk];
+                std::fprintf(stderr, "xe %s cpu experts a call: 0: %lld, 1: %lld, 2: %lld, 3: %lld, 4+: %lld calls\n", spk ? "verify" : "decode",
+                             (long long) ch[0], (long long) ch[1], (long long) ch[2], (long long) ch[3], (long long) ch[4]);
+                if (im.pool && im.st.cpu > 0) {   // the CPU pool: its phases (kernels) vs the CPU part's wall time
+                    const cpu::ExpertPool& pl = *im.pool;
+                    double wp = 0, dr = 0, rp = 0;
+                    pl.phase_ms(wp, dr, rp);
+                    std::fprintf(stderr, "xe cpu pool: %lld experts, %.0f us an expert (cpu_ents wall); pool gate/up %.0f + quant %.0f + down "
+                                 "%.0f us an expert, %.1f GB/s of expert bytes in the products; %d workers\n", (long long) im.st.cpu,
+                                 1e3 * im.st.cpu_ms / im.st.cpu, 1e3 * pl.ms_multi_gu / im.st.cpu, 1e3 * pl.ms_multi_q / im.st.cpu,
+                                 1e3 * pl.ms_multi_down / im.st.cpu,
+                                 (double) pl.multi_bytes / 1e6 / std::max(1e-9, pl.ms_multi_gu + pl.ms_multi_down), pl.workers());
+                }
+            }
         }
         im.st.wall_ms += now_ms() - t0;
         return true;

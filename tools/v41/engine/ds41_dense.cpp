@@ -1352,6 +1352,9 @@ static ggml_cgraph * build_shexp(Ds41Dense::Impl & im, ggml_context * gc, int il
     ggml_tensor * fn8 = col0 == 0 && b.hc_fused(n) && q8_fused(im, il, n) ? ggml_view_1d(gc, im.o_fn8, ggml_dsv41_q8_floats(D, n), 0) : nullptr;
     ggml_tensor * sx = b.cols2(im.shexp, D, n, col0);
     ggml_tensor * fv = b.cols2(im.o_fn, D, n, col0);
+    // STRATA_DEBUG_NO_SHEXP=1 (timing bound only: WRONG output) - the shared expert's work left out (its output zero)
+    static const bool no_shexp = env_on("STRATA_DEBUG_NO_SHEXP", false);
+    if (no_shexp) { ggml_build_forward_expand(gf, ggml_scale_inplace(gc, sx, 0.0f)); return gf; }
     ggml_build_forward_expand(gf, fn8 ? shexp_ffn(im, gc, il, fv, fn8, sx) : ggml_cpy(gc, shexp_ffn(im, gc, il, fv), sx));
     return gf;
 }
@@ -2367,6 +2370,9 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_shexp(im, im.gctx, il, n)).first;
         const double ts0 = g_decprof_on ? dprof_now() : 0;
         if (!im.compute(it->second, true, async)) return false;
+        // STRATA_DEBUG_SHEXP_TWICE=1 (timing only; the output is right): the shared expert twice - its marginal cost
+        static const bool twice = env_on("STRATA_DEBUG_SHEXP_TWICE", false);
+        if (twice && !im.compute(it->second, true, async)) return false;
         if (g_decprof_on) ts += dprof_now() - ts0;
         return true;
     };
