@@ -1361,7 +1361,7 @@ diff --git a/ggml/src/ggml-sycl/dsv41-dec.hpp b/ggml/src/ggml-sycl/dsv41-dec.hpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-dec.hpp
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,774 @@
 +// ggml-sycl/dsv41-dec.hpp - larry (DeepSeek-V4.1 on Intel Arc B70): the decode / verify-width (< 8 queries) attention
 +// core as three kernels, pointer-based (dsv41-fused.cpp wraps them as ggml ops; an engine without ggml can call them).
 +//
@@ -1624,6 +1624,8 @@ new file mode 100644
 +// ================================================================== attn_dec
 +constexpr int DD = 512;            // head dim
 +constexpr int XKC = 64, XHG = 32;  // keys per chunk, heads per work-group (fattn-dsv4-dec.hpp's XMX form)
++// larry, tensor parallel: a shard of NH % 32 != 0 heads (16 a card at 4 cards, 24 / 16 at 3) takes the 16-head form,
++// its last work-group's heads past NH masked (o-groups are 8 heads: NH % 8 == 0)
 +
 +struct AttnArgs {
 +    const float * q = nullptr;  size_t q_h = 0, q_b = 0;   // q[b * q_b + h * q_h + d], before RoPE
@@ -1653,18 +1655,20 @@ new file mode 100644
 +
 +inline int n_chunks(int M) { return (M + XKC - 1) / XKC; }
 +inline size_t scratch_floats(int NH, int M, int n) { return (size_t) n * n_chunks(M) * NH * (DD + 2); }
-+inline bool covered(int NH, int M) { return NH % XHG == 0 && M >= 1 && n_chunks(M) <= 32; }
++inline bool covered(int NH, int M) { return NH % 8 == 0 && M >= 1 && n_chunks(M) <= 32; }
 +
 +namespace jm = sycl::ext::oneapi::experimental::matrix;
 +
-+inline sycl::event attn_dec(sycl::queue & q, const AttnArgs & a, sycl::event * first = nullptr) {
++template <int HG>
++inline sycl::event attn_dec_t(sycl::queue & q, const AttnArgs & a, sycl::event * first) {
++    static_assert(HG == 16 || HG == 32, "16 or 32 heads a work-group");
 +    const int M = a.swa + a.K;
 +    const int nch = n_chunks(M);
 +    const int NH = a.NH, n = a.n;
 +    constexpr int D = DD;
 +    constexpr int KS = D + 8;     // ks row stride (halves): ks[key][d]
-+    constexpr int QS = XHG + 8;   // qt row stride (halves): qt[d][head]
-+    constexpr int SS = XHG + 4;   // ss row stride (floats): ss[key][head]
++    constexpr int QS = HG + 8;    // qt row stride (halves): qt[d][head]
++    constexpr int SS = HG + 4;    // ss row stride (floats): ss[key][head]
 +    constexpr int PS = XKC + 16;  // ps row stride (halves): ps[head][key]
 +    const AttnArgs A = a;
 +    float * pO = a.part;
@@ -1673,11 +1677,11 @@ new file mode 100644
 +        sycl::local_accessor<sycl::half, 1> ks(sycl::range<1>((size_t) XKC * KS), h);
 +        sycl::local_accessor<sycl::half, 1> qt(sycl::range<1>((size_t) D * QS), h);
 +        sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) XKC * SS), h);
-+        sycl::local_accessor<sycl::half, 1> ps(sycl::range<1>((size_t) XHG * PS), h);
++        sycl::local_accessor<sycl::half, 1> ps(sycl::range<1>((size_t) HG * PS), h);
 +        sycl::local_accessor<float, 1> mk(sycl::range<1>((size_t) XKC), h);
 +        sycl::local_accessor<uint64_t, 1> rp(sycl::range<1>((size_t) XKC), h);   // the chunk's key rows: address | type
 +        sycl::local_accessor<float, 1> tl(sycl::range<1>((size_t) DD), h);       // the query's RoPE table
-+        h.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t) n, (size_t) nch, (size_t) (NH / XHG) * 256),
++        h.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t) n, (size_t) nch, (size_t) ((NH + HG - 1) / HG) * 256),
 +                                         sycl::range<3>(1, 1, 256)),
 +                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
 +            const int b = (int) it.get_group(0), c = (int) it.get_group(1), hg = (int) it.get_group(2);
@@ -1686,6 +1690,7 @@ new file mode 100644
 +            const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
 +            const int j0 = c * XKC;
 +            const int nk = sycl::min(XKC, M - j0);
++            const int nhw = sycl::min(HG, NH - hg * HG);   // this work-group's heads (the rest masked: zero q, not stored)
 +            // 0. per key of the chunk its source row (an address; bit 0: a compressed row) and its mask (-1e30 for keys
 +            // past the count); the query's RoPE table -> local memory (the gather below then has no dependent loads)
 +            if (lid < XKC) {
@@ -1735,13 +1740,14 @@ new file mode 100644
 +                }
 +                *reinterpret_cast<sycl::half4 *>(&ks[(size_t) row * KS + d]) = hv;
 +            }
-+            // 2. Q^T of this work-group's 32 heads -> qt (RoPE'd from the local table, scaled, f16)
++            // 2. Q^T of this work-group's HG heads -> qt (RoPE'd from the local table, scaled, f16)
 +            const int roff = D - A.n_dims;
 +            const float * tb = tl.template get_multi_ptr<sycl::access::decorated::no>().get();
 +#pragma unroll 8
-+            for (int idx = lid * 4; idx < XHG * D; idx += 256 * 4) {
++            for (int idx = lid * 4; idx < HG * D; idx += 256 * 4) {
 +                const int hl = idx / D, d = idx % D;
-+                sycl::float4 v = *reinterpret_cast<const sycl::float4 *>(A.q + (size_t) b * A.q_b + (size_t) (hg * XHG + hl) * A.q_h + d);
++                sycl::float4 v(0.0f, 0.0f, 0.0f, 0.0f);
++                if (hl < nhw) v = *reinterpret_cast<const sycl::float4 *>(A.q + (size_t) b * A.q_b + (size_t) (hg * HG + hl) * A.q_h + d);
 +                if (d >= roff) {
 +                    float v0 = v.x(), v1 = v.y(), v2 = v.z(), v3 = v.w();
 +                    rope_tab(tb, d - roff, true, v0, v1);
@@ -1756,8 +1762,9 @@ new file mode 100644
 +            sycl::group_barrier(it.get_group());
 +            auto kp = ks.template get_multi_ptr<sycl::access::decorated::no>();
 +            // 3. S^T: one 8-key x 16-head tile per sub-group (keys 8 mt.., heads 16 nt..), 32 steps over D
-+            {
-+                const int mt = s >> 1, nt = s & 1;
++            constexpr int NT = HG / 16;
++            if (s / NT < XKC / 8) {   // (HG 16: sub-groups 0-7; uniform per sub-group)
++                const int mt = s / NT, nt = s % NT;
 +                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> ma;
 +                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> mb;
 +                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> mc;
@@ -1773,8 +1780,8 @@ new file mode 100644
 +            }
 +            sycl::group_barrier(it.get_group());
 +            // 4. the chunk's softmax per head: sub-groups 0, 1, lane = head; P (f16) -> ps[head][key]
-+            if (s < 2) {
-+                const int hl = s * 16 + lane, hh = hg * XHG + hl;
++            if (s < HG / 16) {
++                const int hl = s * 16 + lane, hh = hg * HG + hl;
 +                float xv[XKC];
 +                float mx = -1e30f;
 +#pragma unroll
@@ -1789,19 +1796,23 @@ new file mode 100644
 +                    l += pj;
 +                    ps[(size_t) hl * PS + j] = (sycl::half) pj;
 +                }
-+                float * ml = pML + (((size_t) b * nch + c) * NH + hh) * 2;
-+                ml[0] = mx;
-+                ml[1] = l;
++                if (hl < nhw) {
++                    float * ml = pML + (((size_t) b * nch + c) * NH + hh) * 2;
++                    ml[0] = mx;
++                    ml[1] = l;
++                }
 +            }
 +            sycl::group_barrier(it.get_group());
-+            // 5. this chunk's O = P . K: 4 head tiles x 32 dim tiles, 8 per sub-group, 4 steps over the keys
++            // 5. this chunk's O = P . K: HG / 8 head tiles x 32 dim tiles, HG / 4 per sub-group, 4 steps over the keys
 +            {
++                constexpr int TPS = HG / 4;
 +                auto pp = ps.template get_multi_ptr<sycl::access::decorated::no>();
 +                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> ma;
 +                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> mb;
 +                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> mc;
-+                for (int ti = 0; ti < 8; ++ti) {
-+                    const int tile = s * 8 + ti, ht = tile / 32, dt = tile % 32;
++                for (int ti = 0; ti < TPS; ++ti) {
++                    const int tile = s * TPS + ti, ht = tile / 32, dt = tile % 32;
++                    if (ht * 8 >= nhw) continue;   // a masked head tile (uniform per sub-group)
 +                    jm::joint_matrix_fill(sg, mc, 0.0f);
 +#pragma unroll
 +                    for (int k = 0; k < XKC / 16; ++k) {
@@ -1809,7 +1820,7 @@ new file mode 100644
 +                        jm::joint_matrix_load(sg, mb, kp + (size_t) (k * 16) * KS + dt * 16, KS);
 +                        jm::joint_matrix_mad(sg, mc, ma, mb, mc);
 +                    }
-+                    float * dst = pO + (((size_t) b * nch + c) * NH + hg * XHG + ht * 8) * D + dt * 16;
++                    float * dst = pO + (((size_t) b * nch + c) * NH + hg * HG + ht * 8) * D + dt * 16;
 +                    jm::joint_matrix_store(sg, mc, sycl::address_space_cast<sycl::access::address_space::global_space,
 +                                                                             sycl::access::decorated::no>(dst), D, jm::layout::row_major);
 +                }
@@ -1910,6 +1921,10 @@ new file mode 100644
 +            }
 +        }
 +    });
++}
++
++inline sycl::event attn_dec(sycl::queue & q, const AttnArgs & a, sycl::event * first = nullptr) {
++    return a.NH % 32 == 0 ? attn_dec_t<32>(q, a, first) : attn_dec_t<16>(q, a, first);
 +}
 +
 +// ================================================================== the lightning indexer at decode widths

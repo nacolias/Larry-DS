@@ -53,6 +53,7 @@ public:
     std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
     /// larry: start() into caller storage: outp[e] holds n * cols * dim floats for slot e (e.g. pinned memory); it is
     /// not cleared first (every slot of a good batch is written) and must stay untouched until wait() returns.
+    /// outp[e] null: slot e is not read (engine1 reads the first Engram layer's rows before the second's).
     std::shared_ptr<Batch> start_into(int64_t pos0, int n, float * const * outp, std::string & err);
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
     /// larry: warm the row cache with the rows of positions pos0..pos0+n-1 (every slot; their tokens set): the reads

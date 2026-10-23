@@ -129,6 +129,24 @@ public:
     /// right after groute_next() (the generate loop's decode / verify paths: their tier call matches the pass).
     void route(int64_t layer, int nt, const void* ids_dev, const void* wts_dev, const void* fn_dev, const float* fn_host);
     void groute_next();
+    /// larry, engine1 (STRATA_TP): the residency table for the tensor-parallel decode core - pinned RtEnt
+    /// [n_layer * n_expert] (the expert's blob on its card, offsets, types, card or -1), allocated on the first call and
+    /// kept up to date with every residency change; *version moves with each change.  Null: it cannot be allocated.
+    const void* tp_route_table(const volatile uint64_t** version);
+    /// larry, engine1: the CPU pool's share of a decode / verify call the TP core routes - the picks of ids / w (nt
+    /// tokens x top_k) whose expert is on no card, weighted into out [nt][n_embd] (zeroed first when there are any).
+    /// Returns how many CPU-pool experts ran (0: out untouched).  Synchronous (the pool's threads).
+    int tp_cpu_part(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
+    /// larry, engine1: between two TP passes (no TP kernel in flight) - the promotion cache (STRATA_XE_PROMOTE): set
+    /// up once, finished copies published (the residency table moves: the next pass refreshes its copies), up to
+    /// `chunks` more copy chunks queued on the tier's card queues (they run beside the next pass; the slots they fill
+    /// were taken off the table before that pass)
+    void tp_between_passes(int chunks);
+    /// larry, engine1: the queues (sycl::queue*, by card) the promotion copies go to - the TP core's own: in order with
+    /// its passes (a second queue on a card whose TP queue spins between its cards barely ran: promotions stalled)
+    void tp_set_promote_queues(const std::vector<void*>& qs);
+    /// larry, engine1: the table keys (layer * n_expert + expert) changed since the last call; true = take every key
+    bool tp_take_dirty(std::vector<uint32_t>& keys);
     bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
 

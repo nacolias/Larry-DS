@@ -201,6 +201,11 @@ struct Ds41Dense::Impl {
         ggml_tensor * rbias = nullptr;    // F32 [NE]        selection-only routing bias (set_route_bias), 0 = model routing
     };
     int snap_pos = -1;
+    // larry, engine1: what was written since take_written() (an external decode core re-syncs from it; at first: all)
+    int64_t wr_lo = 0, wr_hi = INT64_MAX;
+    bool wr_changed = true;
+    int64_t parked_n = 0;
+    void wrote(int64_t lo, int64_t hi) { wr_lo = std::min(wr_lo, lo); wr_hi = std::max(wr_hi, hi); wr_changed = true; }
     struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; };
     std::vector<ParkedRows> parked;     // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites
     int parked_pos = -1;
@@ -2011,6 +2016,7 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     im.pos0 = pos0;
     im.n = n;
     if (!im.upload_inputs(tids, n, pos0)) return false;
+    im.wrote(pos0, pos0 + n);
     span_pass_caps(im, pos0, n, im.pass_cap);
     // embeddings -> state
     ggml_context * gc = nullptr;
@@ -2051,6 +2057,7 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;
     if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) { im.err = "bad batch"; return false; }
     if (!im.upload_inputs(tids, B, pos0)) return false;
+    im.wrote(pos0, pos0 + B);
     im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B; im.col0 = 0;
     // per-sub-batch pass_cap (the compressed rows each sub-batch ranks over) - depends only on (pos0, len)
     const int64_t nb = (B + im.S - 1) / im.S;
@@ -2599,6 +2606,7 @@ bool Ds41Dense::restore() {
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv_snap, L.st_kv); ggml_backend_tensor_copy(L.st_sc_snap, L.st_sc); }
     }
     ggml_backend_synchronize(im.backend);
+    im.wr_changed = true;   // the rings and compressor states (no rows)
     return true;
 }
 
@@ -2626,6 +2634,7 @@ bool Ds41Dense::park(int64_t positions) {
         }
     }
     im.parked_pos = im.snap_pos;
+    im.parked_n = positions;
     return true;
 }
 
@@ -2635,6 +2644,7 @@ bool Ds41Dense::unpark() {
     ggml_backend_synchronize(im.backend);
     for (auto & r : im.parked) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
     ggml_backend_synchronize(im.backend);
+    im.wrote(0, 2 * (im.parked_n + 1));   // the parked rows (rows [0, positions + 1] of either ratio)
     im.snap_pos = im.parked_pos;
     drop_park();
     return true;
@@ -2647,6 +2657,61 @@ void Ds41Dense::drop_park() {
 }
 
 bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
+
+bool Ds41Dense::state_ptrs(int il, void ** raw, void ** comp, void ** idxk, void ** st_kv, void ** st_sc) const {
+    const Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || im.cpu) return false;
+    const Impl::Layer & L = im.ly[(size_t) il];
+    if (!L.raw || L.raw->type != GGML_TYPE_F32) return false;
+    if ((L.comp && L.comp->type != GGML_TYPE_BF16) || (L.idxk && L.idxk->type != GGML_TYPE_BF16)) return false;
+    *raw = L.raw->data;
+    *comp = L.comp ? L.comp->data : nullptr;
+    *idxk = L.idxk ? L.idxk->data : nullptr;
+    *st_kv = L.st_kv ? L.st_kv->data : nullptr;
+    *st_sc = L.st_sc ? L.st_sc->data : nullptr;
+    return true;
+}
+
+void Ds41Dense::take_written(int64_t * lo, int64_t * hi, bool * changed) {
+    Impl & im = *p_;
+    *lo = im.wr_lo;
+    *hi = im.wr_hi;
+    *changed = im.wr_changed;
+    im.wr_lo = INT64_MAX;
+    im.wr_hi = -1;
+    im.wr_changed = false;
+}
+
+bool Ds41Dense::engram_rows(const int * tids, int n, int pos0, float * const * out) {
+    Impl & im = *p_;
+    if (!im.engram.enabled()) return true;
+    if (!engram_ready(im)) return false;   // a dense pass's batch still pending: flushed first
+    if (im.eng_pf) {                       // the prompt prefetch's rows land in the row cache first
+        std::string e2;
+        im.engram.wait(im.eng_pf, e2);
+        im.eng_pf.reset();
+    }
+    for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
+    auto b = im.engram.start_into(pos0, n, out, im.err);
+    return b && im.engram.wait(b, im.err);
+}
+
+bool Ds41Dense::engram_rows_slot(const int * tids, int n, int pos0, int slot, float * out) {
+    Impl & im = *p_;
+    if (!im.engram.enabled() || slot < 0 || slot >= im.engram.n_slots()) return true;
+    if (slot == 0) {
+        if (!engram_ready(im)) return false;
+        if (im.eng_pf) {
+            std::string e2;
+            im.engram.wait(im.eng_pf, e2);
+            im.eng_pf.reset();
+        }
+        for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
+    }
+    float * outp[2] = { slot == 0 ? out : nullptr, slot == 1 ? out : nullptr };
+    auto b = im.engram.start_into(pos0, n, outp, im.err);
+    return b && im.engram.wait(b, im.err);
+}
 
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;

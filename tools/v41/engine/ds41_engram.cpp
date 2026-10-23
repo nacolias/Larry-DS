@@ -378,6 +378,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
 
     b->uniq.resize((size_t) nel); b->packed.resize((size_t) nel); b->run_begin.resize((size_t) nel);
     for (int64_t e = 0; e < nel; ++e) {
+        if (!b->outp[(size_t) e]) continue;   // larry, engine1: this slot not wanted by this call (outp[e] null)
         const Table & T = tables_[(size_t) e];
         // pack (row_id << 32 | slot) so the sort is a plain integer sort - no comparator, no indirection
         auto & pk = b->packed[(size_t) e];

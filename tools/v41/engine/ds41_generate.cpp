@@ -28,6 +28,9 @@
 #include "ds41_xe_tier.hpp"   // larry: the multi-card Intel Arc (SYCL) expert tier
 #include "ggml-sycl.h"
 #endif
+#if defined(DS41_TP)
+#include "tp_core.hpp"        // larry, engine1: the tensor-parallel decode core (STRATA_TP=N)
+#endif
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
 #endif
@@ -50,6 +53,7 @@
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -341,22 +345,65 @@ int main(int argc, char ** argv) {
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
 #if defined(DS41_XE)
     // larry: the dense weights' planar reorder now, not inside the first decode token (STRATA_PREREORDER, default 1)
+    std::set<const void *> planar_w, planar_slices;   // larry, engine1: what the TP core's rank 0 may read in place
     if (dense.backend() && !ggml_backend_is_cpu(dense.backend()) && !(std::getenv("STRATA_PREREORDER") && std::getenv("STRATA_PREREORDER")[0] == '0')) {
         const double t0 = now_ms();
         int nr = 0;
-        for (ggml_tensor * t : dense.reorder_weights()) nr += ggml_backend_sycl_prereorder(dense.backend(), t) ? 1 : 0;
+        for (ggml_tensor * t : dense.reorder_weights())
+            if (ggml_backend_sycl_prereorder(dense.backend(), t)) { ++nr; planar_w.insert(t->data); }
         // wo_a per group slice: every prompt span then takes the per-slice GEMM, from the first prompt on
         // (STRATA_PREREORDER_SLICES, default 1)
         int ns = 0;
         if (!(std::getenv("STRATA_PREREORDER_SLICES") && std::getenv("STRATA_PREREORDER_SLICES")[0] == '0'))
             for (ggml_tensor * t : dense.slice_reorder_weights())
-                ns += ggml_backend_sycl_prereorder_slices(dense.backend(), t, dense.geom().o_groups) ? 1 : 0;
+                if (ggml_backend_sycl_prereorder_slices(dense.backend(), t, dense.geom().o_groups)) { ++ns; planar_slices.insert(t->data); }
         ggml_backend_synchronize(dense.backend());
         std::fprintf(stderr, "dense: %d Q6_K weights reordered at load, %d per slice (%.2f s)\n", nr, ns, (now_ms() - t0) / 1000.0);
     }
 #endif
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
+#if defined(DS41_TP)
+    // larry, engine1 (STRATA_TP=N, 0 = off): decode / verify passes of <= 7 tokens on the tensor-parallel core - the
+    // dense half split over N cards, each card its routed experts, the host out of the loop (a replayed SYCL graph per
+    // card).  Loaded here, before the tier places experts, so the cards' budgets see its weights.  Rank 0's state is
+    // the dense half's own (the prompt path, park / snapshot see what TP passes write); the other cards keep copies.
+    std::unique_ptr<Ds41Tp> tp;
+    if (const int tp_n = std::getenv("STRATA_TP") ? std::atoi(std::getenv("STRATA_TP")) : 0; tp_n > 0 && dense.backend() &&
+        !ggml_backend_is_cpu(dense.backend())) {
+        Ds41TpConfig tc;
+        tc.gguf = a.model;
+        tc.n_cards = tp_n;
+        tc.ctx_max = ctx;
+        tc.act_quant = a.act_quant;
+        if (const char * c = std::getenv("STRATA_TP_CACHE")) tc.cache_dir = c;
+        Ds41TpHooks th;
+        for (int l = 0; l < n_layer; ++l) {
+            void * p[5] = {};
+            if (!dense.state_ptrs(l, &p[0], &p[1], &p[2], &p[3], &p[4])) {
+                std::fprintf(stderr, "ds41_generate: STRATA_TP: the dense state of layer %d is not bf16 / f32 (no --kv-fp4)\n", l);
+                return 1;
+            }
+            th.state.push_back({ (float *) p[0], (uint16_t *) p[1], (uint16_t *) p[2], (float *) p[3], (float *) p[4] });
+        }
+        th.engram = [&dense](const int * t, int n, int p0, float * const * o) { return dense.engram_rows(t, n, p0, o); };
+        th.engram_slot = [&dense](const int * t, int n, int p0, int s, float * o) { return dense.engram_rows_slot(t, n, p0, s, o); };
+        // rank 0 reads the dense half's weights in place where they are already in its layout: the reordered (planar)
+        // Q6_K tensors, wo_a's per-slice planes, the F16 ones - no second copy of them on card 0
+        th.shared_weight = [&dense, &planar_w, &planar_slices](const std::string & name) -> const void * {
+            const ggml_tensor * t = dense.weight(name);
+            if (!t || !t->data || t->ne[2] != 1) return nullptr;
+            if (t->type == GGML_TYPE_F16) return t->data;
+            if (t->type != GGML_TYPE_Q6_K) return nullptr;
+            const bool woa = name.size() > 20 && name.compare(name.size() - 20, 20, "attn_output_a.weight") == 0;
+            return (woa ? planar_slices.count(t->data) : planar_w.count(t->data)) ? t->data : nullptr;
+        };
+        const double t0 = now_ms();
+        tp = std::make_unique<Ds41Tp>();
+        if (!tp->init(tc, th, err)) { std::fprintf(stderr, "ds41_generate: STRATA_TP: %s\n", err.c_str()); return 1; }
+        std::fprintf(stderr, "tp: %d cards, loaded in %.1f s\n", tp_n, (now_ms() - t0) / 1000.0);
+    }
+#endif
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
     // layers above it only read that owner's state, so the cut belongs there).  Also the window reach R = swa *
     // (n_layer - cut_layer) is what --enc-replay defaults to.
@@ -476,6 +523,21 @@ int main(int argc, char ** argv) {
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
     }
+#if defined(DS41_TP)
+    if (tp) {
+        const volatile uint64_t * rver = nullptr;
+        const void * rtab = tier.tp_route_table(&rver);
+        if (!tp->attach_experts(rtab, rver, [&tier](int l, int n, const int32_t * i, const float * w, const float * x, float * o) {
+                return tier.tp_cpu_part(l, n, i, w, x, o); }, [&tier](std::vector<uint32_t> & k) { return tier.tp_take_dirty(k); })) {
+            std::fprintf(stderr, "ds41_generate: STRATA_TP: %s\n", tp->last_error().c_str());
+            return 1;
+        }
+        // the promotion copies: on the tier's own card queues, beside the TP passes (a second queue runs while the TP
+        // queue spins: engine1/bench/cq_probe) - STRATA_TP_PROMOTE_INORDER=1: on the TP queues, between the passes
+        if (std::getenv("STRATA_TP_PROMOTE_INORDER") && std::atoi(std::getenv("STRATA_TP_PROMOTE_INORDER")) != 0)
+            tier.tp_set_promote_queues(tp->queues());
+    }
+#endif
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
     if (a.bias_prompt > 0) {
@@ -505,6 +567,9 @@ int main(int argc, char ** argv) {
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
                                : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
+#if defined(DS41_TP)
+            if (tp) tp->set_route_bias((int) l, rb.data());
+#endif
         }
     };
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
@@ -558,11 +623,47 @@ int main(int argc, char ** argv) {
     float * rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
+    // larry, engine1: a TP pass (its logits read by logits_rows below; DSpark's taps into vh_out when given)
+    bool last_tp = false;
+    std::vector<float> tp_logits;
+#if defined(DS41_TP)
+    auto tp_run = [&](const int * toks, int m, int pos, float * vh_out) -> bool {
+        int64_t lo = 0, hi = 0;
+        bool changed = false;
+        dense.take_written(&lo, &hi, &changed);
+        if (changed) {   // the prompt path / a restore wrote card 0's state: the other cards pull it
+            dense.pass_sync();
+            if (!tp->sync_state(lo, hi, false)) { ferr = tp->last_error(); return false; }
+        }
+        tp_logits.resize((size_t) m * nv);
+        if (!tp->pass(toks, m, pos, tp_logits.data(), vh_out, true)) { ferr = tp->last_error(); return false; }
+        last_tp = true;
+        // the tier's promotion cache between passes (STRATA_TP_PROMOTE_CHUNKS copy chunks of 1 MB a pass)
+        static const int pchunks = std::getenv("STRATA_TP_PROMOTE_CHUNKS") ? std::atoi(std::getenv("STRATA_TP_PROMOTE_CHUNKS")) : 64;
+        tier.tp_between_passes(pchunks);
+        return true;
+    };
+    const bool tp_on = tp != nullptr;
+#else
+    auto tp_run = [&](const int *, int, int, float *) -> bool { return false; };
+    const bool tp_on = false;
+#endif
+    // the logits rows of the last pass: the TP core's (host) or the dense half's
+    auto logits_rows = [&](int row0, int nrows, float * out) -> bool {
+        if (last_tp) {
+            std::memcpy(out, tp_logits.data() + (size_t) row0 * nv, (size_t) nrows * nv * sizeof(float));
+            return true;
+        }
+        if (!dense.logits(row0, nrows, out)) { ferr = dense.last_error(); return false; }
+        return true;
+    };
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
         double ta = dprof ? now_ms() : 0;
 #if defined(DS41_XE)
         tier.tl_flush();   // the previous token's timeline (its logits were read: all of it has run)
 #endif
+        if (tp_on && !dump_main && !file_pred) return tp_run(&tok, 1, pos, nullptr);
+        last_tp = false;
         if (dump_main) {
             dm_tok = tok;
             dm_pos = pos;
@@ -665,6 +766,8 @@ int main(int argc, char ** argv) {
     std::vector<int> mids;
     std::vector<float> mw;
     auto pass_m = [&](const int * toks, int m, int pos) -> bool {
+        if (tp_on && m <= 7) return tp_run(toks, m, pos, nullptr);
+        last_tp = false;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
@@ -701,6 +804,14 @@ int main(int argc, char ** argv) {
         double tq = now_ms();
         auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
+        if (tp_on && m <= 7) {   // larry, engine1: the whole pass on the TP cards (logits + DSpark's taps)
+            vh.assign((size_t) m * 3 * n_embd, 0.0f);
+            if (!tp_run(toks, m, pos, vh.data())) return false;
+            vlog.assign(tp_logits.begin(), tp_logits.begin() + (ptrdiff_t) m * nv);
+            lap(0);
+            return true;
+        }
+        last_tp = false;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
@@ -906,7 +1017,7 @@ int main(int argc, char ** argv) {
         const int t0 = n - tail_keep, lo = std::max(row0, t0), hi = row0 + nrows;
         if (lo >= hi) return true;
         if (tail_logits.size() != (size_t) tail_keep * (size_t) nv) tail_logits.assign((size_t) tail_keep * (size_t) nv, 0.0f);
-        if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
+        if (!logits_rows(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) return false;
         return true;
     };
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
@@ -944,6 +1055,7 @@ int main(int argc, char ** argv) {
                             continue;
                         } else { ferr = dense.last_error(); return false; }
                     }
+                    last_tp = false;
                     if (dense.begin_batch(ids + c0, B, pos0 + c0)) break;
                     if (B > SB) {
                         std::fprintf(stderr, "ds41_generate: batch of %d did not fit (%s) - retrying at %d\n",
@@ -1179,6 +1291,27 @@ int main(int argc, char ** argv) {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
                 const int m = std::min(NP, n - c0);
                 double t0 = now_ms();
+                // larry, engine1 (STRATA_TP_PROMPT=1, a test path: decode-path PPL / logits on the TP cards with
+                // --prefill-chunk <= 7): the chunk as a TP pass
+                static const bool tp_prompt = std::getenv("STRATA_TP_PROMPT") && std::atoi(std::getenv("STRATA_TP_PROMPT")) != 0;
+                if (tp_on && tp_prompt && m <= 7 && !dump_dir) {
+                    if (!tp_run(ids + c0, m, pos0 + c0, nullptr)) return false;
+                    fd_dense += now_ms() - t0;
+                    const double tl = now_ms();
+                    if (all_logits) {
+                        all_logits->resize((size_t) (c0 + m) * (size_t) nv);
+                        std::copy(tp_logits.begin(), tp_logits.begin() + (ptrdiff_t) m * nv, all_logits->begin() + (ptrdiff_t) c0 * nv);
+                        if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
+                    } else if (c0 + m == n) {
+                        std::copy(tp_logits.begin() + (ptrdiff_t) (m - 1) * nv, tp_logits.begin() + (ptrdiff_t) m * nv, last_logits.begin());
+                    }
+                    if (!capture_tail(n, c0, m, 0)) return false;
+                    fd_logits += now_ms() - tl;
+                    c0 += m;
+                    progress(c0);
+                    continue;
+                }
+                last_tp = false;
                 if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
                     const float * fn = nullptr;
@@ -1517,7 +1650,7 @@ int main(int argc, char ** argv) {
                     last_rows = m;
                     if (i / 64 != before / 64 && i < dh) pp(i);
                 }
-                if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                if (!logits_rows(last_rows - 1, 1, last_logits.data())) return false;
                 pp(dh);
                 return true;
             };
@@ -1843,7 +1976,7 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
+                if (!step(tok, pos) || !logits_rows(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
                 tier.rebalance_tick();
@@ -1903,7 +2036,7 @@ int main(int argc, char ** argv) {
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
-        if (!step(prompt[(size_t) i], i) || !dense.logits(0, 1, last_logits.data())) {
+        if (!step(prompt[(size_t) i], i) || !logits_rows(0, 1, last_logits.data())) {
             std::fprintf(stderr, "ds41_generate: dump-main prompt step: %s\n", ferr.c_str());
             return 1;
         }
@@ -2101,7 +2234,7 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!step(tok, pos) || !logits_rows(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;

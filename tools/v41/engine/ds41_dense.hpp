@@ -209,6 +209,21 @@ public:
     std::vector<ggml_tensor *> reorder_weights() const;
     /// larry: the 2-D Q6_K weights read only through per-group slice views (wo_a) - for ggml_backend_sycl_prereorder_slices
     std::vector<ggml_tensor *> slice_reorder_weights() const;
+    /// larry, engine1 (STRATA_TP): layer il's persistent state tensors on the backend (device addresses; null where
+    /// the layer has none) - the window ring [RAW][DH] f32, the compressed KV / indexer keys ([ctx_max / ratio + 1][DH]
+    /// / [..][ID] bf16) and the ratio-2 compressor state [2][DH] f32 (values, scores).  False: another layout (--kv-fp4,
+    /// an f32 cache, the CPU backend).
+    bool state_ptrs(int il, void ** raw, void ** comp, void ** idxk, void ** st_kv, void ** st_sc) const;
+    /// larry, engine1: what the dense half wrote to that state since the last call - the positions [*lo, *hi) of its
+    /// passes / batches / unpark, and *changed (any write at all: the rings and compressor states too, e.g. restore).
+    /// An external decode core re-syncs its copies from it.  Every state write is behind a pass_sync() the caller does.
+    void take_written(int64_t * lo, int64_t * hi, bool * changed);
+    /// larry, engine1: the Engram rows of tokens tids[0..n) at pos0.. into out[e] (n * cols * dim floats, slot e =
+    /// the e-th Engram layer), the tokens recorded in the n-gram history first; blocking.  No Engram: true, untouched.
+    bool engram_rows(const int * tids, int n, int pos0, float * const * out);
+    /// larry, engine1: one slot's rows (slot 0 first: it records the tokens) - the first Engram layer can start before
+    /// the second's rows are read
+    bool engram_rows_slot(const int * tids, int n, int pos0, int slot, float * out);
 
 private:
     std::unique_ptr<Impl> p_;
