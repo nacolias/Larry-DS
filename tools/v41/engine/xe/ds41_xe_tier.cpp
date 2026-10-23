@@ -32,6 +32,9 @@
 
 #include <pthread.h>
 #include <sched.h>
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+#include <immintrin.h>
+#endif
 
 namespace strata::v41 {
 
@@ -373,6 +376,7 @@ struct Ds41XeImpl {
     double pc_push_us = 0, pc_poll_us = 0;
     int64_t pc_chunks = 0;
     std::atomic<int64_t> pc_fill_us{0}, pc_fill_n{0}, pc_wait_us{0};   ///< the helpers' repack time, count, time a job sat queued
+    std::atomic<int> pool_busy{0};     ///< larry, engine1: a TP pass's CPU pool is computing (the fills step aside: STRATA_TP_PC_PACE)
     Ds41MoeStats st;
     std::mutex mu;
     bool planar = true;                ///< STRATA_XE_PLANAR (default 1): experts repacked on the cards, int8 kernels
@@ -393,6 +397,12 @@ struct Ds41XeImpl {
     std::vector<uint32_t> rt_dirty;    ///< larry, engine1: the keys rt_put changed since tp_take_dirty (bounded; overflow: all)
     bool rt_dirty_all = true;
     std::vector<std::pair<int64_t, size_t>> tp_want;   ///< larry, engine1: the last pass's CPU-pool experts (promotion candidates)
+    // larry, engine1, STRATA_XE_CPU_LOG=<file> (diagnostics): a line per TP pass (T), per CPU-pool expert (E: layer,
+    // expert, its tokens, class, arena pinned / pageable / file, earlier CPU uses, promotion state, bytes), per layer
+    // with any (L: experts, bytes, wall us, the pool's phase ms) and per promotion event (Q queued, P published, V
+    // evicted, S skipped); STRATA_XE_CPU_TWICE=1 also runs each layer's CPU experts again (weights hot in the caches)
+    std::FILE* cpu_log = nullptr;
+    int64_t tp_pass = 0;
     XeJob* rt_jobs = nullptr;          ///< dense card: [cards][kMaxDecodeJobs] - the routed call's jobs, per card
     XeJob* rt_null = nullptr;          ///< dense card: [cards] - each card's null job (the lists' padding)
     RtHdr* rt_hdr = nullptr;           ///< pinned: the route kernel's counts and CPU entries
@@ -1534,6 +1544,36 @@ void cpu_repack_mat(int type, const uint8_t* src, uint8_t* dst, size_t NB) {
     }
 }
 
+/// larry, engine1 (STRATA_XE_PC_STREAM, default 1): an arena blob into a pinned bounce with streaming stores - no
+/// read-for-ownership of the bounce's lines and none of them left in the caches.  The CPU pool beside the helpers is
+/// DRAM-bound: its one-expert layers took ~400 us with no fills beside them, ~500 beside plain-store fills and ~475
+/// beside these.  dst 32-byte aligned, n a multiple of 16.
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+__attribute__((target("avx2")))
+#endif
+void stream_copy(uint8_t* dst, const uint8_t* src, size_t n) {
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+    static const bool on = env_i("STRATA_XE_PC_STREAM", 1) != 0;
+    if (on && ((uintptr_t) dst & 31) == 0 && n % 16 == 0) {
+        size_t i = 0;
+        for (; i + 128 <= n; i += 128) {
+            const __m256i a = _mm256_loadu_si256((const __m256i*) (src + i));
+            const __m256i b = _mm256_loadu_si256((const __m256i*) (src + i + 32));
+            const __m256i c = _mm256_loadu_si256((const __m256i*) (src + i + 64));
+            const __m256i d = _mm256_loadu_si256((const __m256i*) (src + i + 96));
+            _mm256_stream_si256((__m256i*) (dst + i), a);
+            _mm256_stream_si256((__m256i*) (dst + i + 32), b);
+            _mm256_stream_si256((__m256i*) (dst + i + 64), c);
+            _mm256_stream_si256((__m256i*) (dst + i + 96), d);
+        }
+        for (; i < n; i += 16) _mm_stream_si128((__m128i*) (dst + i), _mm_loadu_si128((const __m128i*) (src + i)));
+        _mm_sfence();   // weakly ordered: globally visible before the fill is flagged done
+        return;
+    }
+#endif
+    std::memcpy(dst, src, n);
+}
+
 /// The promotion cache's slots (each expert card's flex region, STRATA_XE_FLEX_GIB), the bounces and the helper thread.
 void pc_setup(Ds41XeImpl& im) {
     im.pc_slot = ((size_t) im.blob_max + 255) & ~(size_t) 255;
@@ -1582,7 +1622,18 @@ void pc_setup(Ds41XeImpl& im) {
                 const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
                 const uint8_t* src = im.aptr[(size_t) j->key];
                 uint8_t* dst = im.pc_bounce + (size_t) j->bounce * im.pc_slot;
-                if (!im.planar || im.pc_devrepack) std::memcpy(dst, src, im.bbytes(l, e));   // (the card repacks)
+                if (!im.planar || im.pc_devrepack) {   // (the card repacks)
+                    // larry, engine1 (STRATA_TP_PC_PACE, default 0): 1 MB at a time, none while a TP pass's CPU pool
+                    // computes - beside it a fill takes the pool's cores' SMT siblings and DRAM (one-expert layers
+                    // ~400 -> ~460 us).  Paced they were ~440 us, but later fills missed more next passes: DSpark
+                    // cycles 30.2 / 30.5 ms against 29.9 / 30.1 unpaced (bench/engine1/tcpu4.sh)
+                    static const bool pace = env_i("STRATA_TP_PC_PACE", 0) != 0;
+                    const size_t b = im.bbytes(l, e), piece = pace ? (size_t) 1 << 20 : b;
+                    for (size_t off = 0; off < b; off += piece) {
+                        while (pace && im.pool_busy.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::microseconds(25));
+                        stream_copy(dst + off, src + off, std::min(piece, b - off));
+                    }
+                }
                 else {
                     const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
                     auto qk = [](int t) { return t == xe::kQ3K ? 256 : t == xe::kQ20 ? 64 : 128; };
@@ -1628,9 +1679,12 @@ bool pc_check(Ds41XeImpl& im, XeCard& c, int64_t key, const uint8_t* slot) {
 /// (push = false: the start of a call)
 void pc_poll(Ds41XeImpl& im, bool push) {
     static const bool check = env_i("STRATA_XE_PROMOTE_CHECK", 0) != 0;
-    static const size_t chunk = (size_t) (env_d("STRATA_XE_PROMOTE_CHUNK_MB", 1.0) * 1048576.0) & ~(size_t) 255;
+    // larry, engine1: 4 MB under STRATA_TP (the copies run on their own queues during the draft; fewer submissions
+    // between passes - 64 a pass are ~20 experts)
+    static const size_t chunk = (size_t) (env_d("STRATA_XE_PROMOTE_CHUNK_MB", env_i("STRATA_TP", 0) > 0 ? 4.0 : 1.0) * 1048576.0) & ~(size_t) 255;
     for (auto it = im.pc_jobs.begin(); it != im.pc_jobs.end();) {
         Ds41XeImpl::PcJob& j = *it;
+        if (j.card < 0) { ++it; continue; }   // larry, engine1: its bounce filling early (pc_early), no card / slot yet
         XeCard& c = *im.cards[(size_t) j.card];
         const int64_t l = j.key / im.g.n_experts, e = j.key % im.g.n_experts;
         uint8_t* slot = c.pc_mem + (size_t) j.slot * im.pc_slot;
@@ -1680,6 +1734,7 @@ void pc_poll(Ds41XeImpl& im, bool push) {
                 c.pc_tick[(size_t) j.slot] = im.pc_clock;
                 im.pc_where[(size_t) j.key] = (c.idx << 16) | j.slot;
                 ++im.pc_done;
+                if (im.cpu_log) std::fprintf(im.cpu_log, "P %lld %lld %d\n", (long long) im.tp_pass, (long long) j.key, c.idx);
             }
             it = im.pc_jobs.erase(it);
             continue;
@@ -1692,19 +1747,28 @@ void pc_poll(Ds41XeImpl& im, bool push) {
 /// the least recently used of another layer (no queued job reads it: only layer l's are in flight now, every earlier
 /// layer's cards were done before this layer's attention; its repack is queued after them anyway).
 void pc_want(Ds41XeImpl& im, int64_t l, size_t key) {
-    if (im.pc_where[key] != -1 || !im.aptr[key]) return;
+    // larry, engine1: a pageable expert's bounce may be filling already (pc_early, at its CPU use) - it only waits for
+    // its card and slot (and keeps its bounce until it gets them)
+    Ds41XeImpl::PcJob* early = nullptr;
+    if (im.pc_where[key] == -3)
+        for (auto& j : im.pc_jobs)
+            if (j.key == (int64_t) key && j.card < 0) { early = &j; break; }
+    if (!early && (im.pc_where[key] != -1 || !im.aptr[key])) return;
     static const int pmin = std::max(1, env_i("STRATA_XE_PROMOTE_MIN", 2));
     if (im.pc_uses.size() != im.card_of.size()) im.pc_uses.assign(im.card_of.size(), 0);
     if (im.pc_uses[key] < 255) ++im.pc_uses[key];
-    if (im.pc_uses[key] < pmin) return;
+    if (!early && im.pc_uses[key] < pmin) return;
     const int NC = (int) im.cards.size();
     XeCard* cd = nullptr;
     for (int k = 0; k < NC && !cd; ++k) {
         XeCard& c = *im.cards[(size_t) ((im.pc_rr + k) % NC)];
         if (!c.dense && c.pc_n > 0 && c.pc_busy < im.pc_par) cd = &c;
     }
-    if (!cd) { ++im.pc_busy_skip; return; }
-    if (im.pc_bfree.empty() && !(im.pc_devrepack && im.apin[key])) { ++im.pc_busy_skip; return; }
+    if (!cd || (!early && im.pc_bfree.empty() && !(im.pc_devrepack && im.apin[key]))) {
+        ++im.pc_busy_skip;
+        if (im.cpu_log) std::fprintf(im.cpu_log, "S %lld %lld %d\n", (long long) im.tp_pass, (long long) key, cd ? 1 : 0);
+        return;
+    }
     int slot = -1;
     uint64_t best = UINT64_MAX;
     for (int sl = 0; sl < cd->pc_n; ++sl) {
@@ -1721,10 +1785,17 @@ void pc_want(Ds41XeImpl& im, int64_t l, size_t key) {
         rt_put(im, (size_t) old);
         im.pc_where[(size_t) old] = -1;
         ++im.pc_evicted;
+        if (im.cpu_log) std::fprintf(im.cpu_log, "V %lld %lld\n", (long long) im.tp_pass, (long long) old);
     }
+    if (im.cpu_log) std::fprintf(im.cpu_log, "Q %lld %lld %d\n", (long long) im.tp_pass, (long long) key, cd->idx);
     cd->pc_key[(size_t) slot] = -2;
     cd->pc_busy += 1;
     im.pc_where[key] = -2;
+    if (early) {   // pc_poll takes it from here (filled -> its copies)
+        early->card = cd->idx;
+        early->slot = slot;
+        return;
+    }
     im.pc_jobs.emplace_back();
     Ds41XeImpl::PcJob& j = im.pc_jobs.back();
     j.key = (int64_t) key;
@@ -1740,6 +1811,29 @@ void pc_want(Ds41XeImpl& im, int64_t l, size_t key) {
     im.pc_bfree.pop_back();
     { std::lock_guard<std::mutex> lk(im.pc_mu); im.pc_fill.push_back(&j); }
     im.pc_cv.notify_one();
+}
+
+/// larry, engine1 (STRATA_TP_PC_EARLY): the pageable experts a TP pass's CPU pool just ran that the next tp_between_passes
+/// will want get their bounces filled now, while the pass goes on (their bytes just went through the caches) - there
+/// pc_want only places them and their copies run during the draft: the next pass finds them on a card, not two to
+/// five passes later
+void pc_early(Ds41XeImpl& im, int64_t l, const std::vector<const Ent*>& ents) {
+    static const int pmin = std::max(1, env_i("STRATA_XE_PROMOTE_MIN", 2));
+    if (im.pc_uses.size() != im.card_of.size()) im.pc_uses.assign(im.card_of.size(), 0);
+    for (const Ent* en : ents) {
+        const size_t key = (size_t) im.key(l, en->e);
+        if (im.pc_where[key] != -1 || !im.aptr[key] || (im.pc_devrepack && im.apin[key])) continue;   // pinned: read in place
+        if (im.pc_uses[key] + 1 < pmin || im.pc_bfree.empty()) continue;
+        im.pc_jobs.emplace_back();
+        Ds41XeImpl::PcJob& j = im.pc_jobs.back();
+        j.key = (int64_t) key;
+        j.t_queued = now_ms();
+        j.bounce = im.pc_bfree.back();
+        im.pc_bfree.pop_back();
+        im.pc_where[key] = -3;
+        { std::lock_guard<std::mutex> lk(im.pc_mu); im.pc_fill.push_back(&j); }
+        im.pc_cv.notify_one();
+    }
 }
 
 /// The cache gone (a prompt's prefetch wants the VRAM; close): in-flight promotions finished, every promoted expert
@@ -3671,6 +3765,8 @@ const void* Ds41XeTier::tp_route_table(const volatile uint64_t** version) {
 
 void Ds41XeTier::tp_between_passes(int chunks) {
     Ds41XeImpl& im = *im_;
+    if (im.cpu_log) std::fprintf(im.cpu_log, "B %lld %.3f\n", (long long) im.tp_pass, now_ms());   // the pass is back
+    ++im.tp_pass;
     if (im.pc_mode < 0) im.pc_mode = env_i("STRATA_XE_PROMOTE", 1) != 0 && im.planar && im.dense >= 0 ? 1 : 0;
     if (im.pc_mode <= 0) return;
     ++im.pc_clock;
@@ -3685,6 +3781,16 @@ void Ds41XeTier::tp_between_passes(int chunks) {
     pc_poll(im, false);   // copies done (in order behind the last pass): published - their slots free for new wants
     for (const auto& lk : im.tp_want) if (im.pc_ready) pc_want(im, lk.first, lk.second);
     im.tp_want.clear();
+    // early bounces no card took (every card at its in-flight cap): given back once filled (the helper is done with them)
+    for (auto it = im.pc_jobs.begin(); it != im.pc_jobs.end();) {
+        if (it->card < 0 && it->filled.load(std::memory_order_acquire)) {
+            im.pc_bfree.push_back(it->bounce);
+            im.pc_where[(size_t) it->key] = -1;
+            it = im.pc_jobs.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (env_i("STRATA_TP_PC_DEBUG", 0) && im.pc_clock % 32 == 0) {   // the pipeline's state
         int st[4] = {0, 0, 0, 0};
         for (auto& j : im.pc_jobs) ++st[std::min(3, std::max(0, j.stage))];
@@ -3771,6 +3877,11 @@ void Ds41XeTier::tp_set_promote_queues(const std::vector<void*>& qs) {
 
 bool Ds41XeTier::tp_take_dirty(std::vector<uint32_t>& keys) {
     Ds41XeImpl& im = *im_;
+    // larry, engine1 (STRATA_TP_PC_PUBLISH, default 1): the TP core asks before every pass - the promotions whose copies
+    // finished since (they run during the draft) are published first, so this pass's table has them
+    static const bool publish = env_i("STRATA_TP_PC_PUBLISH", 1) != 0;
+    if (publish && im.pc_mode > 0 && !im.pc_jobs.empty()) pc_poll(im, false);
+    if (im.cpu_log) std::fprintf(im.cpu_log, "A %lld %.3f\n", (long long) im.tp_pass, now_ms());   // a pass starts
     const bool all = im.rt_dirty_all;
     keys.swap(im.rt_dirty);
     im.rt_dirty.clear();
@@ -3783,6 +3894,13 @@ int Ds41XeTier::tp_cpu_part(int64_t layer, int nt, const int32_t* ids, const flo
     static thread_local std::vector<Ent> ents;
     static thread_local std::vector<int32_t> first;
     static thread_local std::vector<const Ent*> cpu_list;
+    static const char* log_path = std::getenv("STRATA_XE_CPU_LOG");
+    if (log_path && !im.cpu_log) {
+        im.cpu_log = std::fopen(log_path, "w");
+        if (im.cpu_log) std::setvbuf(im.cpu_log, nullptr, _IOFBF, 1 << 20);
+        log_path = nullptr;   // one try
+    }
+    if (im.cpu_log && layer == 0) std::fprintf(im.cpu_log, "T %lld %d\n", (long long) im.tp_pass, nt);
     group(ids, w, nt, (int) im.g.top_k, im.g.n_experts, ents, first);
     cpu_list.clear();
     for (const Ent& en : ents) {
@@ -3795,11 +3913,53 @@ int Ds41XeTier::tp_cpu_part(int64_t layer, int nt, const int32_t* ids, const flo
         } else if (im.pc_ready && im.pc_where[key] >= 0) {   // a promoted expert the cards ran: its slot used now
             im.cards[(size_t) (im.pc_where[key] >> 16)]->pc_tick[(size_t) (im.pc_where[key] & 0xFFFF)] = im.pc_clock;
             ++im.pc_hit;
+            if (im.cpu_log) std::fprintf(im.cpu_log, "H %lld %lld %d %d\n", (long long) im.tp_pass, (long long) layer, en.e, en.nt);
         }
     }
     if (cpu_list.empty()) return 0;
     std::memset(out, 0, (size_t) nt * (size_t) im.g.n_embd * sizeof(float));
+    // larry, engine1 (STRATA_TP_PC_EARLY, default 1): the bounces of the experts the next tp_between_passes promotes fill
+    // from now on (pc_early).  With STRATA_TP_PC_PUBLISH and 4 MB chunks: CPU-pool experts a verify pass 10.2-11.3 ->
+    // 7.0-8.0, a DSpark cycle at the same pass widths -6 % (bench/engine1/tcpu3.sh .. tcpu5.sh, engine1/DESIGN.md)
+    static const bool early = env_i("STRATA_TP_PC_EARLY", 1) != 0;
+    if (!im.cpu_log) {
+        im.pool_busy.store(1, std::memory_order_release);
+        cpu_ents(im, layer, cpu_list, x, out);
+        im.pool_busy.store(0, std::memory_order_release);
+        if (early && im.pc_ready) pc_early(im, layer, cpu_list);
+        return (int) cpu_list.size();
+    }
+    size_t bytes = 0;
+    for (const Ent* en : cpu_list) {
+        const size_t key = (size_t) im.key(layer, en->e);
+        const int where = key < im.pc_where.size() ? im.pc_where[key] : -1;
+        const int uses = key < im.pc_uses.size() ? im.pc_uses[key] : 0;
+        const int pin = !im.aptr[key] ? 2 : key < im.apin.size() && im.apin[key] ? 1 : 0;
+        bytes += im.bbytes(layer, en->e);
+        std::fprintf(im.cpu_log, "E %lld %lld %d %d %d %d %d %d %zu\n", (long long) im.tp_pass, (long long) layer, en->e, en->nt,
+                     im.cls(layer, en->e), pin, uses, where, im.bbytes(layer, en->e));
+    }
+    cpu::ExpertPool& pl = *im.pool;
+    const double g0 = pl.ms_multi_gu, q0 = pl.ms_multi_q, d0 = pl.ms_multi_down, t0 = now_ms();
+    im.pool_busy.store(1, std::memory_order_release);
     cpu_ents(im, layer, cpu_list, x, out);
+    im.pool_busy.store(0, std::memory_order_release);
+    const double t1 = now_ms(), g1 = pl.ms_multi_gu, q1 = pl.ms_multi_q, d1 = pl.ms_multi_down;
+    static const bool twice = env_i("STRATA_XE_CPU_TWICE", 0) != 0;
+    double hot = 0, hg = 0, hq = 0, hd = 0;
+    if (twice) {   // the same experts again, into scratch (their counters left as the first run set them)
+        static thread_local std::vector<float> scratch;
+        scratch.assign((size_t) nt * (size_t) im.g.n_embd, 0.0f);
+        const auto st = im.st;
+        const double t2 = now_ms();
+        cpu_ents(im, layer, cpu_list, x, scratch.data());
+        hot = (now_ms() - t2) * 1e3;
+        hg = pl.ms_multi_gu - g1; hq = pl.ms_multi_q - q1; hd = pl.ms_multi_down - d1;
+        im.st = st;
+    }
+    if (early && im.pc_ready) pc_early(im, layer, cpu_list);
+    std::fprintf(im.cpu_log, "L %lld %lld %d %zu %zu %.1f %.3f %.3f %.3f %.1f %.3f %.3f %.3f\n", (long long) im.tp_pass, (long long) layer,
+                 nt, cpu_list.size(), bytes, (t1 - t0) * 1e3, g1 - g0, q1 - q0, d1 - d0, hot, hg, hq, hd);
     return (int) cpu_list.size();
 }
 
@@ -4000,6 +4160,7 @@ void Ds41XeTier::close() {
         im.pc_thr_more.clear();
     }
     if (im.pc_bounce) { sycl::free(im.pc_bounce, im.ctx); im.pc_bounce = nullptr; }
+    if (im.cpu_log) { std::fclose(im.cpu_log); im.cpu_log = nullptr; }
     if (im.pc_done || im.pc_busy_skip)
         std::fprintf(stderr, "xe tier: promotion cache: %lld promoted, %lld hits, %lld evicted, %lld skipped (cards busy), %lld bad; "
                      "%lld chunks, host push %.1f ms, poll %.1f ms\n", (long long) im.pc_done, (long long) im.pc_hit, (long long) im.pc_evicted,

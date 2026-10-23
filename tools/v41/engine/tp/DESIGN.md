@@ -1,7 +1,8 @@
 # engine1 - DeepSeek-V4.1 decode / verify on N cards (tensor parallel), host out of the loop
 
 Status: phases A-D done; in the engine behind STRATA_TP=N (default 0), in the service since 2026-10-23 02:35
-(STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02 - see the status sections at the end.  User go-ahead
+(STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02, promotions in time for the next pass since 17:31 - see the
+status sections at the end.  User go-ahead
 2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card count).  Mirror of
 larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
 
@@ -220,3 +221,58 @@ layer 1: wherever activations are rounded to 8 bits (dp4a GEMMs, planar experts)
 rounding, and the jump is ~1e-5.  The bulk statistics do not move with the pager: KL against a resident run
 0.0021-0.0025 mean, PPL without row 111 1.998-2.009.  A bit-exact prompt path (fixed reduction orders, placement
 independent of the driver's free-VRAM reading) would make such rows repeatable, not right; not planned.
+
+## Status 2026-10-23 ~17:30 (the CPU-pool experts of verify passes: promotions in time for the next pass)
+
+Measured first, on the DSpark essay at the service's settings (`STRATA_XE_CPU_LOG=<file>`: a line per TP pass, per
+CPU-pool expert, per layer with any and per promotion event; `bench/engine1/cpulog.py` reads it, `pcsim.py` replays
+a run's expert uses under other promotion policies):
+
+* 94-95 % of the CPU pool's experts are pageable arena experts.  The pinned ~20 GiB of the arena hold the hottest arena
+  experts, and card 0's cache takes ~1,700 of those, so the plan (idle cards computing pinned experts over PCIe) would
+  have covered ~5 % of the CPU pool's work.
+* The pool reads 28-31 GB/s cold (larry's DRAM 38-40) and 45 GB/s with the weights in the caches
+  (`STRATA_XE_CPU_TWICE=1` runs each layer's CPU experts again): faster kernels could give ~1.3x at most.
+* 63 % of the CPU uses were repeats, 31 % of an expert the pass before had run on the CPU.  A promotion took 2-5
+  passes: the bounce was filled after the pass (helpers), the copies went out 64 chunks of 1 MB a pass, and the slot
+  was published one pass after its copies.  18 % of the CPU uses came while that expert's promotion was in flight, and
+  the in-flight cap (8 a card) skipped 533 promotions.
+
+So promotions now land before the next pass:
+
+* `STRATA_TP_PC_EARLY` (default 1): a pageable expert the next tp_between_passes will promote gets its pinned bounce
+  filled right after the CPU pool ran it, while the pass goes on, with streaming stores (`STRATA_XE_PC_STREAM`: no
+  read-for-ownership of the bounce, and its lines kept out of the caches the pool uses).  Between passes it only gets
+  its card and slot; a bounce no card took (every card at its cap) goes back once filled.
+* Copy chunks of 4 MB under TP (were 1 MB; 64 a pass are ~20 experts): they run on the cards' promotion queues during
+  the draft, when cards 1-3 are idle.
+* `STRATA_TP_PC_PUBLISH` (default 1): the TP core calls the tier's dirty hook before every pass (it used to only when
+  the residency table's version had changed), and the tier publishes there the promotions whose copies are done.
+* `STRATA_TP_ENG_ASYNC` (default 1): a pass's Engram rows are read by a helper thread, so CPU-pool layers among 0-3 (a
+  quarter of the verify passes have one) no longer wait behind both Engram layers' rows (~2 ms).  Neutral within the
+  noise below.
+
+A DSpark cycle (verify pass + draft) by pass width, from the pass timestamps the CPU log carries, weighted by one
+pass-width mix for every run (the acceptance moves with the text, and the texts diverge after a few tokens):
+
+| one-shot, service settings, essay 1000 tokens, clocks pinned | CPU-pool experts a pass | one-expert CPU layer | cycle |
+| --- | --- | --- | --- |
+| before (2 runs) | 10.2 / 11.3 | 391 / 413 us | 31.5 / 32.6 ms |
+| promoted at the first use (`STRATA_XE_PROMOTE_MIN=1`, 2 runs) | 7.9 / 8.1 | 473 / 480 us | 30.7 / 30.9 ms |
+| promoted at the second use, Engram inline (3 runs) | 7.0 / 8.0 / 8.0 | 453 - 481 us | 29.9 / 30.1 / 30.5 ms |
+| the same with the Engram rows on the helper (2 runs; in the service) | 7.2 / 8.0 | 454 / 455 us | 30.1 / 30.2 ms |
+
+A cycle is 6 % shorter, ~+6.5 % tokens a second at equal acceptance.  Promoting at the first use evicts more and
+slows the draft (the copies of ~7 promotions a pass run during it).  Pausing the fills while the CPU pool computes
+(`STRATA_TP_PC_PACE=1`) brought one-expert layers to ~440 us, but later fills missed more next passes: cycles 30.2 /
+30.5 ms.  Checked: `STRATA_XE_PROMOTE_CHECK=1`, 1392 promotions, 0 bad slots; a private-port copy of the service
+(`tpg.sh`, the tsvc2 sequence twice) and tsvc2 on the service (17:31): needles 200 / 8K / 8K / 16K / 31K found, the
+tool call right, essay 69.9 / 63.6 tok/s, svcbench 80.4 / 72.9 (the service samples at temperature 1: its acceptance
+noise is larger than 6 %), prompts 8K 816 / 932, 16K 1303, 31K 1673 tok/s, hidden RAM 40 GiB peak.  The one-shot texts
+diverge from the old path's after a few tokens (promoted experts run the cards' int8 kernels, not the CPU pool's) and
+read as well.
+
+What is left of the CPU pool's share: ~40 % of its experts are an expert's first use in the run (no cache takes those:
+only a faster CPU part or routing prediction); more slots (card 0 has ~2 GiB free in decode) would take ~6 % more of
+the rest at MIN 2 (`pcsim.py`).  The service drops the promotion cache at every batch prompt (the flex regions become
+the prompt's prefetch buffers), so its sessions start cold more often than these runs.

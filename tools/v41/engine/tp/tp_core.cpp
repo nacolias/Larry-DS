@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -285,6 +288,42 @@ struct Ds41Tp::Impl {
     // experts (and the mailbox waits before them), the wait for the cards after the host's part
     double pf[6] = {0, 0, 0, 0, 0, 0};
     int64_t pf_n = 0, pf_cpu_layers = 0;
+    double pf_eng = 0;   // STRATA_TP_ENG_ASYNC: the helper's Engram reads (beside the columns above)
+    // STRATA_TP_ENG_ASYNC (default 1): a pass's Engram rows are read by a helper thread while the pass's own thread
+    // takes the CPU pool's layers from layer 0 (inline, a CPU-pool layer among layers 0-3 - a quarter of the verify
+    // passes - waited ~2 ms behind both Engram layers' rows).  The Engram reader is the dense half's, which nothing
+    // else touches during a TP pass.
+    std::thread eng_thr;
+    std::mutex eng_mu;
+    std::condition_variable eng_cv;
+    std::function<void()> eng_job;
+    std::atomic<int> eng_state{0};   // 0 idle, 1 posted, 2 done, 3 stop
+    void eng_post(std::function<void()> job) {
+        if (!eng_thr.joinable())
+            eng_thr = std::thread([this] {
+                for (;;) {
+                    std::function<void()> j;
+                    {
+                        std::unique_lock<std::mutex> lk(eng_mu);
+                        eng_cv.wait(lk, [this] { const int st = eng_state.load(); return st == 1 || st == 3; });
+                        if (eng_state.load() == 3) return;
+                        j = std::move(eng_job);
+                    }
+                    j();
+                    eng_state.store(2, std::memory_order_release);
+                }
+            });
+        {
+            std::lock_guard<std::mutex> lk(eng_mu);
+            eng_job = std::move(job);
+            eng_state.store(1, std::memory_order_release);
+        }
+        eng_cv.notify_one();
+    }
+    void eng_join() {
+        while (eng_state.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        eng_state.store(0, std::memory_order_release);
+    }
     int pf_rec = 0;   // passes of the window that recorded their graphs
     std::unique_ptr<sycl::kernel_bundle<sycl::bundle_state::executable>> kb;   // keeps the cards' modules built
     int dm_layers[3] = { 36, 37, 38 };
@@ -296,6 +335,11 @@ struct Ds41Tp::Impl {
     std::function<bool(int, size_t)> make_room;   // the tier: room for that many more bytes on that GPU
 
     ~Impl() {
+        if (eng_thr.joinable()) {
+            { std::lock_guard<std::mutex> lk(eng_mu); eng_state.store(3); }
+            eng_cv.notify_one();
+            eng_thr.join();
+        }
         for (auto & c : cards) {
             try { c->q.wait(); } catch (...) {}
             c->graphs.clear();
@@ -658,14 +702,17 @@ struct Ds41Tp::Impl {
     size_t hkeys_cap = 0;
     void refresh_rtab() {
         if (!hooks.rtab || !hooks.rtab_version) return;
-        const uint64_t v = *hooks.rtab_version;
-        if (v == rtab_seen) return;
         const bool first = rtab_seen == ~(uint64_t) 0;
+        // the dirty hook first, every pass: the tier publishes there the promotions whose copies finished since (they
+        // run during the draft) - then the version says whether anything changed
+        bool all = first;
+        if (hooks.rtab_dirty && hooks.rtab_dirty(rt_keys)) all = true;
+        const uint64_t v = *hooks.rtab_version;
+        if (v == rtab_seen && !all) return;
         rtab_seen = v;
         const tpk::TpExp * src = (const tpk::TpExp *) hooks.rtab;
         const size_t nent = (size_t) (NL * NE);
-        bool all = first || !hooks.rtab_dirty;
-        if (hooks.rtab_dirty && hooks.rtab_dirty(rt_keys)) all = true;
+        if (!hooks.rtab_dirty) all = true;   // no dirty keys: the whole table whenever it changed
         if (!all && rt_keys.size() > hkeys_cap) all = true;
         if (all) {
             for (auto & cp : cards) {
@@ -1590,22 +1637,28 @@ bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * mai
     bool host_ok = true;
     const double t2 = now_us();
     double t_cpu = 0, t_mail = 0;
-    if (im.hooks.engram) {
-        // the first Engram layer's rows, its gate; then the second's (its layer is ~13 layers later).  On failure the
-        // rows are stale but the gates open anyway: the pass must not hang; the error is returned.
+    bool eng_ok = true;
+    double t_eng = 0;
+    // the first Engram layer's rows, its gate; then the second's (its layer is ~13 layers later).  On failure the rows
+    // are stale but the gates open anyway: the pass must not hang; the error is returned.
+    auto engram_rows = [&im, tids, n, pos0, want0, &eng_ok, &t_eng] {
+        const double te = now_us();
         float * outp[2] = { im.heng, im.heng + (size_t) im.NMAX * im.EC * im.ED };
-        float * o0[2] = { outp[0], nullptr }, * o1[2] = { nullptr, outp[1] };
         const bool split = im.hooks.engram_slot != nullptr;
         if (split) {
-            if (!im.hooks.engram_slot(tids, n, pos0, 0, outp[0])) { host_ok = false; im.err = "tp: Engram rows failed"; }
-        } else if (!im.hooks.engram(tids, n, pos0, outp)) { host_ok = false; im.err = "tp: Engram rows failed"; }
+            if (!im.hooks.engram_slot(tids, n, pos0, 0, outp[0])) eng_ok = false;
+        } else if (!im.hooks.engram(tids, n, pos0, outp)) eng_ok = false;
         std::atomic_thread_fence(std::memory_order_release);
         reinterpret_cast<volatile int32_t *>(im.hflag)[0] = want0 + Impl::S_ENG;
-        if (split && !im.hooks.engram_slot(tids, n, pos0, 1, outp[1])) { host_ok = false; im.err = "tp: Engram rows failed"; }
+        if (split && !im.hooks.engram_slot(tids, n, pos0, 1, outp[1])) eng_ok = false;
         std::atomic_thread_fence(std::memory_order_release);
         reinterpret_cast<volatile int32_t *>(im.hflag + 16 * (1 + im.NL))[0] = want0 + Impl::S_ENG + 1;
-        (void) o0; (void) o1;
-    }
+        t_eng = now_us() - te;
+    };
+    static const bool eng_async = env_on("STRATA_TP_ENG_ASYNC", true);
+    const bool eng_posted = im.hooks.engram && eng_async && im.hooks.cpu_part;
+    if (eng_posted) im.eng_post(engram_rows);
+    else if (im.hooks.engram) engram_rows();
     const double t3 = now_us();
     if (im.hooks.cpu_part) {
         for (int l = 0; l < im.NL && host_ok; ++l) {
@@ -1631,6 +1684,8 @@ bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * mai
             t_cpu += now_us() - tc;
         }
     }
+    if (eng_posted) im.eng_join();
+    if (!eng_ok) { host_ok = false; if (im.err.empty()) im.err = "tp: Engram rows failed"; }
     const double t4 = now_us();
     for (auto & e : ev) e.wait();
     for (auto & cp : im.cards) cp->q.wait();
@@ -1638,13 +1693,15 @@ bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * mai
     im.last_pass_us = t5 - t0;
     if (prof) {
         im.pf[0] += t1 - t0; im.pf[1] += t2 - t1; im.pf[2] += t3 - t2; im.pf[3] += t_mail; im.pf[4] += t_cpu; im.pf[5] += t5 - t4;
+        if (eng_posted) im.pf_eng += t_eng;
         if (++im.pf_n % 128 == 0) {
             const double k = 1.0 / 128.0;
             std::fprintf(stderr, "tp prof (passes %lld-%lld, %d recorded, %.2f CPU-pool layers a pass): inputs %.0f us, launch %.0f, engram %.0f, "
-                         "mailbox waits %.0f, cpu experts %.0f, card wait %.0f = %.0f us a pass%s\n", (long long) im.pf_n - 127, (long long) im.pf_n,
-                         im.pf_rec, im.pf_cpu_layers * k, im.pf[0] * k, im.pf[1] * k, im.pf[2] * k, im.pf[3] * k, im.pf[4] * k, im.pf[5] * k,
-                         (im.pf[0] + im.pf[1] + im.pf[2] + im.pf[3] + im.pf[4] + im.pf[5]) * k, im.free_str().c_str());
+                         "mailbox waits %.0f, cpu experts %.0f, card wait %.0f = %.0f us a pass (Engram helper %.0f)%s\n", (long long) im.pf_n - 127,
+                         (long long) im.pf_n, im.pf_rec, im.pf_cpu_layers * k, im.pf[0] * k, im.pf[1] * k, im.pf[2] * k, im.pf[3] * k, im.pf[4] * k,
+                         im.pf[5] * k, (im.pf[0] + im.pf[1] + im.pf[2] + im.pf[3] + im.pf[4] + im.pf[5]) * k, im.pf_eng * k, im.free_str().c_str());
             for (double & v : im.pf) v = 0;
+            im.pf_eng = 0;
             im.pf_cpu_layers = 0;
             im.pf_rec = 0;
         }
