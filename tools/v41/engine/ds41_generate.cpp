@@ -1,9 +1,9 @@
 // tools/v41/engine/ds41_generate.cpp - the Strata DeepSeek-V4.1-Flash engine end to end: Ds41Dense (attention,
-// Engram, router, shared expert; CUDA or CPU ggml backend) + Ds41MoeTier (routed experts with per-expert formats:
+// Engram, router, shared expert; GPU or CPU ggml backend) + Ds41MoeTier (routed experts with per-expert formats:
 // VRAM cache, pinned RAM arena, file tier, CPU pool, PCIe share) + sampling.  Token ids in, token ids out (text is
 // the server's job: tools/v41/serve/serve_ds41.py).
 //
-//   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
+//   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend gpu|cpu] [--experts gpu|cpu]
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
@@ -85,7 +85,7 @@ struct Args {
                                   // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
     std::vector<std::string> engram;
     int n_predict = 64;
-    std::string backend = "cuda", experts = "gpu";
+    std::string backend = "gpu", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
 #if defined(DS41_XE)
@@ -124,7 +124,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--ids") a.ids_csv = next();
         else if (k == "--ids-file") a.ids_file = next();
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
-        else if (k == "--backend") a.backend = next();
+        // --backend gpu = the build's GPU ggml backend (ggml-sycl on larry); "cuda" (upstream's name) and "sycl" mean the same
+        else if (k == "--backend") { a.backend = next(); if (a.backend == "cuda" || a.backend == "sycl") a.backend = "gpu"; }
         else if (k == "--experts") a.experts = next();
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
@@ -173,6 +174,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
+    // any other name used to pick the CPU backend without a word
+    if (a.backend != "gpu" && a.backend != "cpu") { std::fprintf(stderr, "--backend gpu|cpu, not %s\n", a.backend.c_str()); return false; }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
 }
 
@@ -299,8 +302,8 @@ int main(int argc, char ** argv) {
     std::mt19937_64 rng(a.seed);
 
     // ---- dense half
-    ggml_backend_t be = a.backend == "cuda" ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)
-                                            : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t be = a.backend == "gpu" ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)
+                                           : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!be) { std::fprintf(stderr, "ds41_generate: no %s backend\n", a.backend.c_str()); return 1; }
     if (ggml_backend_is_cpu(be)) ggml_backend_cpu_set_n_threads(be, a.threads > 0 ? a.threads : 8);
     int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
