@@ -114,7 +114,34 @@ must be ONE plane set; the promotion cache needs several jobs a card in flight (
 tier's own path: DSpark's 16-token seed passes); graph recording ~40 ms a width - pre-recorded at attach, cap floor
 1024 rows.
 
-Next: VRAM back to the experts and the prompt path - KV replicas sized to the context reached (grown on demand), the
-TP weights inside the tier's budget accounting so a service-sized flex fits; then the pass's own kernels (unitrace of
-tp_bench, eager; STRATA_TP_PUSH untested), the CPU pool's share in verify passes, then TP prefill (drops card 0's full
-dense copy: 6.5 GB) and the DSpark draft on the TP core.
+## Status 2026-10-23 ~02:00 (at the service's settings)
+
+The FLEX 3 failure above was the expert settings, not TP: FLEX 3 GiB with a 0.3 GiB margin left ~0.3 GiB free on the
+expert cards, and a 252-token prompt (below the prefetch path, which resizes the flex region) ran out of VRAM in
+run_big.  At the service's own settings (ctx 262144, FLEX 1 / margin 1.5, RESERVE 3.5) eager TP was DSpark -2 %,
+plain +15 %: its KV replicas displaced ~960 VRAM experts (CPU-pool uses 2x), and the four normal-priority promotion
+helpers (host repacks, 10-20 ms an expert) slowed the draft's submission (enqueue 3.95 vs 2.30 ms) and the verify
+pass (one helper: 34.1 -> 30.7 ms).  Fixed:
+
+* STRATA_TP_LAZY_KV: ranks >= 1 keep the KV replicas in Level Zero virtual memory (one address for the graphs),
+  pages mapped as a pass's cap bucket or a sync reaches them, the new rows copied from card 0.  The VRAM not mapped
+  yet is lent to the tier's flex region (placement as with eager replicas); tier.tp_make_room takes back only the
+  shortfall when rows map (keeping 1.5 GiB free there emptied the flex after a long prompt: no promotions, 95K
+  DSpark 43.0 vs today 48.5).
+* STRATA_TP_PC_DEVREPACK: promotions copy the file layout (pinned arena blobs straight from the arena) and the card
+  repacks (slot -> temp -> slot); 2 helpers.  Checked: 0 bad slots.
+* The head split (the draft's LM head, small passes' Engram projections) reads TP ranks' row slices (same rows,
+  same planar layout) instead of copies - it now fits after long prompts.
+
+* Both paths: the expert cards' last 1 GiB slab is filled at placement (STRATA_XE_FILL_SLAB) - its tail was
+  allocated anyway (today's path +0.74 GiB of experts a card, CPU-pool uses -10 %).
+
+Measured (one-shot, service settings, clocks pinned, both paths with the slab fill): essay DSpark today 60.5 / 56.9
+tok/s, TP 61.2 / 64.7 (+7 %; verify 33.5 -> 28.8 ms); 20K prefix 92.0 -> 110.0; 95K prefix 50.4 -> 50.3 (verify
+40.5 -> 38.7 ms, fewer tokens a pass); plain 47.1 -> 61.6 (+31 %); PPL p2k 2.0085, KL vs eager TP 0.0033.  Free
+VRAM is logged per card (load, warm-up, graphs, each profile window).
+
+Next: the draft's remaining +0.55 ms under TP; card 0's 3/4 of the sharded dense weights (~3.8 GB, only the prompt
+path reads them: page them in per layer from the other cards); the CPU pool's share of verify passes (GPU help over
+PCIe for pinned arena experts); the pass's own kernels (unitrace of tp_bench); then TP prefill and the draft on the
+TP core.

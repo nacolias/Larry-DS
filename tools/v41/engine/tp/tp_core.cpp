@@ -81,6 +81,63 @@ struct Arena {
     }
 };
 
+// ---- a device buffer whose pages are committed on demand (Level Zero virtual memory): ranks >= 1 hold their KV
+// replicas (compressed rows, indexer keys) only for the rows a pass can touch, not ctx_max rows from the start
+// (STRATA_TP_LAZY_KV, default 1) - the rest stays with the tier (its flex region) until the context needs it.  One
+// address for the kernels and the recorded graphs; bytes past `done` (but the tail, where the spare row lives) are
+// never touched: passes and syncs map their rows first.
+struct LazyBuf {
+    void * va = nullptr;
+    size_t cap = 0, page = 0, done = 0, tail = 0;   // reserved bytes, page size, bytes mapped from va, the tail's offset
+    std::vector<ze_physical_mem_handle_t> phys;
+    std::vector<std::pair<void *, size_t>> maps;
+    bool map(ze_context_handle_t zc, ze_device_handle_t zd, size_t off, size_t bytes, std::string & err) {
+        ze_physical_mem_desc_t d = { ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC, nullptr, 0, bytes };
+        ze_physical_mem_handle_t h = nullptr;
+        if (zePhysicalMemCreate(zc, zd, &d, &h) != ZE_RESULT_SUCCESS || !h) { err = "zePhysicalMemCreate failed"; return false; }
+        void * p = (uint8_t *) va + off;
+        if (zeVirtualMemMap(zc, p, bytes, h, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE) != ZE_RESULT_SUCCESS) {
+            zePhysicalMemDestroy(zc, h);
+            err = "zeVirtualMemMap failed";
+            return false;
+        }
+        phys.push_back(h);
+        maps.emplace_back(p, bytes);
+        return true;
+    }
+    // reserve `bytes`; map the pages from the one holding byte `spare` (the spare row) to the end, then `first` bytes
+    bool make(ze_context_handle_t zc, ze_device_handle_t zd, size_t bytes, size_t spare, size_t first, std::string & err) {
+        size_t pg = 0;
+        if (zeVirtualMemQueryPageSize(zc, zd, bytes, &pg) != ZE_RESULT_SUCCESS || !pg) { err = "zeVirtualMemQueryPageSize failed"; return false; }
+        page = std::max<size_t>(pg, (size_t) 2 << 20);
+        cap = (bytes + page - 1) / page * page;
+        if (zeVirtualMemReserve(zc, nullptr, cap, &va) != ZE_RESULT_SUCCESS || !va) { va = nullptr; err = "zeVirtualMemReserve failed"; return false; }
+        tail = std::min(cap - page, spare / page * page);
+        if (!map(zc, zd, tail, cap - tail, err)) return false;
+        return grow(zc, zd, first, err);
+    }
+    size_t want_of(size_t bytes) const { return std::min(tail, (bytes + page - 1) / page * page); }
+    size_t grow_bytes(size_t bytes) const { const size_t w = want_of(bytes); return w > done ? w - done : 0; }
+    // map up to `bytes` (in pages; the tail is mapped already)
+    bool grow(ze_context_handle_t zc, ze_device_handle_t zd, size_t bytes, std::string & err) {
+        const size_t w = want_of(bytes);
+        if (w <= done) return true;
+        if (!map(zc, zd, done, w - done, err)) return false;
+        done = w;
+        return true;
+    }
+    size_t mapped() const { return va ? done + (cap - tail) : 0; }
+    void release(ze_context_handle_t zc) {
+        for (auto & m : maps) zeVirtualMemUnmap(zc, m.first, m.second);
+        for (auto h : phys) zePhysicalMemDestroy(zc, h);
+        if (va) zeVirtualMemFree(zc, va, cap);
+        maps.clear();
+        phys.clear();
+        va = nullptr;
+        done = 0;
+    }
+};
+
 // ---- a weight shard on a card
 struct Mat {
     const void * p = nullptr;
@@ -118,6 +175,7 @@ struct LS {   // one layer's persistent state on a card
     float * st_kv = nullptr, * st_sc = nullptr;  // [2][DH] (ratio-2 kv sources)
     int32_t * sel = nullptr;                     // [NMAX][ITOP] (index sources)
     float * selm = nullptr;
+    LazyBuf vcomp, vidxk;                        // ranks >= 1, STRATA_TP_LAZY_KV: comp / idxk's pages
 };
 
 // the per-pass input block (int32 / float words), the same layout in pinned memory and on every card
@@ -138,6 +196,7 @@ struct InLayout {
 
 struct Card {
     int rank = 0;
+    int gpu = 0;                 // its Level Zero GPU index
     sycl::device dev;
     sycl::queue q;
     Arena ar;
@@ -229,11 +288,19 @@ struct Ds41Tp::Impl {
     std::unique_ptr<sycl::kernel_bundle<sycl::bundle_state::executable>> kb;   // keeps the cards' modules built
     int dm_layers[3] = { 36, 37, 38 };
 
+    // STRATA_TP_LAZY_KV (default 1): ranks >= 1 map their KV replicas' rows as the context reaches them; rows_done[r]
+    // = rows of every ratio-r source mapped (and mirroring card 0's) on every such card
+    bool lazy = false;
+    int64_t rows_done[3] = { 0, 0, 0 };
+    std::function<bool(int, size_t)> make_room;   // the tier: room for that many more bytes on that GPU
+
     ~Impl() {
         for (auto & c : cards) {
             try { c->q.wait(); } catch (...) {}
             c->graphs.clear();
             if (c->peer_blk) sycl::free(c->peer_blk, c->q);
+            ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+            for (auto & s : c->ls) { s.vcomp.release(zc); s.vidxk.release(zc); }
             c->ar.release();
         }
         if (hin) sycl::free(hin, ctx);
@@ -663,8 +730,23 @@ struct Ds41Tp::Impl {
             } else {
                 s.raw = dalloc<float>(c, (size_t) (RAW * DH));
                 if (L.kv_src) {
-                    s.comp = dalloc<uint16_t>(c, (size_t) ((cmax[L.ratio] + 1) * DH));
-                    s.idxk = dalloc<uint16_t>(c, (size_t) ((cmax[L.ratio] + 1) * ID));
+                    const int64_t rows = cmax[L.ratio] + 1;
+                    if (lazy && c.rank > 0) {   // pages for the first rows_done rows and the spare row (row cmax)
+                        ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+                        ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(c.dev);
+                        const int64_t r0 = rows_done[L.ratio];
+                        std::string e;
+                        if (!s.vcomp.make(zc, zd, (size_t) (rows * DH) * 2, (size_t) ((rows - 1) * DH) * 2, (size_t) (r0 * DH) * 2, e) ||
+                            !s.vidxk.make(zc, zd, (size_t) (rows * ID) * 2, (size_t) ((rows - 1) * ID) * 2, (size_t) (r0 * ID) * 2, e)) {
+                            err = "tp: KV replica of layer " + std::to_string(l) + ": " + e;
+                            return false;
+                        }
+                        s.comp = (uint16_t *) s.vcomp.va;
+                        s.idxk = (uint16_t *) s.vidxk.va;
+                    } else {
+                        s.comp = dalloc<uint16_t>(c, (size_t) (rows * DH));
+                        s.idxk = dalloc<uint16_t>(c, (size_t) (rows * ID));
+                    }
                     if (L.ratio == 2) { s.st_kv = dalloc<float>(c, (size_t) (2 * DH)); s.st_sc = dalloc<float>(c, (size_t) (2 * DH)); }
                 }
             }
@@ -1104,6 +1186,85 @@ struct Ds41Tp::Impl {
         }
         return true;
     }
+    // STRATA_TP_LAZY_KV: ranks >= 1 map the pages of rows [0, want[r]) of every ratio-r source (up to cmax[r]) before
+    // anything touches them, the tier making room first (its flex region gives VRAM back); the newly mapped rows are
+    // copied from card 0, so the mapped rows of a replica always mirror card 0's.  Between passes only.
+    bool ensure_rows(const int64_t want_in[3]) {
+        if (!lazy || N < 2) return true;
+        int64_t want[3] = { 0, 0, 0 };
+        bool any = false;
+        for (int r = 1; r <= 2; ++r) {
+            want[r] = std::min<int64_t>(cmax[r], std::max<int64_t>(want_in[r], rows_done[r]));
+            any = any || want[r] > rows_done[r];
+        }
+        if (!any) return true;
+        ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+        const Card & c0 = *cards[0];
+        size_t total = 0;
+        for (int k = 1; k < N; ++k) {
+            Card & c = *cards[(size_t) k];
+            ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(c.dev);
+            size_t extra = 0;
+            for (int l = 0; l < NL; ++l) {
+                const LInfo & L = li[(size_t) l];
+                if (!L.kv_src) continue;
+                const LS & s = c.ls[(size_t) l];
+                extra += s.vcomp.grow_bytes((size_t) (want[L.ratio] * DH) * 2) + s.vidxk.grow_bytes((size_t) (want[L.ratio] * ID) * 2);
+            }
+            if (extra && make_room && !make_room(c.gpu, extra)) { err = "tp: no VRAM on GPU " + std::to_string(c.gpu) + " for the KV rows"; return false; }
+            total += extra;
+            for (int l = 0; l < NL; ++l) {
+                const LInfo & L = li[(size_t) l];
+                if (!L.kv_src) continue;
+                LS & s = c.ls[(size_t) l];
+                const int64_t r = L.ratio, r0 = rows_done[r], r1 = want[r];
+                if (r1 <= r0) continue;
+                std::string e;
+                if (!s.vcomp.grow(zc, zd, (size_t) (r1 * DH) * 2, e) || !s.vidxk.grow(zc, zd, (size_t) (r1 * ID) * 2, e)) {
+                    err = "tp: KV rows of layer " + std::to_string(l) + ": " + e;
+                    return false;
+                }
+                const LS & a = c0.ls[(size_t) l];
+                c.q.memcpy(s.comp + r0 * DH, a.comp + r0 * DH, (size_t) ((r1 - r0) * DH) * 2);
+                c.q.memcpy(s.idxk + r0 * ID, a.idxk + r0 * ID, (size_t) ((r1 - r0) * ID) * 2);
+            }
+        }
+        try {
+            for (int k = 1; k < N; ++k) cards[(size_t) k]->q.wait_and_throw();
+        } catch (const std::exception & e) {
+            err = std::string("tp: KV rows copy: ") + e.what();
+            return false;
+        }
+        std::fprintf(stderr, "tp: KV replicas now %lld / %lld rows (ratio 1 / 2), +%.0f MiB on the other cards\n",
+                     (long long) want[1], (long long) want[2], total / 1048576.0);
+        for (int r = 1; r <= 2; ++r) rows_done[r] = want[r];
+        return true;
+    }
+    // the VRAM a rank's lazy replicas have not mapped yet (what the tier's flex region can hold meanwhile)
+    size_t deferred(const Card & c) const {
+        size_t b = 0;
+        for (const LS & s : c.ls) {
+            if (s.vcomp.va) b += s.vcomp.cap - s.vcomp.mapped();
+            if (s.vidxk.va) b += s.vidxk.cap - s.vidxk.mapped();
+        }
+        return b;
+    }
+    // the cards' free VRAM (GiB; what the driver reports: the xe driver spills an over-commit into host RAM)
+    std::string free_str() const {
+        std::string r;
+        char b[48];
+        for (const auto & c : cards) {
+            if (!c->dev.has(sycl::aspect::ext_intel_free_memory)) return "";
+            std::snprintf(b, sizeof b, " r%d %.2f", c->rank, c->dev.get_info<sycl::ext::intel::info::device::free_memory>() / 1073741824.0);
+            r += b;
+        }
+        return " | free GiB" + r;
+    }
+    size_t lazy_mapped(const Card & c) const {
+        size_t b = 0;
+        for (const LS & s : c.ls) b += s.vcomp.mapped() + s.vidxk.mapped();
+        return b;
+    }
     void caps(int pos0, int n, int64_t out[3]) const {
         static const int64_t cap_min = std::getenv("STRATA_TP_CAP_MIN") ? std::atoll(std::getenv("STRATA_TP_CAP_MIN")) : 1024;
         out[0] = 0;
@@ -1119,7 +1280,34 @@ Ds41Tp::~Ds41Tp() = default;
 int64_t Ds41Tp::vocab() const { return p_->V; }
 int64_t Ds41Tp::n_embd() const { return p_->D; }
 int Ds41Tp::n_layer() const { return p_->NL; }
+int Ds41Tp::n_cards() const { return p_->N; }
 const std::string & Ds41Tp::last_error() const { return p_->err; }
+const void * Ds41Tp::shard(const std::string & name, int rank, int64_t & r0, int64_t & r1, int & gpu) const {
+    const Impl & im = *p_;
+    if (rank < 0 || rank >= im.N) return nullptr;
+    const Card & c = *im.cards[(size_t) rank];
+    gpu = c.gpu;
+    if (name == "output.weight") {
+        r0 = c.vrow.lo * 16; r1 = c.vrow.hi * 16;
+        return c.head.G == 1 && !c.head.f16 && !c.head.nbt ? c.head.p : nullptr;
+    }
+    int l = -1;
+    if (std::sscanf(name.c_str(), "blk.%d.engram_kv.weight", &l) == 1 && l >= 0 && l < im.NL && im.li[(size_t) l].eslot >= 0) {
+        const Mat & m = c.lw[(size_t) l].ekv;
+        r0 = c.erow.lo * QK; r1 = c.erow.hi * QK;
+        return m.G == 1 && !m.f16 && !m.nbt ? m.p : nullptr;
+    }
+    return nullptr;
+}
+
+std::vector<std::pair<int, size_t>> Ds41Tp::deferred_vram() const {
+    std::vector<std::pair<int, size_t>> v;
+    for (const auto & c : p_->cards) if (const size_t b = p_->deferred(*c)) v.emplace_back(c->gpu, b);
+    return v;
+}
+
+void Ds41Tp::set_vram_hook(std::function<bool(int, size_t)> make_room) { p_->make_room = std::move(make_room); }
+
 std::vector<void *> Ds41Tp::queues() const {
     std::vector<void *> v;
     for (auto & c : p_->cards) v.push_back(&c->q);
@@ -1147,6 +1335,8 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
     im.NFF = G.n_ff; im.IH = G.idx_heads; im.ID = G.idx_dim; im.ITOP = G.idx_topk; im.CB = G.cand_blocks; im.CBS = G.cand_bsize;
     im.EC = (G.engram_ngram - 1) * G.engram_heads; im.ED = G.engram_dim; im.V = G.vocab; im.ER = (tpk::HC + 1) * G.n_embd;
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
+    im.lazy = env_on("STRATA_TP_LAZY_KV", true) && cfg.n_cards > 1;
+    for (int r = 1; r <= 2; ++r) im.rows_done[r] = im.lazy ? std::min<int64_t>(im.cmax[r], 1024) : im.cmax[r];
     if (im.D != 5120 || G.hc != tpk::HC || im.DH != tpdec::DD || im.ND != 64 || im.IH != tpdec::LIH || im.ID != tpdec::LID ||
         im.ITOP > 512 || im.CBS != 8 || im.NFF % QK || im.ER % QK || im.V % 16 || (im.EC * im.ED) % QK || cfg.ctx_max % 256 ||
         im.N < 1 || im.N > 8 || im.NMAX < 1 || im.NMAX > 7) {
@@ -1195,6 +1385,7 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
         if (devs[(size_t) k] < 0 || devs[(size_t) k] >= (int) gpus.size()) { err = "tp: no GPU " + std::to_string(devs[(size_t) k]); return false; }
         auto c = std::make_unique<Card>();
         c->rank = k;
+        c->gpu = devs[(size_t) k];
         c->dev = gpus[(size_t) devs[(size_t) k]];
         c->q = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
         c->ar.q = &c->q;
@@ -1259,10 +1450,11 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
     const double t0 = now_us();
     for (auto & c : im.cards) {
         if (!im.load_weights(*c) || !im.alloc_buffers(*c)) { err = im.err; return false; }
-        std::fprintf(stderr, "tp: rank %d: %lld heads, %lld o-groups, n_ff %lld, Engram rows %lld, vocab rows %lld - %.2f GiB%s\n",
+        std::fprintf(stderr, "tp: rank %d: %lld heads, %lld o-groups, n_ff %lld, Engram rows %lld, vocab rows %lld - %.2f GiB%s%s\n",
                      c->rank, (long long) c->nhk, (long long) c->grp.n(), (long long) c->fk, (long long) c->rk, (long long) c->vk,
-                     c->ar.total / 1073741824.0, c->rank == 0 && im.shared_bytes ?
-                     (" (+ " + std::to_string((int) (im.shared_bytes >> 20)) + " MiB of the engine's weights shared)").c_str() : "");
+                     (c->ar.total + im.lazy_mapped(*c)) / 1073741824.0, c->rank == 0 && im.shared_bytes ?
+                     (" (+ " + std::to_string((int) (im.shared_bytes >> 20)) + " MiB of the engine's weights shared)").c_str() : "",
+                     im.deferred(*c) ? (" (+ " + std::to_string((int) (im.deferred(*c) >> 20)) + " MiB of KV rows mapped as the context grows)").c_str() : "");
     }
     im.q6_drop();
     if (!im.load_bench_experts()) { err = im.err; return false; }
@@ -1272,7 +1464,7 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
         im.refresh_rtab();
         for (auto & c : im.cards) c->q.wait();
     }
-    std::fprintf(stderr, "tp: %d cards loaded in %.1f s\n", im.N, (now_us() - t0) / 1e6);
+    std::fprintf(stderr, "tp: %d cards loaded in %.1f s%s\n", im.N, (now_us() - t0) / 1e6, im.free_str().c_str());
     // the first card-to-card copy of every pair now (timed: the first one sets up the peer path)
     for (int k = 0; k < im.N; ++k)
         for (int j = 0; j < im.N; ++j) {
@@ -1289,13 +1481,14 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
         std::vector<int> t(1, 0);
         if (!pass(t.data(), 1, 0, nullptr, false)) std::fprintf(stderr, "tp: warm-up pass: %s (ignored)\n", im.err.c_str());
         im.err.clear();
-        std::fprintf(stderr, "tp: warm-up pass %.2f s\n", (now_us() - tw) / 1e6);
+        std::fprintf(stderr, "tp: warm-up pass %.2f s%s\n", (now_us() - tw) / 1e6, im.free_str().c_str());
     }
     return true;
 }
 
 void Ds41Tp::fill_state(int64_t pos, uint32_t seed) {
     Impl & im = *p_;
+    { const int64_t all[3] = { 0, im.cmax[1], im.cmax[2] }; im.ensure_rows(all); }   // lazy replicas: every row mapped
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> U(-1.0f, 1.0f);
     // window rows: FP8-ish values; compressed rows / indexer keys: bf16 of small values; compressor state: floats
@@ -1334,6 +1527,7 @@ bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * mai
     Impl::PassK P;
     P.n = n;
     im.caps(pos0, n, P.cap);
+    if (!im.ensure_rows(P.cap)) return false;   // lazy replicas: the rows the indexer scans (a cap bucket)
     const double t0 = now_us();
     static const bool prof = env_on("STRATA_TP_PROF", false);
     im.make_inputs(tids, n, pos0);
@@ -1415,9 +1609,9 @@ bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * mai
         if (++im.pf_n % 128 == 0) {
             const double k = 1.0 / 128.0;
             std::fprintf(stderr, "tp prof (passes %lld-%lld, %d recorded, %.2f CPU-pool layers a pass): inputs %.0f us, launch %.0f, engram %.0f, "
-                         "mailbox waits %.0f, cpu experts %.0f, card wait %.0f = %.0f us a pass\n", (long long) im.pf_n - 127, (long long) im.pf_n,
+                         "mailbox waits %.0f, cpu experts %.0f, card wait %.0f = %.0f us a pass%s\n", (long long) im.pf_n - 127, (long long) im.pf_n,
                          im.pf_rec, im.pf_cpu_layers * k, im.pf[0] * k, im.pf[1] * k, im.pf[2] * k, im.pf[3] * k, im.pf[4] * k, im.pf[5] * k,
-                         (im.pf[0] + im.pf[1] + im.pf[2] + im.pf[3] + im.pf[4] + im.pf[5]) * k);
+                         (im.pf[0] + im.pf[1] + im.pf[2] + im.pf[3] + im.pf[4] + im.pf[5]) * k, im.free_str().c_str());
             for (double & v : im.pf) v = 0;
             im.pf_cpu_layers = 0;
             im.pf_rec = 0;
@@ -1477,7 +1671,7 @@ bool Ds41Tp::attach_experts(const void * rtab, const volatile uint64_t * rtab_ve
                 ++nk;
             }
         im.pf_rec = 0;
-        std::fprintf(stderr, "tp: %d pass graphs recorded a card in %.2f s\n", nk, (now_us() - t0) / 1e6);
+        std::fprintf(stderr, "tp: %d pass graphs recorded a card in %.2f s%s\n", nk, (now_us() - t0) / 1e6, im.free_str().c_str());
     }
     return true;
 }
@@ -1485,6 +1679,12 @@ bool Ds41Tp::attach_experts(const void * rtab, const volatile uint64_t * rtab_ve
 bool Ds41Tp::sync_state(int64_t lo, int64_t hi, bool all) {
     Impl & im = *p_;
     if (im.N < 2) return true;
+    const bool every = all || hi > im.cmax[1] || lo < 0;
+    if (im.lazy && !every) {   // the replicas' pages for the rows up to hi first (as a pass there would: a cap bucket)
+        int64_t want[3] = { 0, 0, 0 };
+        for (int r = 1; r <= 2; ++r) want[r] = std::min<int64_t>(im.cmax[r], next_pow2(std::max<int64_t>(1024, (hi + r - 1) / r + 1)));
+        if (!im.ensure_rows(want)) return false;
+    }
     const Card & c0 = *im.cards[0];
     for (int k = 1; k < im.N; ++k) {
         Card & c = *im.cards[(size_t) k];   // card k pulls (a P2P read by its copy engine from card 0's buffers)
@@ -1495,8 +1695,8 @@ bool Ds41Tp::sync_state(int64_t lo, int64_t hi, bool all) {
             c.q.memcpy(b.raw, a.raw, (size_t) (im.RAW * im.DH) * 4);
             if (!L.kv_src) continue;
             const int64_t r = L.ratio, rows = im.cmax[r] + 1;
-            const bool every = all || hi > im.cmax[1] || lo < 0;
-            int64_t r0 = every ? 0 : std::max<int64_t>(0, lo / r), r1 = every ? rows - 1 : std::min<int64_t>(rows - 1, (hi + r - 1) / r + 1);
+            const int64_t top = im.lazy ? im.rows_done[r] : rows - 1;   // rows past the mapped ones: copied when mapped
+            int64_t r0 = every ? 0 : std::max<int64_t>(0, lo / r), r1 = every ? top : std::min<int64_t>(top, (hi + r - 1) / r + 1);
             if (r1 > r0) {
                 c.q.memcpy(b.comp + r0 * im.DH, a.comp + r0 * im.DH, (size_t) ((r1 - r0) * im.DH) * 2);
                 c.q.memcpy(b.idxk + r0 * im.ID, a.idxk + r0 * im.ID, (size_t) ((r1 - r0) * im.ID) * 2);

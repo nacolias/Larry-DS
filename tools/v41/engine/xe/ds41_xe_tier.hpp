@@ -147,6 +147,15 @@ public:
     void tp_set_promote_queues(const std::vector<void*>& qs);
     /// larry, engine1: the table keys (layer * n_expert + expert) changed since the last call; true = take every key
     bool tp_take_dirty(std::vector<uint32_t>& keys);
+    /// larry, engine1 (STRATA_TP_LAZY_KV): `bytes` of the TP core's VRAM on GPU `gpu` are not mapped yet - the card's
+    /// flex region (promotion slots) holds them meanwhile.  Before placement.
+    void tp_defer_vram(int gpu, size_t bytes);
+    /// larry, engine1: room for `bytes` more on GPU `gpu` (the TP core maps KV rows): the flex region shrinks when the
+    /// card's free VRAM would drop below STRATA_XE_FLEX_MARGIN_GIB.  Between passes.  False: no room.
+    bool tp_make_room(int gpu, size_t bytes);
+    /// larry, engine1: rows [r0, r1) of weight `w` (the dense card's reordered tensor) are on GPU `gpu` already as one
+    /// planar slice at `p` (the TP core's shard): the LM head split (mv_hook) reads it instead of a copy.  Before use.
+    void tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p);
     bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
 

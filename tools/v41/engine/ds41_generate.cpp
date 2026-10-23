@@ -501,6 +501,28 @@ int main(int argc, char ** argv) {
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
 #endif
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
+#if defined(DS41_TP) && defined(DS41_XE)
+    // larry, engine1: the TP core's KV replicas map their rows as the context grows (STRATA_TP_LAZY_KV) - the expert
+    // cards' flex regions hold that VRAM until then, and give it back when the core asks
+    if (tp) {
+        for (const auto & d : tp->deferred_vram()) tier.tp_defer_vram(d.first, d.second);
+        tp->set_vram_hook([&tier](int gpu, size_t bytes) { return tier.tp_make_room(gpu, bytes); });
+        // the head split (the DSpark draft's LM head, small dense passes' Engram projections) reads the TP core's row
+        // slices of those weights instead of copying the same rows onto the expert cards again
+        std::vector<std::string> hn = { "output.weight" };
+        for (int l = 0; l < n_layer; ++l)
+            if (G.engram_slot(l) >= 0) hn.push_back("blk." + std::to_string(l) + ".engram_kv.weight");
+        for (const auto & nm : hn) {
+            const ggml_tensor * t = dense.weight(nm);
+            if (!t || !t->data || t->type != GGML_TYPE_Q6_K || !planar_w.count(t->data)) continue;
+            for (int k = 1; k < tp->n_cards(); ++k) {
+                int64_t r0 = 0, r1 = 0;
+                int gpu = -1;
+                if (const void * p = tp->shard(nm, k, r0, r1, gpu)) tier.tp_head_slice(t->data, gpu, r0, r1, p);
+            }
+        }
+    }
+#endif
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
     // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)

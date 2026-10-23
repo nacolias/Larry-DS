@@ -112,6 +112,7 @@ struct RtHdr { int32_t ncard, ncpu, pad[2]; RtCpu cpu[kMaxDecodeJobs]; };
 /// One card.
 struct XeCard {
     int idx = 0;
+    int gpu = -1;                   ///< its Level Zero GPU index (STRATA_XE_DEVICES' numbering)
     sycl::device dev;
     sycl::queue q;
     std::string name;
@@ -150,6 +151,7 @@ struct XeCard {
     std::vector<int64_t> pc_key;    ///< slot -> expert key; -1 free, -2 being filled
     std::vector<uint64_t> pc_tick;  ///< slot -> the decode call that last used it
     int pc_busy = 0;                ///< promotions of this card in flight (at most the tier's pc_par)
+    uint8_t* pc_tmp = nullptr;      ///< larry, engine1 (pc_devrepack): one slot's bytes the card repacks a promoted blob into
     /// decode / verify: the card's command sequence of a call (stage copy, quantise, gate/up, down, copy to the dense
     /// card's slot) recorded once per shape (jobs, tokens, kernel variant) and replayed - one submission, not five
     std::map<uint32_t, std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> dgraphs;
@@ -274,10 +276,14 @@ struct Ds41XeImpl {
         int64_t r[9] = {};              ///< rows [r[i], r[i+1]) on part i (part 0: the dense card)
         std::vector<XeCard*> c;         ///< part i >= 1
         std::vector<uint8_t*> w;
+        std::vector<char> own;          ///< w[i] is the split's own copy (else the TP core's shard)
         std::vector<int8_t*> xq;
         std::vector<float*> xd, y;
     };
     std::map<const void*, HeadSplit> heads;
+    /// larry, engine1: rows the TP core holds already as planar slices, by weight: (GPU, r0, r1, address)
+    struct GivenSlice { int gpu; int64_t r0, r1; const void* p; };
+    std::map<const void*, std::vector<GivenSlice>> head_given;
     // STRATA_TP_OPROJ: per layer (keyed by wo_a), the attention output's parts - part 0 the dense card, part i >= 1 an
     // expert card: groups [g0[i], g0[i + 1]) of wo_a (its slices as they are) and wo_b's matching columns (gathered)
     struct OSplit {
@@ -345,6 +351,12 @@ struct Ds41XeImpl {
     int pc_nb = kPcBounce;             ///< bounces (larry, engine1: more with STRATA_TP_PROMOTE_PAR)
     int pc_par = 1;                    ///< promotions in flight a card (1; engine1's between-pass driving: more)
     std::vector<sycl::queue*> pc_q;    ///< larry, engine1: the queue a card's promotion copies go to (null: the card's own)
+    std::map<int, size_t> tp_defer;    ///< larry, engine1: by GPU, the TP core's VRAM not mapped yet (the flex holds it)
+    /// larry, engine1 (STRATA_TP, STRATA_TP_PC_DEVREPACK default 1): a promotion copies the expert's FILE layout into its
+    /// slot (pinned arena blobs straight from the arena, pageable ones through a bounce by a plain memcpy) and the card
+    /// repacks it there (slot -> pc_tmp -> slot) - the host's repack (10-20 ms an expert on a busy host) took the cores
+    /// the DSpark draft's submission and the CPU pool need
+    bool pc_devrepack = false;
     std::vector<int> pc_bfree;
     std::list<PcJob> pc_jobs;          ///< in flight (stable addresses: the helper holds pointers)
     std::thread pc_thr;
@@ -601,6 +613,7 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
         if (i < 0 || i >= (int) devs.size()) { err = "xe tier: STRATA_XE_DEVICES names device " + std::to_string(i); return false; }
         auto c = std::make_unique<XeCard>();
         c->idx = (int) im.cards.size();
+        c->gpu = i;
         c->dev = devs[(size_t) i];
         c->q = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
         c->pq = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
@@ -730,6 +743,9 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         if (c.dense) { c.budget = 0; continue; }
         int64_t fr = c.free_vram();
         if (fr < 0) fr = (int64_t) c.dev.get_info<sycl::info::device::global_mem_size>();
+        // larry, engine1: VRAM the TP core will map later (its KV replicas) is lent to the flex region, not to experts
+        const auto td = im.tp_defer.find(c.gpu);
+        if (td != im.tp_defer.end()) fr -= (int64_t) td->second;
         double gib = fr / kGiB - reserve;
         if (cap_gib > 0) gib = std::min(gib, cap_gib);
         c.budget = (int64_t) (std::max(0.0, gib) * kGiB);
@@ -741,6 +757,12 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     std::vector<int64_t> left((size_t) im.cards.size(), 0);
     for (auto& cp : im.cards) left[(size_t) cp->idx] = cp->budget;
     std::vector<std::pair<int32_t, int32_t>> rest;
+    // larry: past its budget a card still takes the experts its last slab holds (STRATA_XE_FILL_SLAB, default 1) - the
+    // 1 GiB slab is allocated anyway, and its tail sat idle (0.3-0.9 GiB a card); sl[] replays alloc_expert's bump
+    // (a new slab when used + bytes > kSlab, then used += the 256-aligned size) in the order the experts are uploaded
+    static const bool fill = env_i("STRATA_XE_FILL_SLAB", 1) != 0;
+    std::vector<int64_t> sl((size_t) im.cards.size(), -1);   // bytes used in the card's open slab (-1: none yet)
+    int64_t filled = 0;
     for (const auto& le : order) {
         const int64_t b = (int64_t) im.bbytes(le.first, le.second);
         int best = -1;
@@ -751,10 +773,22 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
             const double s = (double) left[(size_t) c.idx] / (double) c.budget;
             if (best < 0 || s > share) { best = c.idx; share = s; }
         }
+        bool extra = false;
+        if (best < 0 && fill)
+            for (auto& cp : im.cards) {
+                const XeCard& c = *cp;
+                const int64_t u = sl[(size_t) c.idx];
+                if (c.budget > 0 && u >= 0 && u + b <= (int64_t) kSlab && (best < 0 || u < sl[(size_t) best])) { best = c.idx; extra = true; }
+            }
         if (best < 0) { rest.push_back(le); continue; }
         left[(size_t) best] -= b;
+        int64_t& u = sl[(size_t) best];
+        if (u < 0 || u + b > (int64_t) kSlab) u = 0;
+        u += (b + 255) & ~(int64_t) 255;
+        if (extra) filled += b;
         on[(size_t) best].push_back(le);
     }
+    if (filled) std::fprintf(stderr, "xe tier: %.2f GiB more experts in the cards' last slabs (allocated anyway)\n", filled / kGiB);
     // ---- the arena: the rest, in ranked order, up to the RAM budget, in pinned chunks (no blob straddles one)
     const char* aenv = std::getenv("STRATA_XE_ARENA_GIB");
     const double arena_cap_gib = aenv && *aenv ? std::atof(aenv) : 1e9;   // default: every expert not on a card
@@ -902,7 +936,10 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
             XeCard& c = *cp;
             if (c.dense || c.flex) continue;
             const int64_t fr = c.free_vram();
-            const int64_t want = std::min<int64_t>((int64_t) (fg * kGiB), fr > 0 ? fr - (int64_t) (fm * kGiB) : 0) & ~(int64_t) 255;
+            // larry, engine1: + what the TP core's KV replicas have not mapped yet (given back as the context grows)
+            const auto td = im.tp_defer.find(c.gpu);
+            const int64_t extra = td == im.tp_defer.end() ? 0 : (int64_t) td->second;
+            const int64_t want = std::min<int64_t>((int64_t) (fg * kGiB) + extra, fr > 0 ? fr - (int64_t) (fm * kGiB) : 0) & ~(int64_t) 255;
             if (want < 8 * im.blob_max) continue;
             c.flex = local_alloc(c.q, (size_t) want);
             c.flex_cap = c.flex ? (size_t) want : 0;
@@ -1056,25 +1093,34 @@ Ds41XeImpl::HeadSplit head_init(Ds41XeImpl& im, const void* w, int64_t K, int64_
     for (int i = 0; i <= np; ++i) hs.r[i] = N * i / np;
     const int64_t bpr = K / 256, nb = N * bpr;
     const size_t po[4] = {0, 128, 192, 208}, pb[4] = {128, 64, 16, 2};   // R8 planes: offset / bytes per block
+    const auto gv = im.head_given.find(w);
     for (int i = 1; i < np; ++i) {
         XeCard& c = *parts[(size_t) i - 1];
         const int64_t rows = hs.r[i + 1] - hs.r[i], b0 = hs.r[i] * bpr, bn = rows * bpr;
-        const size_t need = (size_t) bn * 210 + (size_t) 8 * K * 2 + (size_t) 8 * rows * 4;
-        if (c.free_vram() > 0 && c.free_vram() < (int64_t) (need + ((size_t) 768 << 20))) {
+        const uint8_t* given = nullptr;   // larry, engine1: the TP core's shard of exactly these rows on this card
+        if (gv != im.head_given.end())
+            for (const auto& g : gv->second)
+                if (g.gpu == c.gpu && g.r0 == hs.r[i] && g.r1 == hs.r[i + 1]) given = (const uint8_t*) g.p;
+        const size_t need = (given ? 0 : (size_t) bn * 210) + (size_t) 8 * K * 2 + (size_t) 8 * rows * 4;
+        // (with the TP core's slice only the scratch is new: a small margin then)
+        if (c.free_vram() > 0 && c.free_vram() < (int64_t) (need + ((size_t) (given ? 64 : 768) << 20))) {
             std::fprintf(stderr, "xe tier: no room on card %d for the head split (%zu MB) - not split\n", c.idx, need >> 20);
             return Ds41XeImpl::HeadSplit();
         }
-        uint8_t* wk = sycl::malloc_device<uint8_t>((size_t) bn * 210, c.q);
+        uint8_t* wk = given ? const_cast<uint8_t*>(given) : sycl::malloc_device<uint8_t>((size_t) bn * 210, c.q);
         int8_t* xq = sycl::malloc_device<int8_t>((size_t) 8 * K, c.q);
         float* xd = sycl::malloc_device<float>((size_t) 8 * K / 32, c.q);
         float* y = sycl::malloc_device<float>((size_t) 8 * rows, c.q);
         if (!wk || !xq || !xd || !y) { std::fprintf(stderr, "xe tier: head split allocation failed - not split\n"); return Ds41XeImpl::HeadSplit(); }
-        for (int p = 0; p < 4; ++p) c.q.memcpy(wk + po[p] * bn, (const uint8_t*) w + po[p] * nb + pb[p] * b0, pb[p] * bn);
+        if (!given) for (int p = 0; p < 4; ++p) c.q.memcpy(wk + po[p] * bn, (const uint8_t*) w + po[p] * nb + pb[p] * b0, pb[p] * bn);
         c.q.wait();
-        hs.c.push_back(&c); hs.w.push_back(wk); hs.xq.push_back(xq); hs.xd.push_back(xd); hs.y.push_back(y);
+        hs.c.push_back(&c); hs.w.push_back(wk); hs.own.push_back(given ? 0 : 1); hs.xq.push_back(xq); hs.xd.push_back(xd); hs.y.push_back(y);
     }
     hs.ok = true;
-    std::fprintf(stderr, "xe tier: %lld x %lld LM head split over %d cards\n", (long long) N, (long long) K, np);
+    int shared = 0;
+    for (char o : hs.own) shared += o ? 0 : 1;
+    std::fprintf(stderr, "xe tier: %lld x %lld LM head split over %d cards%s\n", (long long) N, (long long) K, np,
+                 shared ? (" (" + std::to_string(shared) + " slices the TP core's own rows)").c_str() : "");
     return hs;
 }
 }  // namespace
@@ -1489,12 +1535,14 @@ void cpu_repack_mat(int type, const uint8_t* src, uint8_t* dst, size_t NB) {
 /// The promotion cache's slots (each expert card's flex region, STRATA_XE_FLEX_GIB), the bounces and the helper thread.
 void pc_setup(Ds41XeImpl& im) {
     im.pc_slot = ((size_t) im.blob_max + 255) & ~(size_t) 255;
+    im.pc_devrepack = env_i("STRATA_TP", 0) > 0 && env_i("STRATA_TP_PC_DEVREPACK", 1) != 0;
     int total = 0;
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
         if (c.dense || c.pc_mem || !c.flex || c.pbuf_cap) continue;   // the slots: the card's flex region (no prompt running)
-        const int n = (int) std::min<size_t>(c.flex_cap / im.pc_slot, 65535);
-        if (n < 4) continue;
+        int n = (int) std::min<size_t>(c.flex_cap / im.pc_slot, 65535);
+        if (n < 4 + (im.pc_devrepack ? 1 : 0)) continue;
+        if (im.pc_devrepack) { --n; c.pc_tmp = c.flex + (size_t) n * im.pc_slot; }   // the last slot's bytes: the temp
         c.pc_mem = c.flex;
         c.pc_n = n;
         c.pc_key.assign((size_t) n, -1);
@@ -1532,7 +1580,7 @@ void pc_setup(Ds41XeImpl& im) {
                 const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
                 const uint8_t* src = im.aptr[(size_t) j->key];
                 uint8_t* dst = im.pc_bounce + (size_t) j->bounce * im.pc_slot;
-                if (!im.planar) std::memcpy(dst, src, im.bbytes(l, e));
+                if (!im.planar || im.pc_devrepack) std::memcpy(dst, src, im.bbytes(l, e));   // (the card repacks)
                 else {
                     const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
                     auto qk = [](int t) { return t == xe::kQ3K ? 256 : t == xe::kQ20 ? 64 : 128; };
@@ -1548,7 +1596,8 @@ void pc_setup(Ds41XeImpl& im) {
         };
         im.pc_thr = std::thread(helper);
         // larry, engine1: under STRATA_TP the repacks (~10-20 ms an expert on a busy host) were the promotions' limit
-        const int more = env_i("STRATA_TP", 0) > 0 ? std::max(0, env_i("STRATA_TP_PC_THREADS", 4) - 1) : 0;
+        // (with the card's repack (pc_devrepack) a helper only copies pageable blobs: 2)
+        const int more = env_i("STRATA_TP", 0) > 0 ? std::max(0, env_i("STRATA_TP_PC_THREADS", im.pc_devrepack ? 2 : 4) - 1) : 0;
         for (int k = 0; k < more; ++k) im.pc_thr_more.emplace_back(helper);
     }
     im.pc_ready = im.pc_bounce && total > 0;
@@ -1603,6 +1652,13 @@ void pc_poll(Ds41XeImpl& im, bool push) {
             ++im.pc_chunks;
             if (j.sent == b) {   // in queue order: once this kernel is done the whole copy is
                 j.ev = kev;
+                if (im.pc_devrepack && im.planar) {   // the file layout -> planes: slot -> temp, temp -> slot (in order)
+                    const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
+                    xe::xe_repack_blob(pq, slot, c.pc_tmp, f.gu_type, f.d_type, f.up_off, f.down_off, (int) im.g.n_embd, (int) im.g.n_ff);
+                    const u4v* tv = reinterpret_cast<const u4v*>(c.pc_tmp);
+                    u4v* ov = reinterpret_cast<u4v*>(slot);
+                    j.ev = pq.parallel_for(sycl::range<1>(b / 16), [=](sycl::id<1> i) { ov[i] = tv[i]; });
+                }
                 j.stage = 3;
             }
         } else if (j.stage == 3 && !push && ev_done(j.ev)) {
@@ -1646,7 +1702,7 @@ void pc_want(Ds41XeImpl& im, int64_t l, size_t key) {
         if (!c.dense && c.pc_n > 0 && c.pc_busy < im.pc_par) cd = &c;
     }
     if (!cd) { ++im.pc_busy_skip; return; }
-    if (im.pc_bfree.empty()) { ++im.pc_busy_skip; return; }
+    if (im.pc_bfree.empty() && !(im.pc_devrepack && im.apin[key])) { ++im.pc_busy_skip; return; }
     int slot = -1;
     uint64_t best = UINT64_MAX;
     for (int sl = 0; sl < cd->pc_n; ++sl) {
@@ -1672,9 +1728,14 @@ void pc_want(Ds41XeImpl& im, int64_t l, size_t key) {
     j.key = (int64_t) key;
     j.card = cd->idx;
     j.slot = slot;
+    j.t_queued = now_ms();
+    if (im.pc_devrepack && im.apin[key]) {   // the card reads the pinned arena blob itself and repacks it
+        j.src = im.aptr[key];
+        j.stage = 1;
+        return;
+    }
     j.bounce = im.pc_bfree.back();   // the helper repacks it into a bounce (pinned arena copies too)
     im.pc_bfree.pop_back();
-    j.t_queued = now_ms();
     { std::lock_guard<std::mutex> lk(im.pc_mu); im.pc_fill.push_back(&j); }
     im.pc_cv.notify_one();
 }
@@ -1701,6 +1762,7 @@ void pc_drop(Ds41XeImpl& im) {
             if (k >= 0) { im.card_of[(size_t) k] = -1; im.dptr[(size_t) k] = nullptr; rt_put(im, (size_t) k); }
         }
         c.pc_mem = nullptr;   // the flex region (prefetch buffers next)
+        c.pc_tmp = nullptr;
         c.pc_n = 0;
         c.pc_key.clear();
         c.pc_tick.clear();
@@ -3639,6 +3701,41 @@ void Ds41XeTier::tp_between_passes(int chunks) {
     }
 }
 
+void Ds41XeTier::tp_defer_vram(int gpu, size_t bytes) { im_->tp_defer[gpu] = bytes; }
+
+void Ds41XeTier::tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p) {
+    if (w && p) im_->head_given[w].push_back({gpu, r0, r1, p});
+}
+
+bool Ds41XeTier::tp_make_room(int gpu, size_t bytes) {
+    Ds41XeImpl& im = *im_;
+    XeCard* cp = nullptr;
+    for (auto& c : im.cards) if (c->gpu == gpu) cp = c.get();
+    if (!cp || cp->dense) return true;   // not an expert card of the tier
+    XeCard& c = *cp;
+    // the rows fit beside what is free (STRATA_TP_ROOM_KEEP_GIB, 0.25, left over); else the flex region gives the
+    // shortfall back - after a long prompt its chunk buffers hold the card's slack, as they did with eager replicas
+    const int64_t keep = (int64_t) (env_d("STRATA_TP_ROOM_KEEP_GIB", 0.25) * kGiB);
+    const int64_t fr = c.free_vram();
+    auto tdl = im.tp_defer.find(gpu);
+    if (tdl != im.tp_defer.end()) tdl->second = tdl->second > bytes ? tdl->second - bytes : 0;
+    if (fr < 0) return true;
+    int64_t give = (int64_t) bytes + keep - fr;
+    if (give <= 0) return true;
+    if (!c.flex || c.pbuf_cap) return fr > (int64_t) bytes;   // no flex region to give back (a prompt holds it)
+    give = std::min<int64_t>(give, (int64_t) c.flex_cap);
+    pc_drop(im);   // the promoted experts out (every card; the slots come back at the next promotion)
+    c.q.wait();
+    const size_t was = c.flex_cap;
+    local_free(c.q, c.flex);
+    const int64_t left = ((int64_t) was - give) & ~(int64_t) 255;
+    c.flex = left >= 8 * (int64_t) im.blob_max ? local_alloc(c.q, (size_t) left) : nullptr;
+    c.flex_cap = c.flex ? (size_t) left : 0;
+    std::fprintf(stderr, "xe tier: card %d's flex region %.2f -> %.2f GiB (the TP core's KV rows)\n", c.idx, was / kGiB,
+                 c.flex_cap / kGiB);
+    return c.free_vram() > (int64_t) bytes;
+}
+
 void Ds41XeTier::tp_set_promote_queues(const std::vector<void*>& qs) {
     Ds41XeImpl& im = *im_;
     im.pc_q.assign(im.cards.size(), nullptr);
@@ -3906,7 +4003,8 @@ void Ds41XeTier::close() {
         for (size_t i = 0; i < kv.second.c.size(); ++i) {
             sycl::queue& q = kv.second.c[i]->q;
             q.wait();
-            sycl::free(kv.second.w[i], q); sycl::free(kv.second.xq[i], q); sycl::free(kv.second.xd[i], q); sycl::free(kv.second.y[i], q);
+            if (i >= kv.second.own.size() || kv.second.own[i]) sycl::free(kv.second.w[i], q);
+            sycl::free(kv.second.xq[i], q); sycl::free(kv.second.xd[i], q); sycl::free(kv.second.y[i], q);
         }
     im.heads.clear();
     for (auto& cp : im.cards) {

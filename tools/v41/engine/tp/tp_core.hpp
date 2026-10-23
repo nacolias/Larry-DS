@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::v41 {
@@ -109,6 +110,17 @@ public:
     const std::string & last_error() const;
     /// the ranks' in-order queues (sycl::queue*): work queued there runs between passes, in order with them
     std::vector<void *> queues() const;
+    /// STRATA_TP_LAZY_KV (default 1): ranks >= 1 map their KV replicas' pages as the context reaches them - the VRAM
+    /// not mapped yet, by GPU index (the expert tier can hold it meanwhile: its flex region)
+    std::vector<std::pair<int, size_t>> deferred_vram() const;
+    /// the tier's side of that: make room for `bytes` more on GPU `gpu` (called between passes, before a mapping);
+    /// false = no room (the pass fails)
+    void set_vram_hook(std::function<bool(int gpu, size_t bytes)> make_room);
+    /// rank `rank`'s rows [r0, r1) of the LM head ("output.weight") or an Engram projection ("blk.<l>.engram_kv.weight")
+    /// as one Q6_K planar slice on GPU `gpu` (the dense half's reordered layout, its rows only) - or null.  The expert
+    /// tier's head split reads these instead of copying the same rows again.
+    const void * shard(const std::string & name, int rank, int64_t & r0, int64_t & r1, int & gpu) const;
+    int n_cards() const;
 
 private:
     struct Impl;
