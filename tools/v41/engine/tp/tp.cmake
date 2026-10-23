@@ -3,7 +3,7 @@
 # from ggml-sycl's sources, compiled here in their own namespaces).
 set(_tp_dir ${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/tp)
 set(_tp_gsycl ${STRATA_GGML_DIR}/ggml/src/ggml-sycl)
-add_library(ds41_tp SHARED ${_tp_dir}/tp_core.cpp ${_tp_dir}/tp_fastmv.cpp)
+add_library(ds41_tp SHARED ${_tp_dir}/tp_core.cpp ${_tp_dir}/tp_fastmv.cpp ${_tp_dir}/tp_pager.cpp)
 target_include_directories(ds41_tp PUBLIC ${_tp_dir} PRIVATE ${_tp_gsycl} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_v41_dir})
 target_link_libraries(ds41_tp PRIVATE ds41_xe ggml-base ze_loader)   # ds41_xe: the planar expert kernels
 target_compile_options(ds41_tp PRIVATE ${_xe_sycl})

@@ -32,6 +32,18 @@ struct Ds41TpLayerState {
     float * st_kv = nullptr, * st_sc = nullptr;   ///< [2][DH] f32 the ratio-2 compressor state
 };
 
+/// One rank's shard of a dense weight, as this core holds it on its card (Q6_K planar: ql | qh | scales | d planes over
+/// its blocks, row-major).  kind 0: rows [a0, a1) of the tensor; 1: rows [a0, a1) of both halves of a stacked pair
+/// (gate | up, `half` rows each) as one plane set; 2: 256-blocks [a0, a1) of every row (a K split); 3: slices [a0, a1)
+/// of `slice` bytes each (wo_a: one plane set a slice).
+struct Ds41TpShard {
+    const void * p = nullptr;
+    int gpu = -1;
+    int kind = 0;
+    int64_t a0 = 0, a1 = 0, half = 0;
+    size_t slice = 0;
+};
+
 /// What the core takes from the engine (all optional: a bench runs without them)
 struct Ds41TpHooks {
     /// rank 0's state, one entry a layer (empty: the core owns rank 0's state too)
@@ -120,6 +132,9 @@ public:
     /// as one Q6_K planar slice on GPU `gpu` (the dense half's reordered layout, its rows only) - or null.  The expert
     /// tier's head split reads these instead of copying the same rows again.
     const void * shard(const std::string & name, int rank, int64_t & r0, int64_t & r1, int & gpu) const;
+    /// rank `rank`'s shard of `name` (attn_q_b, attn_output_a, attn_output_b, ffn_gate_up_shexp, ffn_down_shexp,
+    /// engram_kv, output.weight) when it is this core's own copy (false: not held, or read from the engine in place)
+    bool shard_desc(const std::string & name, int rank, Ds41TpShard & d) const;
     int n_cards() const;
 
 private:

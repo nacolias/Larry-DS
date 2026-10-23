@@ -352,6 +352,8 @@ struct Ds41XeImpl {
     int pc_par = 1;                    ///< promotions in flight a card (1; engine1's between-pass driving: more)
     std::vector<sycl::queue*> pc_q;    ///< larry, engine1: the queue a card's promotion copies go to (null: the card's own)
     std::map<int, size_t> tp_defer;    ///< larry, engine1: by GPU, the TP core's VRAM not mapped yet (the flex holds it)
+    double dense_bonus_gib = 0;        ///< larry, engine1: card 0 VRAM the pager gave back (on top of STRATA_XE_DENSE_GIB)
+    std::map<int, std::pair<uint8_t*, size_t>> dbg;   ///< debug captures (pinned), by slot
     /// larry, engine1 (STRATA_TP, STRATA_TP_PC_DEVREPACK default 1): a promotion copies the expert's FILE layout into its
     /// slot (pinned arena blobs straight from the arena, pageable ones through a bounce by a plain memcpy) and the card
     /// repacks it there (slot -> pc_tmp -> slot) - the host's repack (10-20 ms an expert on a busy host) took the cores
@@ -1017,7 +1019,7 @@ int64_t seed_dense(Ds41XeImpl& im, XeCard& c, const std::vector<std::pair<int32_
 int64_t dense_budget(Ds41XeImpl& im, XeCard& c) {
     const double cap = env_d("STRATA_XE_DENSE_GIB", 10.0);
     double gib = im.slot_gib;
-    if (cap >= 0) gib = std::min(gib, cap);
+    if (cap >= 0) gib = std::min(gib, cap + im.dense_bonus_gib);
     const int64_t fr = c.free_vram();
     if (fr > 0) gib = std::min(gib, (fr + c.used) / kGiB - env_d("STRATA_XE_DENSE_RESERVE_GIB", 8.0));
     return gib < 0.5 ? 0 : (int64_t) (gib * kGiB);
@@ -3702,6 +3704,31 @@ void Ds41XeTier::tp_between_passes(int chunks) {
 }
 
 void Ds41XeTier::tp_defer_vram(int gpu, size_t bytes) { im_->tp_defer[gpu] = bytes; }
+
+void Ds41XeTier::dbg_capture(int slot, const void* src, size_t bytes) {
+    Ds41XeImpl& im = *im_;
+    if (!im.dense_q || !src || !bytes) return;
+    auto& e = im.dbg[slot];
+    if (e.second < bytes) {
+        if (e.first) { im.dense_q->wait(); sycl::free(e.first, im.ctx); }
+        e.first = sycl::malloc_host<uint8_t>(bytes, im.ctx);
+        e.second = e.first ? bytes : 0;
+    }
+    if (e.first) im.dense_q->memcpy(e.first, src, bytes);
+}
+
+std::vector<uint8_t> Ds41XeTier::dbg_take(int slot) {
+    Ds41XeImpl& im = *im_;
+    auto it = im.dbg.find(slot);
+    if (it == im.dbg.end() || !it->second.first || !im.dense_q) return {};
+    im.dense_q->wait();
+    return std::vector<uint8_t>(it->second.first, it->second.first + it->second.second);
+}
+
+void Ds41XeTier::tp_dense_bonus(size_t bytes) {
+    im_->dense_bonus_gib = bytes / kGiB;
+    std::fprintf(stderr, "xe tier: dense card's expert cap +%.2f GiB (the dense weights the TP cards hold, paged)\n", bytes / kGiB);
+}
 
 void Ds41XeTier::tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p) {
     if (w && p) im_->head_given[w].push_back({gpu, r0, r1, p});

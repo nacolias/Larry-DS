@@ -1,8 +1,9 @@
 # engine1 - DeepSeek-V4.1 decode / verify on N cards (tensor parallel), host out of the loop
 
-Status: phases A-C built and measured, in the engine behind STRATA_TP=N (default 0); not in the service yet (VRAM: see
-the status at the end).  User go-ahead 2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card
-count).  Mirror of larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
+Status: phases A-D done; in the engine behind STRATA_TP=N (default 0), in the service since 2026-10-23 02:35
+(STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02 - see the status sections at the end.  User go-ahead
+2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card count).  Mirror of
+larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
 
 ## Why
 
@@ -145,3 +146,77 @@ Next: the draft's remaining +0.55 ms under TP; card 0's 3/4 of the sharded dense
 path reads them: page them in per layer from the other cards); the CPU pool's share of verify passes (GPU help over
 PCIe for pinned arena experts); the pass's own kernels (unitrace of tp_bench); then TP prefill and the draft on the
 TP core.
+
+## Status 2026-10-23 ~05:30 (the pager: card 0's copies of the sharded weights)
+
+With TP on, only the prompt path (layer-major batches) reads card 0's full copies of q_b, wo_a, wo_b, the shared
+expert (gate | up, down) and the Engram projection: 4.93 GiB that the ranks hold in their shards already.
+STRATA_TP_PAGE=1 (tp/tp_pager.cpp) pages them:
+
+* The dense half allocates them through `Ds41DenseConfig::paged_alloc`: one unit of Level Zero virtual memory a layer,
+  a ggml buffer over the region (`ggml_backend_sycl_buffer_from_ptr`), every page mapped while the weights load and
+  reorder.
+* After TP init, `enable()` builds each tensor's fill plan from the ranks' shard layouts (`Ds41Tp::shard_desc`: rows,
+  gate | up halves, K blocks, slices), gives the load-time pages back and keeps 3 slots (244 MiB) plus 32 MiB of
+  staging.  It waits until free VRAM shows the driver's lazy free; the tier's dense cap takes the freed bytes
+  (`tp_dense_bonus`): card 0 holds 1690 experts instead of 1326 (one-shot); the service's deferred cache opens with
+  14.2-16.9 GiB of experts instead of 10.0-11.3.
+* `need(l)` (the dense half's attn_router spans, before the submit lock) maps layer l's unit into a slot and fills it:
+  card 0 pulls rank k's shard (card-to-card copies on its own copy queue) straight into the unit for row, half and
+  slice splits; K splits through the staging and a scatter kernel on the dense queue (2-D card-to-card copies ran at
+  31-40 MB/s); the dense queue waits for them.  The next layer's copies start meanwhile.  `touch(l)` after the layer's
+  work is queued: the slot is free once that work is done.  The copies are never the other cards' (see below).
+* Rank 0 owns its copies of the paged tensors (no shared planes for them).  Prompt passes of <= 7 tokens go to TP
+  passes, and DSpark seeds in chunks of 7: the dense half no longer has the weights for a small pass at hand.
+
+Checked: STRATA_TP_PAGE_CHECK=1 refills every unit in place and compares it with the load (bit-identical).  Measured
+(one-shot, service settings, clocks pinned): essay DSpark 69.6 / 69.0 / 71.1 tok/s (TP without the pager 63.0), 95K
+prefix DSpark 57.0 (50.3), prompts +4 %, plain 63.5; no slot waits.
+
+**The first service deploy (05:20) garbled long prompts.**  tsvc2: the 8K / 16K / 31K needles came back as word salad
+(the decode ran to its length limit), one 8K in two passed, and the tool call after them was garbage too; the
+one-shot runs (one prompt each) had been fine.  The fills were then the OTHER cards' copies (rank k's queue writing
+into card 0's virtual memory).  A private-port copy of the service (bench/engine1/tpg.sh: the tsvc2 sequence with the
+answers shown) reproduced it exactly; the pager off with an 18 GiB cache cap passed (not VRAM pressure), and so did
+the pager with its copies on card 0's queue (STRATA_TP_PAGE_ON0) or with no remapping at all (STRATA_TP_PAGE_KEEP).
+bench/engine1/vmm_remap.cpp has it in 30 lines: after card 0 remaps an address to new pages, card 1's copy into it
+still lands in the OLD pages (every time; card 0's own copy into it is right, and a cross-card barrier waits
+correctly).  A slot moving to another layer left the other cards writing into the pages of whichever unit or freed
+load-time pages had held that address - other layers' weights, then the expert cache that took the freed VRAM.  Fix:
+card 0 pulls every fill on a copy queue of its own.  Checked: the refill check bit-identical through it, the service
+sequence twice in one server all right (needles, tool call, svcbench text), prompts as without the pager (8K
+764-953 tok/s, 16K 1310-1429, 31K 1670-1721; pager off 784-928 / 1345 / 1690); short prompts (<= 34 tokens) run as
+TP passes, 55-83 tok/s against 30-40.  engine1's lazy KV replicas are safe: their pages are only ever added, and
+each card copies into its own.
+
+In the service since 06:02 (tsvc2 against the last run without the pager): needles 200 / 8K / 8K / 16K / 31K all
+found, the tool call right; essay 69.5 / 66.0 tok/s (65.1 / 63.4), svcbench 80.3 / 76.2 (80.4 / 81.6: its noise),
+prompts 8K 795 / 927 tok/s (786 / 942), 16K 1162 then 1419 / 1437 (1342), 31K 1646 (1689); hidden RAM 40 GiB peak.
+
+Next: the CPU-pool share of verify passes (pinned arena experts computed by idle cards over PCIe), the draft's
+remaining +0.5 ms under TP, a bit-exact prompt path if a test ever needs repeatable rows, TP prefill.
+
+**Row 111 (not the pager).**  In p2k PPL runs (one 2048-token batch, exact routing) row 111 - token 1018 in a repeated
+pattern, the next token (6201) certain - predicts 30 (once 201) in some runs: NLL 6.8-7.0 instead of 0.004, PPL
++0.006.  First seen with the pager (2 of 3 runs), then in every variant tried: pages kept, no prefetch, fp16 cache
+off, refills on card 0's queue, a 3 ms busy kernel on the dense queue with no pager at all; and with the pager off
+(bench/engine1/ttp18.sh: 2 of 8).  In all: 2 of 14 runs with the pager off, 9 of 27 with it or a variant - the
+same rate within the noise of such counts.  STRATA_DUMP_COL=<column> writes per layer that column's routing, FFN
+input and routed sum (logs/dump_col.<pid>.bin).  On the bad runs (one with the pager, one without):
+
+* the routed sums match the F32 reference experts from the GGUF in every layer (bench/engine1/test_ds41_dumpref.cpp:
+  rel 1e-7..1e-2) and the routing matches the router recomputed from the dumped input (bench/engine1/routercheck.py:
+  the same top-6 in all 40 layers, weights within 2e-6).  The huge outputs from layer ~21 on (|routed| up to 43,000)
+  are the model's own response to that input;
+* good runs' FFN inputs for that row already differ 2.5e-4 at layer 1, ~30 % by layer 19 and up to ~80 % later, with
+  the same logits (KL <= 0.001) - the pager off as much as on; the bad runs leave that spread smoothly at layers
+  19-21 for another attractor.  Nothing jumps.
+
+So the row is chaotic and the engine's run-to-run noise decides it.  Noise sources seen (every config): the placement
+varies with free VRAM at load (8272-8275 VRAM experts) and so do the prompt prefetch buffers (0.72-0.74 GiB a card),
+which moves experts between the resident (planar, int8 activations) and the streamed kernels; and the dense half
+differs ~1e-7 at layer 0 already.  Row 0, which attends only to itself, differs 1.7e-7 at layer 0 and 3.5e-5 at
+layer 1: wherever activations are rounded to 8 bits (dp4a GEMMs, planar experts) a last-bit difference flips a
+rounding, and the jump is ~1e-5.  The bulk statistics do not move with the pager: KL against a resident run
+0.0021-0.0025 mean, PPL without row 111 1.998-2.009.  A bit-exact prompt path (fixed reduction orders, placement
+independent of the driver's free-VRAM reading) would make such rows repeatable, not right; not planned.

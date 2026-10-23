@@ -58,6 +58,21 @@ struct Ds41DenseConfig {
     /// --serve: start with max_pass (S) state columns and let set_columns() grow them for a layer-major batch and give
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
+    /// larry, engine1 (STRATA_TP_PAGE): each layer's q_b, wo_a, wo_b, shared expert (gate | up, down) and Engram
+    /// projection - the dense weights the TP cards hold between them - in memory the caller provides and pages.
+    /// Called once at load with every layer's bytes (a unit, 0 = none); returns a backend buffer whose base is the
+    /// units' region (unit_off[l] filled in) or null (the normal buffer).  Q6_K tensors only; the work on a layer's unit
+    /// is bracketed by the page hooks (set_page_hooks).
+    std::function<ggml_backend_buffer_t(const std::vector<size_t> & unit_bytes, std::vector<size_t> & unit_off)> paged_alloc;
+};
+
+/// larry, engine1: a weight in the paged units (cfg.paged_alloc): its layer, address, Q6_K shape
+struct Ds41DensePaged {
+    std::string name;
+    int layer = -1;
+    void * data = nullptr;
+    int64_t K = 0, N = 0;
+    size_t bytes = 0;
 };
 
 // larry, STRATA_GPU_TL: called at a decode layer's stage boundaries (0 attention queued, 1 readbacks done, 2 shared
@@ -218,6 +233,10 @@ public:
     /// passes / batches / unpark, and *changed (any write at all: the rings and compressor states too, e.g. restore).
     /// An external decode core re-syncs its copies from it.  Every state write is behind a pass_sync() the caller does.
     void take_written(int64_t * lo, int64_t * hi, bool * changed);
+    /// larry, engine1: the weights in the paged units (cfg.paged_alloc; the shared expert's pair under its fused name)
+    std::vector<Ds41DensePaged> paged_weights() const;
+    /// larry, engine1: need(il) before any work on layer il's weights is queued, touch(il) after (the caller pages them)
+    void set_page_hooks(std::function<void(int)> need, std::function<void(int)> touch);
     /// larry, engine1: the Engram rows of tokens tids[0..n) at pos0.. into out[e] (n * cols * dim floats, slot e =
     /// the e-th Engram layer), the tokens recorded in the n-gram history first; blocking.  No Engram: true, untouched.
     bool engram_rows(const int * tids, int n, int pos0, float * const * out);

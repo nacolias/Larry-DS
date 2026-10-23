@@ -145,6 +145,7 @@ struct Mat {
     size_t gb = 0;                 // bytes a batch (Q6_K planar: its own plane set)
     bool f16 = false;
     int64_t nbt = 0;               // Q6_K: blocks of the plane set (0: N * K / 256) - a row prefix of a bigger tensor
+    bool shared = false;           // the engine's memory (rank 0 reading its weights in place), not this core's
 };
 
 struct LW {   // one card's weights of one layer
@@ -500,13 +501,13 @@ struct Ds41Tp::Impl {
     bool share_q6(Card & c, const std::string & name, int64_t K, int64_t rows, int64_t rows_all, Mat & m) {
         const void * p = share(c, name, (size_t) (rows * (K / QK)) * Q6B);
         if (!p) return false;
-        m.p = p; m.K = K; m.N = rows; m.G = 1; m.gb = 0; m.f16 = false; m.nbt = rows_all * (K / QK);
+        m.p = p; m.K = K; m.N = rows; m.G = 1; m.gb = 0; m.f16 = false; m.nbt = rows_all * (K / QK); m.shared = true;
         return true;
     }
     bool share_f16(Card & c, const std::string & name, int64_t K, int64_t rows, Mat & m) {
         const void * p = share(c, name, (size_t) (K * rows) * 2);
         if (!p) return false;
-        m.p = p; m.K = K; m.N = rows; m.G = 1; m.gb = 0; m.f16 = true;
+        m.p = p; m.K = K; m.N = rows; m.G = 1; m.gb = 0; m.f16 = true; m.shared = true;
         return true;
     }
 
@@ -543,7 +544,7 @@ struct Ds41Tp::Impl {
             {   // wo_a: the engine's per-slice planes (prereorder_slices) - rank 0's slices are its first ones
                 const size_t sb = (size_t) (OL * (OGD / QK)) * Q6B;
                 if (const void * p = share(c, b + "attn_output_a.weight", sb * (size_t) c.grp.n())) {
-                    w.woa.p = p; w.woa.K = OGD; w.woa.N = OL; w.woa.G = c.grp.n(); w.woa.gb = sb; w.woa.f16 = false;
+                    w.woa.p = p; w.woa.K = OGD; w.woa.N = OL; w.woa.G = c.grp.n(); w.woa.gb = sb; w.woa.f16 = false; w.woa.shared = true;
                 } else {
                     std::vector<Part> sl;
                     for (int64_t g = c.grp.lo; g < c.grp.hi; ++g) sl.push_back({ b + "attn_output_a.weight", g * OL, (g + 1) * OL, 0, OGD / QK });
@@ -1282,6 +1283,37 @@ int64_t Ds41Tp::n_embd() const { return p_->D; }
 int Ds41Tp::n_layer() const { return p_->NL; }
 int Ds41Tp::n_cards() const { return p_->N; }
 const std::string & Ds41Tp::last_error() const { return p_->err; }
+bool Ds41Tp::shard_desc(const std::string & name, int rank, Ds41TpShard & d) const {
+    const Impl & im = *p_;
+    d = Ds41TpShard();
+    if (rank < 0 || rank >= im.N) return false;
+    const Card & c = *im.cards[(size_t) rank];
+    d.gpu = c.gpu;
+    const Mat * m = nullptr;
+    if (name == "output.weight") {
+        m = &c.head; d.kind = 0; d.a0 = c.vrow.lo * 16; d.a1 = c.vrow.hi * 16;
+    } else {
+        int l = -1, n = 0;
+        if (std::sscanf(name.c_str(), "blk.%d.%n", &l, &n) != 1 || l < 0 || l >= im.NL || n <= 0) return false;
+        const std::string t = name.substr((size_t) n);
+        const LW & w = c.lw[(size_t) l];
+        const int64_t h0 = c.grp.lo * (im.NH / im.OG);
+        if (t == "attn_q_b.weight") { m = &w.qb; d.kind = 0; d.a0 = h0 * im.DH; d.a1 = (h0 + c.nhk) * im.DH; }
+        else if (t == "attn_output_a.weight") {
+            m = &w.woa; d.kind = 3; d.a0 = c.grp.lo; d.a1 = c.grp.hi; d.slice = w.woa.gb;
+            if (w.woa.G != c.grp.n() || !w.woa.gb) return false;
+        }
+        else if (t == "attn_output_b.weight") { m = &w.wob; d.kind = 2; d.a0 = c.grp.lo * im.OL / QK; d.a1 = c.grp.hi * im.OL / QK; }
+        else if (t == "ffn_gate_up_shexp.weight") { m = &w.sgu; d.kind = 1; d.a0 = c.ffb.lo * QK; d.a1 = c.ffb.hi * QK; d.half = im.NFF; }
+        else if (t == "ffn_down_shexp.weight") { m = &w.sdn; d.kind = 2; d.a0 = c.ffb.lo; d.a1 = c.ffb.hi; }
+        else if (t == "engram_kv.weight" && im.li[(size_t) l].eslot >= 0) { m = &w.ekv; d.kind = 0; d.a0 = c.erow.lo * QK; d.a1 = c.erow.hi * QK; }
+        else return false;
+    }
+    if (!m || !m->p || m->shared || m->f16 || m->nbt) return false;   // only this core's own Q6_K copies
+    d.p = m->p;
+    return true;
+}
+
 const void * Ds41Tp::shard(const std::string & name, int rank, int64_t & r0, int64_t & r1, int & gpu) const {
     const Impl & im = *p_;
     if (rank < 0 || rank >= im.N) return nullptr;

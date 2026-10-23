@@ -156,6 +156,13 @@ public:
     /// larry, engine1: rows [r0, r1) of weight `w` (the dense card's reordered tensor) are on GPU `gpu` already as one
     /// planar slice at `p` (the TP core's shard): the LM head split (mv_hook) reads it instead of a copy.  Before use.
     void tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p);
+    /// larry, engine1: the dense card's expert cap (STRATA_XE_DENSE_GIB) raised by `bytes` (card 0's dense weights
+    /// the pager gave back).  Before the dense card's seed.
+    void tp_dense_bonus(size_t bytes);
+    /// debug (STRATA_DUMP_COL): a copy of `bytes` of dense-card memory at `src` into pinned capture `slot`, queued on the
+    /// dense queue (no wait); dbg_take waits for that queue and returns the bytes
+    void dbg_capture(int slot, const void* src, size_t bytes);
+    std::vector<uint8_t> dbg_take(int slot);
     bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
 

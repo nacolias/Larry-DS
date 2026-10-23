@@ -30,6 +30,7 @@
 #endif
 #if defined(DS41_TP)
 #include "tp_core.hpp"        // larry, engine1: the tensor-parallel decode core (STRATA_TP=N)
+#include "tp_pager.hpp"       // larry, engine1: card 0's copies of the TP cards' dense weights, paged (STRATA_TP_PAGE)
 #endif
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
@@ -58,6 +59,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 using namespace strata;
 using namespace strata::v41;
@@ -339,6 +341,30 @@ int main(int argc, char ** argv) {
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
     if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
+#if defined(DS41_TP)
+    // larry, engine1 (STRATA_TP_PAGE=1 with STRATA_TP >= 2): card 0's copies of the dense weights the TP cards
+    // hold between them (q_b, wo_a, wo_b, the shared expert, the Engram projections: ~5 GB) only paged in for the prompt
+    // path's layers - the TP core runs decode / verify from its own shards; card 0 takes experts in that VRAM instead.
+    // Declared before the dense half: its memory outlives the dense half's buffer over it.
+    std::unique_ptr<Ds41Pager> pager;
+    // (opt-in: STRATA_TP_PAGE=1, the service's setting.  The p2k prompt row it first seemed to break goes wrong without
+    // it too - a chaotic row, not a race: engine1/DESIGN.md)
+    if (const char * tpv = std::getenv("STRATA_TP"); tpv && std::atoi(tpv) >= 2 && !ggml_backend_is_cpu(be) &&
+        std::getenv("STRATA_TP_PAGE") && std::getenv("STRATA_TP_PAGE")[0] == '1') {
+        pager = std::make_unique<Ds41Pager>();
+        std::string perr;
+        if (!pager->init(ggml_backend_sycl_get_queue(be), perr)) {
+            std::fprintf(stderr, "ds41_generate: STRATA_TP_PAGE: %s - off\n", perr.c_str());
+            pager.reset();
+        } else {   // the backend buffer over the pager's region comes from this binary's ggml-sycl (the dense half's)
+            dc.paged_alloc = [&pager](const std::vector<size_t> & ub, std::vector<size_t> & uo) -> ggml_backend_buffer_t {
+                size_t tot = 0;
+                void * va = pager->alloc(ub, uo, tot);
+                return va ? ggml_backend_sycl_buffer_from_ptr(0, va, tot) : nullptr;
+            };
+        }
+    }
+#endif
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
@@ -390,7 +416,10 @@ int main(int argc, char ** argv) {
         th.engram_slot = [&dense](const int * t, int n, int p0, int s, float * o) { return dense.engram_rows_slot(t, n, p0, s, o); };
         // rank 0 reads the dense half's weights in place where they are already in its layout: the reordered (planar)
         // Q6_K tensors, wo_a's per-slice planes, the F16 ones - no second copy of them on card 0
-        th.shared_weight = [&dense, &planar_w, &planar_slices](const std::string & name) -> const void * {
+        std::set<std::string> paged_names;   // larry, engine1: paged (STRATA_TP_PAGE) - rank 0 keeps its own copies of those
+        for (const auto & d : dense.paged_weights()) paged_names.insert(d.name);
+        th.shared_weight = [&dense, &planar_w, &planar_slices, paged_names](const std::string & name) -> const void * {
+            if (paged_names.count(name)) return nullptr;
             const ggml_tensor * t = dense.weight(name);
             if (!t || !t->data || t->ne[2] != 1) return nullptr;
             if (t->type == GGML_TYPE_F16) return t->data;
@@ -403,6 +432,17 @@ int main(int argc, char ** argv) {
         if (!tp->init(tc, th, err)) { std::fprintf(stderr, "ds41_generate: STRATA_TP: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "tp: %d cards, loaded in %.1f s\n", tp_n, (now_ms() - t0) / 1000.0);
     }
+    // the paged units' load-time pages back (the TP ranks own every shard now); a failure keeps them resident
+    if (pager && tp && std::getenv("STRATA_TP_PAGE_DUMMY")) {   // debug: the region kept as loaded, hooks only (timing)
+        dense.set_page_hooks([&pager](int il) { pager->need(il); }, [&pager](int il) { pager->touch(il); });
+    } else if (pager && tp) {
+        std::vector<Ds41PagedTensor> pt;
+        for (const auto & d : dense.paged_weights()) pt.push_back({ d.name, d.layer, d.data, d.K, d.N, d.bytes });
+        std::string perr;
+        if (pager->enable(*tp, pt, perr)) dense.set_page_hooks([&pager](int il) { pager->need(il); }, [&pager](int il) { pager->touch(il); });
+        else std::fprintf(stderr, "ds41_generate: STRATA_TP_PAGE: %s - the dense weights stay resident\n", perr.c_str());
+    }
+
 #endif
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
     // layers above it only read that owner's state, so the cut belongs there).  Also the window reach R = swa *
@@ -502,6 +542,7 @@ int main(int argc, char ** argv) {
 #endif
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
 #if defined(DS41_TP) && defined(DS41_XE)
+    if (pager && pager->enabled()) tier.tp_dense_bonus(pager->freed());   // card 0's expert cap + what paging gave back
     // larry, engine1: the TP core's KV replicas map their rows as the context grows (STRATA_TP_LAZY_KV) - the expert
     // cards' flex regions hold that VRAM until then, and give it back when the core asks
     if (tp) {
@@ -602,7 +643,13 @@ int main(int argc, char ** argv) {
     std::vector<int> ids1((size_t) top_k);
     std::vector<float> w1((size_t) top_k), routed1((size_t) n_embd), logits1((size_t) nv);
     // --serve's short-turn passes (STRATA_SERVE_PASS_M tokens per dense pass; 1 = single decode steps)
-    const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 16);
+#if defined(DS41_TP)
+    const bool tp_small = pager && pager->enabled();   // larry, engine1: paged dense weights - small passes as TP passes (<= 7)
+#else
+    const bool tp_small = false;
+#endif
+    const int pass_max = std::min(tp_small ? 7 : 1 << 30, std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 16));
+    const int seed_chunk = tp_small ? 7 : 16;   // DSpark's seed passes
     std::vector<float> crouted_m((size_t) std::max(pass_max, 17) * n_embd);   // 17: pass_v's DSpark seeding / verify passes
     std::string ferr;
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
@@ -1185,6 +1232,12 @@ int main(int argc, char ** argv) {
                         }
                         return true;
                     };
+                    // debug, STRATA_DUMP_COL=<batch column>: per layer that column's routing (ids / wts), FFN input
+                    // and routed sum, captured asynchronously on the dense queue, written at the batch's end to
+                    // logs/dump_col.<pid>.bin: {int32 layer, int32 ids[K], f32 wts[K], f32 fn[D], f32 routed[D]}
+                    static const int dump_col = std::getenv("STRATA_DUMP_COL") ? std::atoi(std::getenv("STRATA_DUMP_COL")) : -1;
+                    std::vector<std::vector<int32_t>> dc_ids((size_t) n_layer);
+                    std::vector<std::vector<float>> dc_wts((size_t) n_layer);
                     auto PJ = [&]() -> bool {   // join the tier call in flight, then finish its part
                         if (!inflight) return true;
                         inflight = false;
@@ -1192,10 +1245,17 @@ int main(int argc, char ** argv) {
                         const bool ok = tier.run_chunk_wait();
                         fd_tier += now_ms() - t;
                         if (!ok) { ferr = "tier run refused"; return false; }
+                        if (dump_col >= fa && dump_col < fb && prdev)
+                            tier.dbg_capture(2 * fl + 1, prdev + (size_t) dump_col * n_embd, (size_t) n_embd * 4);
                         return PF(fl, fa, fb) && (fb < B || PC(fl));
                     };
                     auto PT = [&](int l, int a0, int a1, bool last) -> bool {
                         dense.pass_sync();   // the part's ids / weights / fn are final (the pass ring does not wait)
+                        if (dump_col >= a0 && dump_col < a1) {
+                            dc_ids[(size_t) l].assign(dense.batch_ids() + (size_t) dump_col * top_k, dense.batch_ids() + (size_t) (dump_col + 1) * top_k);
+                            dc_wts[(size_t) l].assign(dense.batch_wts() + (size_t) dump_col * top_k, dense.batch_wts() + (size_t) (dump_col + 1) * top_k);
+                            if (fn_dev) tier.dbg_capture(2 * l, fn_dev + (size_t) dump_col * n_embd, (size_t) n_embd * 4);
+                        }
                         inflight = tier.run_chunk_dev_async(l, a1 - a0, dense.batch_ids() + (size_t) a0 * top_k,
                                                             dense.batch_wts() + (size_t) a0 * top_k,
                                                             dense.batch_fn() + (size_t) a0 * n_embd, prdev + (size_t) a0 * n_embd, last,
@@ -1228,6 +1288,23 @@ int main(int argc, char ** argv) {
                     }
                     okp = okp && PJ();
                     if (!okp) tier.run_chunk_wait();   // never leave the tier thread running
+                    if (okp && dump_col >= 0 && dump_col < B) {
+                        const std::string dn = "logs/dump_col." + std::to_string((long) getpid()) + ".bin";
+                        if (std::FILE * df = std::fopen(dn.c_str(), "wb")) {
+                            for (int l = 0; l < n_layer; ++l) {
+                                const auto fnb = tier.dbg_take(2 * l), rtb = tier.dbg_take(2 * l + 1);
+                                if (dc_ids[(size_t) l].size() != (size_t) top_k || fnb.size() != (size_t) n_embd * 4 || rtb.size() != (size_t) n_embd * 4) continue;
+                                const int32_t li = l;
+                                std::fwrite(&li, 4, 1, df);
+                                std::fwrite(dc_ids[(size_t) l].data(), 4, (size_t) top_k, df);
+                                std::fwrite(dc_wts[(size_t) l].data(), 4, (size_t) top_k, df);
+                                std::fwrite(fnb.data(), 1, fnb.size(), df);
+                                std::fwrite(rtb.data(), 1, rtb.size(), df);
+                            }
+                            std::fclose(df);
+                            std::fprintf(stderr, "STRATA_DUMP_COL: column %d -> %s\n", dump_col, dn.c_str());
+                        }
+                    }
                     dense.set_pass_ring(false);
                     dense.set_submit_lock(nullptr);
                     dense.set_fn_host(true);
@@ -1765,8 +1842,8 @@ int main(int argc, char ** argv) {
                     }
                     if (bcap_got < 1) { ferr = "DSpark batch seed captured nothing"; ok = false; }
                 }
-                for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; i0 += 16) {
-                    const int m = std::min(16, total - i0);
+                for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; i0 += seed_chunk) {
+                    const int m = std::min(seed_chunk, total - i0);
                     if (!pass_v(ids.data() + i0, m, i0)) { ok = false; break; }
                     spos.resize((size_t) m);
                     for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
@@ -2071,8 +2148,8 @@ int main(int argc, char ** argv) {
         bias_now = false;   // the tail is PROMPT: it routes like the rest of the prompt (no decode biases), as plain decode
         apply_bias();
         std::vector<int> spos;
-        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
-            const int m = std::min<int>(16, (int) prompt.size() - i0);
+        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += seed_chunk) {
+            const int m = std::min<int>(seed_chunk, (int) prompt.size() - i0);
             if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: DSpark seed: %s\n", ferr.c_str()); return 1; }
             spos.resize((size_t) m);
             for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;

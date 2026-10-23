@@ -307,6 +307,8 @@ struct Ds41Dense::Impl {
     std::mutex * sub_mu = nullptr;            // larry: set_submit_lock
     bool fn_host = true;                      // larry: set_fn_host
     std::function<void(int, int)> pre_wait;   // larry: set_pre_wait_hook
+    std::function<void(int)> page_need, page_touch;   // larry, engine1: set_page_hooks
+    std::vector<std::vector<std::pair<ggml_tensor *, size_t>>> paged_lay;   // larry, engine1: cfg.paged_alloc's units
     std::function<void(int, int, const void *, const void *, const void *, const float *)> route_hook;   // larry: set_route_hook
     std::function<bool(int, int, const ggml_tensor *, const ggml_tensor *, const float *, float *)> oproj_hook;   // larry
     std::atomic<int> * sub_prio = nullptr;    // larry: raised while waiting for sub_mu (the tier's threads hold off)
@@ -443,6 +445,54 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     w.t[pn] = tp;
                 }
             }
+        // larry, engine1 (cfg.paged_alloc): each layer's weights the TP cards hold between them - q_b, wo_a, wo_b, the
+        // shared expert's gate | up (back to back: one weight below) and down, the Engram projection - in a unit of the
+        // caller's memory, bound before the buffer below takes the rest.  Q6_K 2-D tensors only.
+        if (im.sycl && im.cfg.paged_alloc) {
+            const ggml_backend_buffer_type_t bt = ggml_backend_get_default_buffer_type(im.backend);
+            const size_t al = std::max<size_t>(256, ggml_backend_buft_get_alignment(bt));
+            auto up_to = [](size_t v, size_t a) { return (v + a - 1) / a * a; };
+            const bool gu_fuse = env_on("STRATA_SHEXP_GU", true);
+            int nl = 0;
+            while (w.t.count("blk." + std::to_string(nl) + ".attn_q_b.weight")) ++nl;
+            std::vector<std::vector<std::pair<ggml_tensor *, size_t>>> lay((size_t) nl);
+            std::vector<size_t> ub((size_t) nl, 0), uo;
+            for (int il = 0; il < nl; ++il) {
+                const std::string b = "blk." + std::to_string(il) + ".";
+                auto q6 = [&](const char * n) -> ggml_tensor * {
+                    auto it = w.t.find(b + n);
+                    return it != w.t.end() && it->second->type == GGML_TYPE_Q6_K && ggml_n_dims(it->second) == 2 ? it->second : nullptr;
+                };
+                size_t off = 0;
+                auto put = [&](ggml_tensor * t, bool packed) {   // packed: right after the previous one (gate | up)
+                    if (!packed) off = up_to(off, al);
+                    lay[(size_t) il].push_back({ t, off });
+                    off += ggml_backend_buft_get_alloc_size(bt, t);
+                };
+                for (const char * n : { "attn_q_b.weight", "attn_output_a.weight", "attn_output_b.weight" })
+                    if (ggml_tensor * t = q6(n)) put(t, false);
+                ggml_tensor * g = q6("ffn_gate_shexp.weight"), * u = q6("ffn_up_shexp.weight");
+                if (gu_fuse && g && u && g->ne[0] == u->ne[0] && g->ne[1] == u->ne[1] && ggml_backend_buft_get_alloc_size(bt, g) == ggml_nbytes(g)) {
+                    put(g, false);
+                    put(u, true);
+                }
+                if (ggml_tensor * t = q6("ffn_down_shexp.weight")) put(t, false);
+                if (ggml_tensor * t = q6("engram_kv.weight")) put(t, false);
+                ub[(size_t) il] = up_to(off, al);
+            }
+            if (ggml_backend_buffer_t pb = im.cfg.paged_alloc(ub, uo)) {
+                uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(pb);
+                for (int il = 0; il < nl; ++il)
+                    for (auto & e : lay[(size_t) il])
+                        if (ggml_backend_tensor_alloc(pb, e.first, base + uo[(size_t) il] + e.second) != GGML_STATUS_SUCCESS) {
+                            err = std::string("cannot bind the paged weight ") + ggml_get_name(e.first);
+                            ggml_backend_buffer_free(pb);
+                            return false;
+                        }
+                w.bufs.push_back(pb);
+                im.paged_lay = std::move(lay);
+            }
+        }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!buf) { err = "cannot allocate the dense weights on the backend"; return false; }
         w.bufs.push_back(buf);
@@ -509,6 +559,12 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             }
             for (auto & a : add) w.t[a.first] = a.second;
             std::fprintf(stderr, "shared expert: %zu gate+up pairs as one weight\n", add.size());
+            for (size_t il = 0; il < im.paged_lay.size(); ++il)   // larry, engine1: a paged pair is paged as its fused weight
+                for (auto & e : im.paged_lay[il])
+                    if (std::strstr(ggml_get_name(e.first), ".ffn_gate_shexp.weight") && !w.t.count("blk." + std::to_string(il) + ".ffn_gate_up_shexp.weight")) {
+                        err = "paged shared expert of layer " + std::to_string(il) + " has no fused weight";
+                        return false;
+                    }
         }
         if (qkv_fuse) {   // STRATA_QKV_FUSE: q_a | kv as one weight over their bytes (same type, rows, buffer, adjacent)
             size_t nf = 0;
@@ -2181,8 +2237,50 @@ void Ds41Dense::set_pass_ring(bool on) {
 }
 void Ds41Dense::pass_sync() { ggml_backend_synchronize(p_->backend); }
 
+namespace {
+// larry, engine1 (set_page_hooks): layer il's paged weights mapped while a call queues work on them - need() before
+// the submit lock (it may wait for a slot's earlier work), touch() once the call's work is queued
+struct PageScope {
+    Ds41Dense::Impl & im;
+    int il;
+    PageScope(Ds41Dense::Impl & i, int l) : im(i), il(l) { if (im.page_need) im.page_need(il); }
+    ~PageScope() { if (im.page_touch) im.page_touch(il); }
+};
+}  // namespace
+
+std::vector<Ds41DensePaged> Ds41Dense::paged_weights() const {
+    const Impl & im = *p_;
+    std::vector<Ds41DensePaged> v;
+    for (size_t il = 0; il < im.paged_lay.size(); ++il)
+        for (auto & e : im.paged_lay[il]) {
+            ggml_tensor * t = e.first;
+            const std::string n = ggml_get_name(t);
+            if (n.find(".ffn_up_shexp.weight") != std::string::npos) continue;   // with its gate, as the fused weight
+            Ds41DensePaged d;
+            d.layer = (int) il;
+            d.data = t->data;
+            d.K = t->ne[0];
+            d.N = t->ne[1];
+            d.bytes = ggml_nbytes(t);
+            d.name = n;
+            if (n.find(".ffn_gate_shexp.weight") != std::string::npos) {
+                d.name = "blk." + std::to_string(il) + ".ffn_gate_up_shexp.weight";
+                d.N *= 2;
+                d.bytes *= 2;
+            }
+            v.push_back(d);
+        }
+    return v;
+}
+
+void Ds41Dense::set_page_hooks(std::function<void(int)> need, std::function<void(int)> touch) {
+    p_->page_need = std::move(need);
+    p_->page_touch = std::move(touch);
+}
+
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
+    PageScope ps(im, il);
     if (im.sub_mu && im.ly[(size_t) il].eslot >= 0 && !engram_wait_host(im)) return false;
     ring_take(im);
     std::unique_lock<std::mutex> sl;
@@ -2202,6 +2300,7 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
 
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
+    PageScope ps(im, il);
     if (im.sub_mu && im.ly[(size_t) il].eslot >= 0 && !engram_wait_host(im)) return false;
     ring_take(im);
     std::unique_lock<std::mutex> sl;
@@ -2300,6 +2399,7 @@ void Ds41Dense::set_fn_host(bool on) { p_->fn_host = on; }
 
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
+    PageScope ps(im, il);
     const int64_t n = im.n;
     // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
     // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.

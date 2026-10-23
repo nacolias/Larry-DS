@@ -298,7 +298,7 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 --- a/ggml/include/ggml-sycl.h
 +++ b/ggml/include/ggml-sycl.h
-@@ -21,6 +21,37 @@
+@@ -21,6 +21,40 @@
  
  GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
  
@@ -324,6 +324,9 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 +                                             int64_t OGD, int64_t OL, int64_t OG, int64_t D, int ncols, const float * o,
 +                                             int64_t o_col_stride, float * dst, int64_t dst_col_stride, void * user);
 +GGML_BACKEND_API void ggml_backend_sycl_set_oproj_hook(ggml_sycl_larry_oproj_hook_t fn, void * user);
++// larry, engine1: a buffer of device `device`'s SYCL buffer type over `size` bytes at `ptr` that the caller owns (ggml
++// never frees them; the caller may map and unmap the pages under it while no work touches them)
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_sycl_buffer_from_ptr(int device, void * ptr, size_t size);
 +// larry: DSV41_OPROJ outside a graph (STRATA_TP_OPROJ=2: the decode attention graph in two halves around it) - wo_a the
 +// 2-D weight read as OG slices of OL rows, o / dst device pointers of n columns (OGD * OG floats apart / dst_col_stride
 +// floats apart).  Ordered on the backend's queue (the launcher above if it takes it); false if the shape is not covered.
@@ -4741,7 +4744,49 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #include "ggml-sycl/lightning-indexer.hpp"
  #include "ggml-sycl/conv2d.hpp"
  #include "ggml-sycl/conv2d-dw.hpp"
-@@ -2888,6 +2891,73 @@
+@@ -584,6 +587,7 @@
+     optimize_feature opt_feature;
+     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
+     bool is_usm_system;
++    bool external = false;   // larry: dev_ptr is the caller's (ggml_backend_sycl_buffer_from_ptr): never freed here
+ 
+     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
+         device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
+@@ -593,7 +597,7 @@
+         }
+ 
+     ~ggml_backend_sycl_buffer_context() {
+-        if (dev_ptr != nullptr) {
++        if (dev_ptr != nullptr && !external) {
+             ggml_sycl_set_device(device);
+             if (is_usm_system)
+                 free_aligned_mem_host(dev_ptr);
+@@ -1061,6 +1065,24 @@
+     /* .is_host          = */ NULL,
+ };
+ 
++// larry: a buffer of `device`'s buffer type over memory the caller owns and keeps alive (engine1 pages Level Zero
++// virtual memory under it: the dense weights the other cards also hold); tensors bound to it get the usual extras
++ggml_backend_buffer_t ggml_backend_sycl_buffer_from_ptr(int device, void * ptr, size_t size) try {
++    ggml_check_sycl();
++    ggml_backend_buffer_type_t buft = ggml_backend_sycl_buffer_type(device);
++    if (!buft || !ptr || !size) return nullptr;
++    ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
++    ggml_sycl_set_device(device);
++    ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(device, ptr, buft_ctx->stream, false);
++    ctx->external = true;
++    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
++}
++catch (sycl::exception const &exc) {
++  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
++            << ", line:" << __LINE__ << std::endl;
++  return nullptr;
++}
++
+ ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
+     static std::mutex mutex;
+     std::lock_guard<std::mutex> lock(mutex);
+@@ -2888,6 +2910,73 @@
    std::exit(1);
  }
  
@@ -4815,7 +4860,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  inline void ggml_sycl_op_mul_mat_sycl(
      ggml_backend_sycl_context & ctx,
      const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
-@@ -2918,7 +2988,11 @@
+@@ -2918,7 +3007,11 @@
  #ifdef GGML_SYCL_F16
      bool use_fp16 = true;  // TODO(Yu) SYCL capability check
  #else
@@ -4828,7 +4873,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #endif
  
  #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
-@@ -2948,18 +3022,22 @@
+@@ -2948,18 +3041,22 @@
      if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
          row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
          ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
@@ -4854,7 +4899,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
          ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
          if (src1->type != GGML_TYPE_F16) {
-@@ -3144,6 +3222,84 @@
+@@ -3144,6 +3241,84 @@
      }
  }
  
@@ -4939,7 +4984,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
      GGML_ASSERT( dst->type == GGML_TYPE_I32);
-@@ -3156,6 +3312,25 @@
+@@ -3156,6 +3331,25 @@
      const int64_t ncols = dst->src[0]->ne[0];
      const int64_t nrows = ggml_nrows(dst->src[0]);
  
@@ -4965,7 +5010,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
      argmax_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
  }
  
-@@ -4661,12 +4836,24 @@
+@@ -4661,12 +4855,24 @@
  static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
@@ -4991,7 +5036,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4921,359 @@
+@@ -4734,6 +4940,359 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -5351,7 +5396,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +5287,9 @@
+@@ -4747,6 +5306,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -5361,7 +5406,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5114,6 +5657,108 @@
+@@ -5114,6 +5676,108 @@
      }
  }
  
@@ -5470,7 +5515,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5134,6 +5779,48 @@
+@@ -5134,6 +5798,48 @@
              return;
          }
      }
@@ -5519,7 +5564,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +6121,61 @@
+@@ -5434,6 +6140,61 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -5581,7 +5626,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6718,33 @@
+@@ -5976,6 +6737,33 @@
      return skip;
  }
  
@@ -5615,7 +5660,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6835,29 @@
+@@ -6066,6 +6854,29 @@
              continue;
          }
  
@@ -5645,7 +5690,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6911,64 @@
+@@ -6119,6 +6930,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -5710,7 +5755,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +7079,12 @@
+@@ -6229,6 +7098,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -5723,7 +5768,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7325,39 @@
+@@ -6469,6 +7344,39 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
