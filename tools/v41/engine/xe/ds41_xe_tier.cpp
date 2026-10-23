@@ -403,6 +403,11 @@ struct Ds41XeImpl {
     // evicted, S skipped); STRATA_XE_CPU_TWICE=1 also runs each layer's CPU experts again (weights hot in the caches)
     std::FILE* cpu_log = nullptr;
     int64_t tp_pass = 0;
+    // larry, engine1, STRATA_XE_USAGE_OUT=<file> (diagnostics): per routed expert the TP passes that ran it (a job) and its
+    // picks (tokens), written at close with its card when decode began (-1: the CPU pool) and its bytes - the input of
+    // placement studies (bench/engine1/place.py)
+    std::vector<uint32_t> use_jobs, use_picks;
+    std::vector<int8_t> use_card;
     XeJob* rt_jobs = nullptr;          ///< dense card: [cards][kMaxDecodeJobs] - the routed call's jobs, per card
     XeJob* rt_null = nullptr;          ///< dense card: [cards] - each card's null job (the lists' padding)
     RtHdr* rt_hdr = nullptr;           ///< pinned: the route kernel's counts and CPU entries
@@ -3902,6 +3907,20 @@ int Ds41XeTier::tp_cpu_part(int64_t layer, int nt, const int32_t* ids, const flo
     }
     if (im.cpu_log && layer == 0) std::fprintf(im.cpu_log, "T %lld %d\n", (long long) im.tp_pass, nt);
     group(ids, w, nt, (int) im.g.top_k, im.g.n_experts, ents, first);
+    static const bool use_on = std::getenv("STRATA_XE_USAGE_OUT") != nullptr;
+    if (use_on) {
+        if (im.use_jobs.empty()) {   // the placement as decode begins (before any promotion)
+            const size_t ne = (size_t) (im.g.n_layers * im.g.n_experts);
+            im.use_jobs.assign(ne, 0);
+            im.use_picks.assign(ne, 0);
+            im.use_card.assign(im.card_of.begin(), im.card_of.begin() + (std::ptrdiff_t) ne);
+        }
+        for (const Ent& en : ents) {
+            const size_t key = (size_t) im.key(layer, en.e);
+            ++im.use_jobs[key];
+            im.use_picks[key] += (uint32_t) en.nt;
+        }
+    }
     cpu_list.clear();
     for (const Ent& en : ents) {
         const size_t key = (size_t) im.key(layer, en.e);
@@ -4161,6 +4180,19 @@ void Ds41XeTier::close() {
     }
     if (im.pc_bounce) { sycl::free(im.pc_bounce, im.ctx); im.pc_bounce = nullptr; }
     if (im.cpu_log) { std::fclose(im.cpu_log); im.cpu_log = nullptr; }
+    if (const char* uo = std::getenv("STRATA_XE_USAGE_OUT"); uo && !im.use_jobs.empty()) {
+        if (std::FILE* f = std::fopen(uo, "w")) {   // "U layer expert jobs picks card bytes", after "P passes"
+            std::fprintf(f, "P %lld\n", (long long) im.tp_pass);
+            for (int64_t l = 0; l < im.g.n_layers; ++l)
+                for (int64_t e = 0; e < im.g.n_experts; ++e) {
+                    if (!im.g.routed(l)) continue;
+                    const size_t key = (size_t) im.key(l, e);
+                    std::fprintf(f, "U %lld %lld %u %u %d %zu\n", (long long) l, (long long) e, im.use_jobs[key], im.use_picks[key],
+                                 (int) im.use_card[key], im.bbytes(l, e));
+                }
+            std::fclose(f);
+        }
+    }
     if (im.pc_done || im.pc_busy_skip)
         std::fprintf(stderr, "xe tier: promotion cache: %lld promoted, %lld hits, %lld evicted, %lld skipped (cards busy), %lld bad; "
                      "%lld chunks, host push %.1f ms, poll %.1f ms\n", (long long) im.pc_done, (long long) im.pc_hit, (long long) im.pc_evicted,

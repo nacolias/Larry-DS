@@ -331,82 +331,88 @@ inline void gu_any(const XeJob& jb, const XSet& xs, const int* rows, int row, in
 }
 
 // larry (STRATA_XE_JOBNT, see xe_experts_q8): only the jobs of lo..hi tokens run here (the others are another launch's),
-// and jn: a 1-token job runs the 1-token form
+// and jn: a 1-token job runs the 1-token form.  nj_dev (engine1): the real job count on the device (the slots past it
+// are null); jst > 0: a launch of jst job slots, each work-group taking jobs j, j + jst, ... (0: one slot a job)
 template <int NT, int LPR = 4>   // LPR 16: one row per sub-group, 4x the sub-groups (decode: few jobs fill the card)
 sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 Hq, int n_embd, int n_ff, float L,
-                       int lo = 1, int hi = kMaxJobTok, bool jn = false) {
+                       int lo = 1, int hi = kMaxJobTok, bool jn = false, const int32_t* nj_dev = nullptr, int jst = 0) {
     const int rb = n_ff / 32;
     constexpr int RPS = SG / LPR, WG = 32 / RPS * SG;   // rows per sub-group, lanes per work-group (32 rows)
-    const sycl::nd_range<1> nr(sycl::range<1>((size_t) nj * rb * WG), sycl::range<1>(WG));
+    const int js = jst > 0 && jst < nj ? jst : nj;
+    const sycl::nd_range<1> nr(sycl::range<1>((size_t) js * rb * WG), sycl::range<1>(WG));
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(NT * 32), h);
         auto kern = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int wg = (int) it.get_group(0);
-            const int j = wg / rb, r0 = (wg % rb) * 32;
+            const int r0 = (wg % rb) * 32;
             const sycl::sub_group sg = it.get_sub_group();
             const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
             const int rg = lane / LPR, bl = lane % LPR;
             const int row = r0 + s * RPS + rg;
-            const XeJob& jb = jobs[j];
-            const int nt = jb.nt;
-            if (nt < lo || nt > hi) return;   // a null job (a graph's padding) or another launch's: the work-group leaves together
-            const XSet xs{X.q, X.d, X.s, n_embd};
-            int rows[NT];
+            const int nlim = nj_dev ? sycl::min(nj, *nj_dev) : nj;
+            for (int j = wg / rb; j < nlim; j += js) {   // (one pass of the loop unless jst < nj)
+                if (j >= wg / rb + js) sycl::group_barrier(it.get_group());   // a later job: every read of sh by the previous one done
+                const XeJob& jb = jobs[j];
+                const int nt = jb.nt;
+                if (nt < lo || nt > hi) continue;   // a null job (a graph's padding) or another launch's: the work-group together
+                const XSet xs{X.q, X.d, X.s, n_embd};
+                int rows[NT];
 #pragma unroll
-            for (int t = 0; t < NT; ++t) rows[t] = jb.tok[t < nt ? t : 0];
-            float acc[2][NT];
+                for (int t = 0; t < NT; ++t) rows[t] = jb.tok[t < nt ? t : 0];
+                float acc[2][NT];
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+                for (int i = 0; i < 2; ++i)
 #pragma unroll
-                for (int t = 0; t < NT; ++t) acc[i][t] = 0.f;
-            if constexpr (NT > 1) {
-                if (jn && nt == 1) {
-                    float a1[2][1] = {{0.f}, {0.f}};
-                    gu_any<1, LPR>(jb, xs, rows, row, bl, n_ff, 1, a1);
-                    acc[0][0] = a1[0][0];
-                    acc[1][0] = a1[1][0];
+                    for (int t = 0; t < NT; ++t) acc[i][t] = 0.f;
+                if constexpr (NT > 1) {
+                    if (jn && nt == 1) {
+                        float a1[2][1] = {{0.f}, {0.f}};
+                        gu_any<1, LPR>(jb, xs, rows, row, bl, n_ff, 1, a1);
+                        acc[0][0] = a1[0][0];
+                        acc[1][0] = a1[1][0];
+                    } else {
+                        gu_any<NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+                    }
                 } else {
                     gu_any<NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
                 }
-            } else {
-                gu_any<NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
-            }
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+                for (int i = 0; i < 2; ++i)
 #pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                    if (t >= nt) continue;   // the job's tokens only (nt is the sub-group's: one job a work-group)
-                    float v = acc[i][t];
+                    for (int t = 0; t < NT; ++t) {
+                        if (t >= nt) continue;   // the job's tokens only (nt is the sub-group's: one job a work-group)
+                        float v = acc[i][t];
 #pragma unroll
-                    for (int o = 1; o < LPR; o <<= 1) v += sycl::permute_group_by_xor(sg, v, o);
-                    acc[i][t] = v;
-                }
-            if (bl == 0) {
+                        for (int o = 1; o < LPR; o <<= 1) v += sycl::permute_group_by_xor(sg, v, o);
+                        acc[i][t] = v;
+                    }
+                if (bl == 0) {
 #pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                    if (t < nt) {
-                        const float g = sycl::fmin(acc[0][t], L);
-                        const float u = sycl::fmax(-L, sycl::fmin(acc[1][t], L));
-                        sh[t * 32 + s * RPS + rg] = g / (1.0f + sycl::exp(-g)) * u;
+                    for (int t = 0; t < NT; ++t) {
+                        if (t < nt) {
+                            const float g = sycl::fmin(acc[0][t], L);
+                            const float u = sycl::fmax(-L, sycl::fmin(acc[1][t], L));
+                            sh[t * 32 + s * RPS + rg] = g / (1.0f + sycl::exp(-g)) * u;
+                        }
                     }
                 }
-            }
-            sycl::group_barrier(it.get_group());
-            // sub-group s quantises token slot s's 32 values: lane = values 2 lane, 2 lane + 1
-            if (s < nt) {
-                const float h0 = sh[s * 32 + 2 * lane], h1 = sh[s * 32 + 2 * lane + 1];
-                const float amax = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(h0), sycl::fabs(h1)), sycl::maximum<float>());
-                const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
-                const int q0 = (int) sycl::rint(h0 * id), q1 = (int) sycl::rint(h1 * id);
-                const int ps = q0 + q1;
-                const int slo = sycl::reduce_over_group(sg, lane < 8 ? ps : 0, sycl::plus<int>());
-                const int shi = sycl::reduce_over_group(sg, lane < 8 ? 0 : ps, sycl::plus<int>());
-                const size_t hrow = (size_t) j * kMaxJobTok + s;
-                *reinterpret_cast<uint16_t*>(Hq.q + hrow * n_ff + r0 + 2 * lane) = (uint16_t) ((q0 & 0xFF) | ((q1 & 0xFF) << 8));
-                if (lane == 0) {
-                    Hq.d[hrow * (n_ff / 32) + r0 / 32] = amax / 127.0f;
-                    Hq.s[hrow * (n_ff / 16) + r0 / 16] = slo;
-                    Hq.s[hrow * (n_ff / 16) + r0 / 16 + 1] = shi;
+                sycl::group_barrier(it.get_group());
+                // sub-group s quantises token slot s's 32 values: lane = values 2 lane, 2 lane + 1
+                if (s < nt) {
+                    const float h0 = sh[s * 32 + 2 * lane], h1 = sh[s * 32 + 2 * lane + 1];
+                    const float amax = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(h0), sycl::fabs(h1)), sycl::maximum<float>());
+                    const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+                    const int q0 = (int) sycl::rint(h0 * id), q1 = (int) sycl::rint(h1 * id);
+                    const int ps = q0 + q1;
+                    const int slo = sycl::reduce_over_group(sg, lane < 8 ? ps : 0, sycl::plus<int>());
+                    const int shi = sycl::reduce_over_group(sg, lane < 8 ? 0 : ps, sycl::plus<int>());
+                    const size_t hrow = (size_t) j * kMaxJobTok + s;
+                    *reinterpret_cast<uint16_t*>(Hq.q + hrow * n_ff + r0 + 2 * lane) = (uint16_t) ((q0 & 0xFF) | ((q1 & 0xFF) << 8));
+                    if (lane == 0) {
+                        Hq.d[hrow * (n_ff / 32) + r0 / 32] = amax / 127.0f;
+                        Hq.s[hrow * (n_ff / 16) + r0 / 16] = slo;
+                        Hq.s[hrow * (n_ff / 16) + r0 / 16 + 1] = shi;
+                    }
                 }
             }
         };
@@ -471,10 +477,11 @@ inline void down_any(const XeJob& jb, const XSet& hs, int j, int row, int bl, in
     else down_job<kQ20, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
 }
 
-// jn (larry, STRATA_XE_JOBNT): a 1- or 2-token job of a wider form runs the 1- / 2-token form
+// jn (larry, STRATA_XE_JOBNT): a 1- or 2-token job of a wider form runs the 1- / 2-token form; nj_dev (engine1): the
+// real job count on the device
 template <int NT, int NTOK, int LPR = 4>   // NT: tokens per job (bound), NTOK: tokens of the call (bound)
 sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq, float* OUT, int n_embd, int n_ff,
-                    bool accumulate, bool jn = false) {
+                    bool accumulate, bool jn = false, const int32_t* nj_dev = nullptr) {
     const int rows_wg = kDownSgPerWg * (SG / LPR);
     const sycl::nd_range<1> nr(sycl::range<1>((size_t) (n_embd / rows_wg) * kDownSgPerWg * SG), sycl::range<1>(kDownSgPerWg * SG));
     return q.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -486,7 +493,8 @@ sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq
         float o[NTOK];
 #pragma unroll
         for (int t = 0; t < NTOK; ++t) o[t] = 0.f;
-        for (int j = 0; j < nj; ++j) {
+        const int nlim = nj_dev ? sycl::min(nj, *nj_dev) : nj;
+        for (int j = 0; j < nlim; ++j) {
             const XeJob& jb = jobs[j];
             const int nt = jb.nt;
             if (nt == 0) continue;   // a null job (padding)
@@ -506,6 +514,58 @@ sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq
                     *p = accumulate ? *p + o[t] : o[t];
                 }
         }
+    });
+}
+
+// larry, engine1 (STRATA_XE_DOWN_SPLIT): down with a work-group's sub-groups on the SAME 4 output rows, sub-group s
+// taking jobs s, s + 8, ...; their sums added in local memory in sub-group order (deterministic) - 8x the sub-groups
+// of down_q8, whose sub-groups each ran every job of the call in turn (latency-bound at a handful of jobs a card)
+template <int NT, int NTOK, int LPR = 4>
+sycl::event down_q8s(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq, float* OUT, int n_embd, int n_ff,
+                     bool accumulate, bool jn, const int32_t* nj_dev) {
+    constexpr int RPW = SG / LPR;   // rows a work-group (= a sub-group's)
+    const sycl::nd_range<1> nr(sycl::range<1>((size_t) (n_embd / RPW) * kDownSgPerWg * SG), sycl::range<1>(kDownSgPerWg * SG));
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) kDownSgPerWg * RPW * NTOK), h);
+        h.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+            const int rg = lane / LPR, bl = lane % LPR;
+            const int row = (int) it.get_group(0) * RPW + rg;
+            const XSet hs{Hq.q, Hq.d, Hq.s, n_ff};
+            float o[NTOK];
+#pragma unroll
+            for (int t = 0; t < NTOK; ++t) o[t] = 0.f;
+            const int nlim = nj_dev ? sycl::min(nj, *nj_dev) : nj;
+            for (int j = s; j < nlim; j += kDownSgPerWg) {
+                const XeJob& jb = jobs[j];
+                const int nt = jb.nt;
+                if (nt == 0) continue;
+                if constexpr (NT > 1) {
+                    if (jn && nt == 1) { down_any<1, NTOK, LPR>(jb, hs, j, row, bl, n_embd, 1, sg, o); continue; }
+                    if constexpr (NT > 2) {
+                        if (jn && nt == 2) { down_any<2, NTOK, LPR>(jb, hs, j, row, bl, n_embd, 2, sg, o); continue; }
+                    }
+                }
+                down_any<NT, NTOK, LPR>(jb, hs, j, row, bl, n_embd, nt, sg, o);
+            }
+            if (bl == 0) {
+#pragma unroll
+                for (int t = 0; t < NTOK; ++t) part[((size_t) s * RPW + rg) * NTOK + t] = o[t];
+            }
+            sycl::group_barrier(it.get_group());
+            if (s == 0 && bl == 0) {
+#pragma unroll
+                for (int t = 0; t < NTOK; ++t)
+                    if (t < ntok) {
+                        float v = 0.f;
+#pragma unroll
+                        for (int k = 0; k < kDownSgPerWg; ++k) v += part[((size_t) k * RPW + rg) * NTOK + t];
+                        float* p = OUT + (size_t) t * n_embd + row;
+                        *p = accumulate ? *p + v : v;
+                    }
+            }
+        });
     });
 }
 
@@ -707,7 +767,7 @@ sycl::event xe_dequant_planar_f16(sycl::queue& q, int type, const uint8_t* mat, 
 }
 
 sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
-                          int n_ff, float swiglu_limit, bool accumulate, int max_nt) {
+                          int n_ff, float swiglu_limit, bool accumulate, int max_nt, const int32_t* nj_dev, int jst, bool split) {
     if (max_nt <= 0) max_nt = ntok;   // the most tokens any job has: the kernels' register footprint follows it
     const float Lm = swiglu_limit;
     if (ntok <= 1) {   // STRATA_XE_LPR (default 4; 16 measured slower: cards busy 75 -> 82 us a layer)
@@ -729,18 +789,21 @@ sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, X
     static const int jobnt = [] { const char* e = std::getenv("STRATA_XE_JOBNT"); return e ? std::atoi(e) : 0; }();
     if (jobnt > 0) {
         const bool two = jobnt >= 2;
-        if (two) gate_up_q8<1>(q, jobs, nj, X, H, n_embd, n_ff, Lm, 1, 1);
+        if (two) gate_up_q8<1>(q, jobs, nj, X, H, n_embd, n_ff, Lm, 1, 1, false, nj_dev, jst);
         const int lo = two ? 2 : 1;
         if (max_nt <= 2) {
-            gate_up_q8<2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true);
-            return down_q8<2, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true);
+            gate_up_q8<2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
+            if (split) return down_q8s<2, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+            return down_q8<2, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
         }
         if (max_nt <= 4) {
-            gate_up_q8<4>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true);
-            return down_q8<4, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true);
+            gate_up_q8<4>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
+            if (split) return down_q8s<4, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+            return down_q8<4, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
         }
-        gate_up_q8<kMaxJobTok>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true);
-        return down_q8<kMaxJobTok, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true);
+        gate_up_q8<kMaxJobTok>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
+        if (split) return down_q8s<kMaxJobTok, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+        return down_q8<kMaxJobTok, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
     }
     if (max_nt <= 2) {
         gate_up_q8<2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);

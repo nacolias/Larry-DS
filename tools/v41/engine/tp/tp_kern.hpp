@@ -20,6 +20,11 @@
 #include "dsv41-dec.hpp"
 #define fastmv tpfmv
 #include "fastmv.hpp"
+namespace tpfmv {
+// tp_fastmv.cpp: a Q6K_R8 mat-vec in a named form (0 fastmv's dispatch, 1-4 dp4a rows 2 / 4 x normal / 256 registers,
+// 5-8 XMX with K split 1 / 2 / 4 / 8: xT / xdT in quant_xT's layout); false when the form cannot take the shape
+bool launch_form(sycl::queue & q, const Args & a, const sycl::half * xT, const float * xdT, int form);
+}  // namespace tpfmv
 #include "xe_kernels.hpp"   // the xe tier's planar int8 expert kernels (libds41_xe) and their job format
 
 namespace tpk {
@@ -185,6 +190,8 @@ struct HcOut {
     float * xn = nullptr, * pre = nullptr, * post = nullptr, * comb = nullptr;
     int8_t * xq = nullptr;   // [n][D] (null: no q8)
     float * xd = nullptr;    // [n][D / 32]
+    sycl::half * xT = nullptr;   // optional: the same q8 in the XMX mat-vecs' layout [D][8] (fp16 integers) ...
+    float * xdT = nullptr;       // ... and its scales [D / 32][8]
 };
 
 struct HcIn {
@@ -261,8 +268,16 @@ inline sycl::event hc_fab_t(sycl::queue & q, const HcIn & I, const HcOut & F) {
                     am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 2));
                     am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 4));
                     if (i < D) {
-                        *(uint32_t *) (O.xq + t * D + i) = tpdec::q8_pack4(xv.x(), xv.y(), xv.z(), xv.w(), tpdec::q8_inv(am));
+                        const float id = tpdec::q8_inv(am);
+                        *(uint32_t *) (O.xq + t * D + i) = tpdec::q8_pack4(xv.x(), xv.y(), xv.z(), xv.w(), id);
                         if ((l & 7) == 0) O.xd[t * (D / 32) + i / 32] = am / 127.0f;
+                        if (O.xT) {
+                            O.xT[(i + 0) * 8 + t] = (sycl::half) sycl::rint(xv.x() * id);
+                            O.xT[(i + 1) * 8 + t] = (sycl::half) sycl::rint(xv.y() * id);
+                            O.xT[(i + 2) * 8 + t] = (sycl::half) sycl::rint(xv.z() * id);
+                            O.xT[(i + 3) * 8 + t] = (sycl::half) sycl::rint(xv.w() * id);
+                            if ((l & 7) == 0) O.xdT[(i / 32) * 8 + t] = am / 127.0f;
+                        }
                     }
                 }
             }
@@ -407,7 +422,7 @@ inline sycl::event router(sycl::queue & q, const RouterArgs & a) {
 // ================================================================== the shared expert's SwiGLU (dsv41-fused.cpp's
 // swiglu_q8): y [n][2N] = gate rows | up rows -> h [n][N] = silu(min(g, L)) * clamp(u, -L, L) and h's q8
 inline sycl::event swiglu_q8(sycl::queue & q, const float * y, int64_t N, int64_t n, float lim, float * hout, int8_t * hq,
-                             float * hd) {
+                             float * hd, sycl::half * hT = nullptr, float * hdT = nullptr) {   // hT / hdT: the XMX layout too
     const int64_t nblk = N / 32;
     return q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * nblk * 16)), sycl::range<1>(16)),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -429,6 +444,11 @@ inline sycl::event swiglu_q8(sycl::queue & q, const float * y, int64_t N, int64_
         const float id = tpdec::q8_inv(am);
         *(uint16_t *) (hq + t * N + i) = (uint16_t) (((int) sycl::rint(o[0] * id) & 0xFF) | (((int) sycl::rint(o[1] * id) & 0xFF) << 8));
         if (lane == 0) hd[t * nblk + bk] = am / 127.0f;
+        if (hT) {
+            hT[i * 8 + t] = (sycl::half) sycl::rint(o[0] * id);
+            hT[(i + 1) * 8 + t] = (sycl::half) sycl::rint(o[1] * id);
+            if (lane == 0) hdT[bk * 8 + t] = am / 127.0f;
+        }
     });
 }
 
@@ -581,9 +601,10 @@ struct TpExp {   // where (layer, expert) lives: the rank holding it (-1: the CP
 };
 
 // jobs[0..nj_max): this card's experts in pick order (token-major), then null jobs (nt = 0: the expert kernels skip
-// them - the pass graph launches them for nj_max); *need_cpu = whether a pick is on no card
-inline sycl::event route_jobs(sycl::queue & q, const int32_t * ids, const float * wts, int n, int nu, const TpExp * tab, int me,
-                              strata::v41::xe::XeJob * jobs, int nj_max, int32_t * need_cpu) {
+// them - the pass graph launches them for nj_max); need_cpu[0] = whether a pick is on no card, need_cpu[1] = the
+// real job count.  One work-item (passes of more than 64 picks; route_jobs below runs a lane a pick otherwise).
+inline sycl::event route_jobs_serial(sycl::queue & q, const int32_t * ids, const float * wts, int n, int nu, const TpExp * tab, int me,
+                                     strata::v41::xe::XeJob * jobs, int nj_max, int32_t * need_cpu) {
     return q.single_task([=] {
         int nj = 0;
         int32_t ex[64];
@@ -609,7 +630,51 @@ inline sycl::event route_jobs(sycl::queue & q, const int32_t * ids, const float 
                 jb.nt = (uint8_t) (jb.nt + 1);
             }
         for (int j = nj; j < nj_max; ++j) jobs[j].nt = 0;
-        if (need_cpu) *need_cpu = cpu ? 1 : 0;
+        if (need_cpu) { need_cpu[0] = cpu ? 1 : 0; need_cpu[1] = nj; }
+    });
+}
+
+// the same jobs, a lane a pick (the serial form's dependent loads were 4.5 us at 1 token, 15 us at 5): an expert's
+// first pick opens its job (the job index = the first picks before it), and gathers the expert's later picks
+inline sycl::event route_jobs(sycl::queue & q, const int32_t * ids, const float * wts, int n, int nu, const TpExp * tab, int me,
+                              strata::v41::xe::XeJob * jobs, int nj_max, int32_t * need_cpu) {
+    constexpr int WG = 64;
+    const int np = n * nu;
+    if (np > WG) return route_jobs_serial(q, ids, wts, n, nu, tab, me, jobs, nj_max, need_cpu);
+    return q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<int32_t, 1> le(sycl::range<1>(WG), h);   // pick p's expert when this card holds it, else -1
+        sycl::local_accessor<float, 1> lw(sycl::range<1>(WG), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const int p = (int) it.get_local_id(0);
+            int e = -1;
+            bool cpu = false;
+            TpExp x;
+            if (p < np) {
+                const int ee = ids[p];
+                x = tab[ee];
+                if (x.owner == me) e = ee;
+                else if (x.owner < 0) cpu = true;
+                lw[p] = wts[p];
+            }
+            le[p] = e;
+            sycl::group_barrier(it.get_group());
+            bool first = e >= 0;
+            for (int k = 0; k < p && first; ++k) first = le[k] != e;
+            const int jidx = sycl::exclusive_scan_over_group(it.get_group(), first ? 1 : 0, sycl::plus<int>());
+            const int nj = sycl::reduce_over_group(it.get_group(), first ? 1 : 0, sycl::plus<int>());
+            const bool any_cpu = sycl::any_of_group(it.get_group(), cpu);
+            if (first) {
+                strata::v41::xe::XeJob & jb = jobs[jidx];
+                jb.blob = x.blob; jb.up_off = x.up_off; jb.down_off = x.down_off;
+                jb.gu_type = x.gu_type; jb.d_type = x.d_type; jb.gu_row = x.gu_row; jb.d_row = x.d_row;
+                int nt = 0;
+                for (int k = p; k < np; ++k)
+                    if (le[k] == e) { jb.tok[nt] = k / nu; jb.w[nt] = lw[k]; ++nt; }
+                jb.nt = (uint8_t) nt;
+            }
+            for (int j = nj + p; j < nj_max; j += WG) jobs[j].nt = 0;
+            if (p == 0 && need_cpu) { need_cpu[0] = any_cpu ? 1 : 0; need_cpu[1] = nj; }
+        });
     });
 }
 

@@ -1364,7 +1364,7 @@ diff --git a/ggml/src/ggml-sycl/dsv41-dec.hpp b/ggml/src/ggml-sycl/dsv41-dec.hpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-dec.hpp
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,792 @@
 +// ggml-sycl/dsv41-dec.hpp - larry (DeepSeek-V4.1 on Intel Arc B70): the decode / verify-width (< 8 queries) attention
 +// core as three kernels, pointer-based (dsv41-fused.cpp wraps them as ggml ops; an engine without ggml can call them).
 +//
@@ -1496,6 +1496,8 @@ new file mode 100644
 +    int8_t * q = nullptr;       // [n][K]
 +    float * d = nullptr;        // [n][K / 32]
 +    int K = 0, n = 0;
++    sycl::half * xT = nullptr;  // optional (larry, engine1): q in the XMX mat-vecs' layout [K][8] (fp16 integers) ...
++    float * xdT = nullptr;      // ... and d as [K / 32][8]
 +};
 +
 +template <int WG>
@@ -1540,6 +1542,12 @@ new file mode 100644
 +                const uint16_t pk = (uint16_t) (((int) sycl::rint(v0 * id) & 0xFF) | (((int) sycl::rint(v1 * id) & 0xFF) << 8));
 +                *(uint16_t *) (A.q + (size_t) t * A.K + bk * 32 + 2 * lane) = pk;
 +                if (lane == 0) A.d[(size_t) t * nblk + bk] = am / 127.0f;
++                if (A.xT) {
++                    const size_t k = (size_t) (bk * 32 + 2 * lane);
++                    A.xT[k * 8 + t] = (sycl::half) sycl::rint(v0 * id);
++                    A.xT[(k + 1) * 8 + t] = (sycl::half) sycl::rint(v1 * id);
++                    if (lane == 0) A.xdT[(size_t) bk * 8 + t] = am / 127.0f;
++                }
 +            }
 +        });
 +    });
@@ -1654,6 +1662,10 @@ new file mode 100644
 +    int hpg = 0;
 +    int8_t * oq = nullptr;
 +    float * od = nullptr;
++    // optional (larry, engine1): the same q8 in the XMX mat-vecs' layout, per group h / hpg [K8][8] (fp16 integers) and
++    // its scales [K8 / 32][8]
++    sycl::half * oT = nullptr;
++    float * odT = nullptr;
 +};
 +
 +inline int n_chunks(int M) { return (M + XKC - 1) / XKC; }
@@ -1921,6 +1933,12 @@ new file mode 100644
 +                    sycl::uint2(q8_pack4(acc[8 * g], acc[8 * g + 1], acc[8 * g + 2], acc[8 * g + 3], id),
 +                                q8_pack4(acc[8 * g + 4], acc[8 * g + 5], acc[8 * g + 6], acc[8 * g + 7], id));
 +                if ((lane & 3) == 0) A.od[r8 * (K8 / 32) + k / 32] = am / 127.0f;
++                if (A.oT) {
++                    const size_t gb = (size_t) (hh / A.hpg) * K8;
++#pragma unroll
++                    for (int e = 0; e < 8; ++e) A.oT[(gb + k + e) * 8 + b] = (sycl::half) sycl::rint(acc[8 * g + e] * id);
++                    if ((lane & 3) == 0) A.odT[(gb + k) / 32 * 8 + b] = am / 127.0f;
++                }
 +            }
 +        }
 +    });
@@ -3250,7 +3268,7 @@ diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fastmv.cpp
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,770 @@
 +// ggml-sycl/fastmv.cpp - see fastmv.hpp.
 +#include "fastmv.hpp"
 +
@@ -3838,8 +3856,9 @@ new file mode 100644
 +#pragma unroll
 +                    for (int jj = 0; jj < 4; ++jj) {   // 32-value block j: scale groups 2 j, 2 j + 1, activation scale j
 +                        const int j = 4 * ipx + jj;
-+                        mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> acc;
-+                        mx::joint_matrix_fill(sg, acc, 0.0f);
++                        const sycl::float4 * xdp = reinterpret_cast<const sycl::float4 *>(xdg + (b * 8 + j) * 8);
++                        const sycl::float4 x0 = xdp[0], x1 = xdp[1];
++                        const float xs[8] = {x0.x(), x0.y(), x0.z(), x0.w(), x1.x(), x1.y(), x1.z(), x1.w()};
 +#pragma unroll
 +                        for (int mm = 0; mm < 2; ++mm) {   // values 16 m .. 16 m + 15: scale group m
 +                            const int m = 2 * j + mm;
@@ -3847,16 +3866,18 @@ new file mode 100644
 +                            const u4 qlw = QL[2 * (k & 1) + hh];
 +                            const u4 qhw = QH[hh];
 +                            const int8_t scm = (int8_t) ((SC[m / 4] >> (8 * (m % 4))) & 0xFF);
-+                            const sycl::half sh = (sycl::half) (float) scm;
-+                            const h2 s2(sh, sh);
++                            // B = q - 32 (exact in fp16; larry, engine1: the scale is applied after the MAD - (q - 32) * sc
++                            // reaches 4064, past fp16's exact integers, and a scaled B moved the decode-path PPL ~+0.005)
++                            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> acc;
++                            mx::joint_matrix_fill(sg, acc, 0.0f);
 +                            mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::b, 16, 16, mx::layout::row_major> mb;
 +                            auto wb = sycl::ext::oneapi::detail::get_wi_data(sg, mb);
 +#pragma unroll
 +                            for (int wd = 0; wd < 4; ++wd) {   // 4 values a word
 +                                const uint32_t nib = (k & 2) ? ((qlw[wd] >> 4) & 0x0F0F0F0Fu) : (qlw[wd] & 0x0F0F0F0Fu);
 +                                const uint32_t q6 = nib | (((qhw[wd] >> (2 * k)) & 0x03030303u) << 4);
-+                                const h2 lo = (sycl::bit_cast<h2>((q6 & 0x00FF00FFu) | 0x64006400u) - off) * s2;          // v, v + 2
-+                                const h2 hi = (sycl::bit_cast<h2>(((q6 >> 8) & 0x00FF00FFu) | 0x64006400u) - off) * s2;   // v + 1, v + 3
++                                const h2 lo = sycl::bit_cast<h2>((q6 & 0x00FF00FFu) | 0x64006400u) - off;          // v, v + 2
++                                const h2 hi = sycl::bit_cast<h2>(((q6 >> 8) & 0x00FF00FFu) | 0x64006400u) - off;   // v + 1, v + 3
 +                                wb[4 * wd + 0] = lo[0]; wb[4 * wd + 1] = hi[0]; wb[4 * wd + 2] = lo[1]; wb[4 * wd + 3] = hi[1];
 +                            }
 +                            mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::a, 8, 16, mx::layout::row_major> ma;
@@ -3865,14 +3886,12 @@ new file mode 100644
 +#pragma unroll
 +                            for (int r = 0; r < 8; ++r) wa[r] = a8[r];
 +                            mx::joint_matrix_mad(sg, acc, ma, mb, acc);
-+                        }
-+                        // the block's exact integer sums, times xd[token] * d[row]
-+                        const sycl::float4 * xdp = reinterpret_cast<const sycl::float4 *>(xdg + (b * 8 + j) * 8);
-+                        const sycl::float4 x0 = xdp[0], x1 = xdp[1];
-+                        const float xs[8] = {x0.x(), x0.y(), x0.z(), x0.w(), x1.x(), x1.y(), x1.z(), x1.w()};
-+                        auto wc = sycl::ext::oneapi::detail::get_wi_data(sg, acc);
++                            // the 16 values' exact integer sums, times sc[group] * d[row] * xd[token]
++                            const float sd = (float) scm * d;
++                            auto wc = sycl::ext::oneapi::detail::get_wi_data(sg, acc);
 +#pragma unroll
-+                        for (int i = 0; i < 8; ++i) c[i] += (float) wc[i] * (xs[i] * d);
++                            for (int i = 0; i < 8; ++i) c[i] += (float) wc[i] * (xs[i] * sd);
++                        }
 +                    }
 +                }
 +            }

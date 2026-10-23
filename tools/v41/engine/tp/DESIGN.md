@@ -1,8 +1,8 @@
 # engine1 - DeepSeek-V4.1 decode / verify on N cards (tensor parallel), host out of the loop
 
 Status: phases A-D done; in the engine behind STRATA_TP=N (default 0), in the service since 2026-10-23 02:35
-(STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02, promotions in time for the next pass since 17:31 - see the
-status sections at the end.  User go-ahead
+(STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02, promotions in time for the next pass since 17:31, the verify
+pass's kernel round since 20:35 - see the status sections at the end.  User go-ahead
 2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card count).  Mirror of
 larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
 
@@ -276,3 +276,55 @@ What is left of the CPU pool's share: ~40 % of its experts are an expert's first
 only a faster CPU part or routing prediction); more slots (card 0 has ~2 GiB free in decode) would take ~6 % more of
 the rest at MIN 2 (`pcsim.py`).  The service drops the promotion cache at every batch prompt (the flex regions become
 the prompt's prefetch buffers), so its sessions start cold more often than these runs.
+
+## Status 2026-10-23 ~20:35 (the verify pass's own kernels, and where the rest of its time goes)
+
+Where a pass's GPU time goes, measured two ways: `tp_bench` eager under unitrace (each kernel's device time) and
+`STRATA_TP_STAMP_LAYER=l` - a kernel reading the sub-group clock after every step of layer l on every card, recorded
+into the pass graph (~0.6 us a stamp; the device-scope clock is not supported on the B70, the sub-group one ticks
+~2790 a us with the clocks pinned and agrees across kernels); `-1` stamps every layer.  The cards are busy all the
+pass: the kernel sum per card-layer equals the pass time (325 us at 1 token, 556 at 5).  At 5 tokens a card-layer
+(bench, layer 20): Q6_K mat-vecs ~165 us (the dp4a kernels slow 30-60 % at 4-6 columns), routed experts 122-193,
+attention 55, the indexer 84 and the compressor 45 (layer 20 has both), the two all-reduce copies 16.5 us each (PCIe:
+~26 GB/s out of a card - `STRATA_TP_PUSH`'s kernel stores gain nothing), the two hc steps 15 each, the router mat-vec 21.
+
+Done (all bit-identical unless noted):
+
+* `route_jobs` runs a lane a pick (a work-group: dedup + scan in local memory) - the one-work-item form's dependent
+  loads were 4.5 us at 1 token, 15 at 5 (a pass -0.08 .. -0.44 ms by width).
+* The expert kernels stop at route_jobs' real job count (in `need_cpu[1]`) and gate/up is launched for 8 job slots,
+  each work-group looping over the jobs (`STRATA_TP_NJ_DEV`, `STRATA_TP_JOB_GRID`; the null slots of n x 6 were
+  dispatched and walked): a 5-token pass -1 %.
+* The Q6_K mat-vecs take a form per shape and width (`STRATA_TP_MV_TUNE`): fastmv's dispatch, the dp4a kernel's row
+  blockings (2 / 4 rows, normal / 256 registers) or the XMX kernel with a K split, timed at init on the card's own
+  40 layers (cold weights) in replayed graphs with a small kernel between the launches - the XMX kernels start ~5 us
+  slower after another kernel than after themselves (`bench/fm3/tpmv_bench`), which the first, back-to-back tuning
+  missed.  An XMX form must beat dp4a by its producer's extra cost: the producers (hc step, q_a norm, attention,
+  quant_xT, SwiGLU) write the q8 a second time in the XMX layout when the consumer takes it (the hc step's scattered
+  2-byte stores cost ~3 us, attention's ~2).  At 5 tokens that is XMX for q_b (32.7 -> 24.6 us), wo_b (31.5 -> 24.7)
+  and the shared expert's down (10.3 -> 8.6), dp4a's 4-row form for q_a+kv / wo_a / gate|up.
+* The XMX mat-vec is exact: B = q - 32 and the scale applied after the MAD (a scaled B reaches 4064, past fp16's
+  exact integers, and moved the decode-path PPL ~+0.005); slightly faster too.
+
+Measured (one-shot, service settings, clocks pinned): `tp_bench` 5 tokens 22.96 -> 22.06 ms a pass (-3.9 %), 3 tokens
+-0.8 %; the DSpark essay's cycle at the common width mix 29.70 / 30.17 ms against 30.39 (the mean of five runs of
+today's code, 30.03-31.15).  Decode-path PPL in 5-token passes (exact routing): the tuned forms' KL to fastmv's
+dispatch 0.0029 against the run-to-run floor 0.0027; PPL without the chaotic row 111 2.0073 / 2.0087 vs 2.0059 /
+2.0037.  No gain: the down kernel's jobs split over its sub-groups (`STRATA_XE_DOWN_SPLIT`, +1.9 %: a work-group
+waits for its slowest job), XMX for q_a+kv and wo_a below 6 tokens (their producers' cost).  Also settled: the
+service's 64 promotion chunks a pass cycle as the A/B's 256 (30.05 / 31.15 vs 30.03 / 30.13 / 30.61 ms).
+
+**Where the rest goes: the cards waiting for each other.**  Stamps on every layer of the essay (`tr5_newst`): every
+card waits ~4 ms of a ~24 ms pass at the FFN all-reduce, and card 0 waits 2.2-2.8 ms for the CPU pool; code waits
+~6 ms (CPU 4.7), math ~8.7 (CPU 7.8: its routing leaves VRAM most).  Two patterns: in layers 11-19 and 32 the CPU pool
+has the most experts and every card waits for card 0, which waits for the host; in layers 25-39 card 0 holds almost
+none of the hot experts (11-36 us of expert work against 80-200 on the others) and idles - its cache is the next
+slice of the global ranking after cards 1-3's.  The static part (per layer, the slowest card's average lead) is
+~2.2-2.4 ms a pass on the essay, but a placement re-dealt from one text's usage counts (`STRATA_XE_USAGE_OUT`,
+`bench/engine1/place.py`) does not transfer: built from the essay it loses 1.5 ms on code, from math 2.9 ms on code;
+from code it gains +0.3-0.5 ms on the others.  The experts run near the memory roofline already (fitted: 837 GB/s +
+19 us a job), so the levers are dynamic: replicas of each layer's hottest experts (the top 8 carry 22-29 % of a
+layer's jobs) on card 0's free decode VRAM (~3 GB), handed out per pass by route_jobs to the least-loaded holder
+(card 0 starting at its CPU estimate); and the CPU pool's latency (~455 us for a one-expert layer, ~370 of it the
+expert's bytes at 30 GB/s).
+

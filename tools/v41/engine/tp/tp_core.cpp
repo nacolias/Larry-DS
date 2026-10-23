@@ -6,9 +6,11 @@
 #include "ggml.h"
 
 #include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -149,6 +151,7 @@ struct Mat {
     bool f16 = false;
     int64_t nbt = 0;               // Q6_K: blocks of the plane set (0: N * K / 256) - a row prefix of a bigger tensor
     bool shared = false;           // the engine's memory (rank 0 reading its weights in place), not this core's
+    int8_t form[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // Q6_K: the mat-vec form a pass width n takes (tpfmv::launch_form; 0 = fastmv's dispatch)
 };
 
 struct LW {   // one card's weights of one layer
@@ -226,6 +229,10 @@ struct Card {
     int8_t * oq = nullptr; float * od = nullptr;
     float * oa = nullptr; int8_t * aq = nullptr; float * ad = nullptr;
     float * cy = nullptr, * iq = nullptr, * iw = nullptr;
+    // the XMX mat-vecs' layout of the q8 activations ([K][8] fp16 integers, [K / 32][8] scales): written beside the
+    // q8 rows by their producers in the passes whose consumer takes an XMX form
+    sycl::half * xT = nullptr, * qrT = nullptr, * oT = nullptr, * aT = nullptr, * fT = nullptr, * shT = nullptr;
+    float * xdT = nullptr, * qrdT = nullptr, * odT = nullptr, * adT = nullptr, * fdT = nullptr, * shdT = nullptr;
     tpdec::li_bf16 * qp = nullptr; float * ws = nullptr; uint32_t * bits = nullptr;
     float * score = nullptr, * bmax = nullptr;
     int32_t * tkid = nullptr; uint32_t * tkst = nullptr; int32_t * cand = nullptr;
@@ -244,6 +251,7 @@ struct Card {
     float * ara = nullptr, * arb = nullptr, * eng = nullptr;   // [N][NMAX][D] x 2, [N][NMAX][Rmax]
     int32_t * flags = nullptr;                                 // [N][MAXS]
     int32_t * seq = nullptr, * err = nullptr;                  // [MAXS], [4] (card-local)
+    uint64_t * stamps = nullptr;                               // STRATA_TP_STAMP_LAYER: the clock at each step of that layer
     // graphs: (n, cap1, cap2) -> the recorded pass
     std::map<std::tuple<int, int64_t, int64_t>, sx::command_graph<sx::graph_state::executable>> graphs;
 };
@@ -289,6 +297,21 @@ struct Ds41Tp::Impl {
     double pf[6] = {0, 0, 0, 0, 0, 0};
     int64_t pf_n = 0, pf_cpu_layers = 0;
     double pf_eng = 0;   // STRATA_TP_ENG_ASYNC: the helper's Engram reads (beside the columns above)
+    // STRATA_TP_STAMP_LAYER=l (diagnostic, off by default): a kernel reading the sub-group clock after every step of layer
+    // l on every card, inside the pass graph (~0.6 us each: the steps' graph-mode times, which eager traces do not show);
+    // per 128 passes each card's average per step.  l = -1: every layer (~0.65 ms a pass more), per layer the expert
+    // step, card 0's wait for the CPU pool and the cards' waits at the two cross-card sums.  STRATA_TP_STAMP_TPU: clock
+    // ticks a us (2790 with the clocks pinned).
+    static constexpr int NST = 27;
+    int stamp_l = -2;   // -2 off
+    double st_tpu = 2790.0;
+    std::vector<double> st_acc;   // [card][NST]
+    int64_t st_n = 0;
+    void ST(Card & c, int l, int i) {
+        if (!c.stamps || (stamp_l >= 0 && l != stamp_l)) return;
+        uint64_t * p = c.stamps + (stamp_l < 0 ? (size_t) l * NST : 0) + i;
+        c.q.single_task([=] { *p = sx::clock<sx::clock_scope::sub_group>(); });
+    }
     // STRATA_TP_ENG_ASYNC (default 1): a pass's Engram rows are read by a helper thread while the pass's own thread
     // takes the CPU pool's layers from layer 0 (inline, a CPU-pool layer among layers 0-3 - a quarter of the verify
     // passes - waited ~2 ms behind both Engram layers' rows).  The Engram reader is the dense half's, which nothing
@@ -749,6 +772,12 @@ struct Ds41Tp::Impl {
         // attn_dec_q8's output: o [n][heads][DH] | q8 rows (groups x n) of OGD | scales
         c.o = dalloc<float>(c, n * c.nhk * DH); c.oq = dalloc<int8_t>(c, n * c.nhk * DH); c.od = dalloc<float>(c, n * c.nhk * DH / 32);
         c.oa = dalloc<float>(c, n * c.grp.n() * OL); c.aq = dalloc<int8_t>(c, n * c.grp.n() * OL); c.ad = dalloc<float>(c, n * c.grp.n() * OL / 32);
+        c.xT = dalloc<sycl::half>(c, (size_t) D * 8); c.xdT = dalloc<float>(c, (size_t) D / 32 * 8);
+        c.qrT = dalloc<sycl::half>(c, (size_t) RQ * 8); c.qrdT = dalloc<float>(c, (size_t) RQ / 32 * 8);
+        c.oT = dalloc<sycl::half>(c, (size_t) (c.grp.n() * OGD) * 8); c.odT = dalloc<float>(c, (size_t) (c.grp.n() * OGD) / 32 * 8);
+        c.aT = dalloc<sycl::half>(c, (size_t) (c.grp.n() * OL) * 8); c.adT = dalloc<float>(c, (size_t) (c.grp.n() * OL) / 32 * 8);
+        c.fT = dalloc<sycl::half>(c, (size_t) D * 8); c.fdT = dalloc<float>(c, (size_t) D / 32 * 8);
+        c.shT = dalloc<sycl::half>(c, (size_t) c.fk * 8); c.shdT = dalloc<float>(c, (size_t) c.fk / 32 * 8);
         c.cy = dalloc<float>(c, n * 2 * DH); c.iq = dalloc<float>(c, n * IH * ID); c.iw = dalloc<float>(c, n * IH);
         c.qp = dalloc<tpdec::li_bf16>(c, n * 4096); c.ws = dalloc<float>(c, n * tpdec::LIH);
         c.bits = dalloc<uint32_t>(c, n * (size_t) tpdec::li_words(cmax[1]));
@@ -763,6 +792,7 @@ struct Ds41Tp::Impl {
         c.z = dalloc<float>(c, n * D); c.zn = dalloc<float>(c, n * D); c.zq = dalloc<int8_t>(c, n * D); c.zd = dalloc<float>(c, n * D / 32);
         c.lgt = dalloc<float>(c, n * (size_t) c.vk);
         c.seq = dalloc<int32_t>(c, tpk::MAXS); c.err = dalloc<int32_t>(c, 4);
+        if (stamp_l >= -1) c.stamps = dalloc<uint64_t>(c, stamp_l == -1 ? (size_t) NST * NL : NST);
         // persistent state
         c.ls.assign((size_t) NL, {});
         for (int l = 0; l < NL; ++l) {
@@ -840,7 +870,7 @@ struct Ds41Tp::Impl {
         return r;
     }
 
-    void mv_q6(Card & c, const Mat & w, const int8_t * xq, const float * xd, int n, float * y, int64_t ycs, int64_t ybs = 0) {
+    static tpfmv::Args q6_args(const Mat & w, const int8_t * xq, const float * xd, int n, float * y, int64_t ycs, int64_t ybs) {
         tpfmv::Args a;
         a.w = w.p; a.K = w.K; a.N = w.N; a.G = w.G; a.g_div = 1;
         a.n_blocks_total = w.nbt ? w.nbt : w.N * (w.K / QK);
@@ -848,7 +878,114 @@ struct Ds41Tp::Impl {
         a.x = nullptr; a.x_col_stride = w.K * w.G; a.x_batch_stride = w.K;
         a.y = y; a.y_col_stride = ycs; a.y_batch_stride = ybs ? ybs : w.N;
         a.ncols = n; a.xq = xq; a.xd = xd;
+        return a;
+    }
+    // xT / xdT: the activations in the XMX layout (when the width's form is an XMX one; its producer wrote them)
+    void mv_q6(Card & c, const Mat & w, const int8_t * xq, const float * xd, int n, float * y, int64_t ycs, int64_t ybs = 0,
+               const sycl::half * xT = nullptr, const float * xdT = nullptr) {
+        const tpfmv::Args a = q6_args(w, xq, xd, n, y, ycs, ybs);
+        const int f = w.form[std::min(n, 7)];
+        if (f != 0 && tpfmv::launch_form(c.q, a, xT, xdT, f)) return;
         if (!tpfmv::launch(c.q, tpfmv::WType::Q6K_R8, a) && err.empty()) err = "tp: fastmv Q6_K shape not covered (K " + std::to_string(w.K) + ")";
+    }
+    static bool xmx(const Mat & w, int n) { return w.form[std::min(n, 7)] >= 5; }
+
+    // STRATA_TP_MV_TUNE (default 1; 0: fastmv's dispatch everywhere): at init every Q6_K mat-vec shape of the cards gets,
+    // per pass width, the fastest of fastmv's dispatch, the dp4a kernel's row blockings and the XMX kernel's K splits,
+    // timed on the card's own layers (one matrix a layer: cold weights, as in a pass) in replayed graphs, a small kernel
+    // between the launches (as in a pass: the XMX kernels start ~5 us slower after another kernel than after themselves,
+    // bench/fm3).  An XMX form must win by its producer's extra cost (the q8 written a second time, in its layout: the hc
+    // step ~3 us, attention ~2 us, the others ~0.5).  Cards with the same shapes share one timing.  STRATA_TP_MV_FORM=f:
+    // form f for every width >= 2 instead (A/B).
+    bool tune_mv() {
+        const char * fe = std::getenv("STRATA_TP_MV_FORM");
+        const int forced = fe && *fe ? std::atoi(fe) : -1;
+        if (!env_on("STRATA_TP_MV_TUNE", true) && forced < 0) return true;
+        const double t0 = now_us();
+        struct Kind { const char * name; Mat LW::* m; double xmx_margin; };
+        static const Kind kinds[] = { {"q_a+kv", &LW::qkv, 4.0}, {"q_b", &LW::qb, 0.5}, {"wo_a", &LW::woa, 2.5}, {"wo_b", &LW::wob, 0.5},
+                                      {"shexp gate|up", &LW::sgu, 4.0}, {"shexp down", &LW::sdn, 0.5} };
+        std::map<std::tuple<int64_t, int64_t, int64_t>, std::array<int8_t, 8>> done;
+        for (auto & cp : cards) {
+            Card & c = *cp;
+            for (const Kind & k : kinds) {
+                const Mat & m0 = c.lw[0].*(k.m);
+                if (!m0.p || m0.f16) continue;
+                const auto key = std::make_tuple(m0.K, m0.N, m0.G);
+                std::array<int8_t, 8> f{};
+                const auto it = done.find(key);
+                if (it != done.end()) f = it->second;
+                else if (forced >= 0) { for (int n = 2; n < 8; ++n) f[(size_t) n] = (int8_t) forced; }
+                else if (!tune_one(c, k.m, k.name, k.xmx_margin, f)) return false;
+                done[key] = f;
+                for (int l = 0; l < NL; ++l) std::copy(f.begin(), f.end(), (c.lw[(size_t) l].*(k.m)).form);
+            }
+        }
+        if (forced < 0) std::fprintf(stderr, "tp: mat-vec forms tuned in %.2f s\n", (now_us() - t0) / 1e6);
+        return true;
+    }
+    bool tune_one(Card & c, Mat LW::* mp, const char * name, double xmx_margin, std::array<int8_t, 8> & f) {
+        const Mat & m0 = c.lw[0].*mp;
+        const int64_t K = m0.K, Nr = m0.N, Gb = m0.G;
+        // scratch activations / outputs (zeros: only the time counts)
+        const size_t nx = (size_t) (Gb * NMAX * K), ny = (size_t) (Gb * NMAX * Nr);
+        int8_t * xq = sycl::malloc_device<int8_t>(nx, c.q);
+        float * xd = sycl::malloc_device<float>(nx / 32, c.q);
+        sycl::half * xT = sycl::malloc_device<sycl::half>((size_t) (Gb * K) * 8, c.q);
+        float * xdT = sycl::malloc_device<float>((size_t) (Gb * K) / 32 * 8, c.q);
+        float * y = sycl::malloc_device<float>(ny, c.q);
+        if (!xq || !xd || !xT || !xdT || !y) { err = "tp: mat-vec tuning buffers"; return false; }
+        c.q.memset(xq, 0, nx); c.q.memset(xd, 0, nx / 32 * 4); c.q.memset(xT, 0, (size_t) (Gb * K) * 8 * 2);
+        c.q.memset(xdT, 0, (size_t) (Gb * K) / 32 * 8 * 4); c.q.memset(y, 0, ny * 4);
+        c.q.wait();
+        // the small kernel between the launches, and its own time
+        float * sk = y;
+        auto small = [&] { c.q.parallel_for(sycl::nd_range<1>(64 * 16, 64), [=](sycl::nd_item<1> it) { if (it.get_global_id(0) == 0) sk[0] += 1.0f; }); };
+        auto timed = [&](const std::function<bool()> & body) -> double {   // a graph of NL launches (each + the small kernel)
+            sx::command_graph<sx::graph_state::modifiable> g(ctx, c.dev);
+            g.begin_recording(c.q);
+            const bool ok = body();
+            g.end_recording(c.q);
+            if (!ok) return -1.0;
+            auto ge = g.finalize();
+            c.q.ext_oneapi_graph(ge).wait();
+            const double ta = now_us();
+            for (int r = 0; r < 3; ++r) c.q.ext_oneapi_graph(ge);
+            c.q.wait();
+            return (now_us() - ta) / (3.0 * NL);
+        };
+        const double t_small = timed([&] { for (int l = 0; l < NL; ++l) small(); return true; });
+        char b[80];
+        std::string line;
+        for (int n = 1; n <= std::min(NMAX, 7); ++n) {
+            double best = 1e30, bestx = 1e30, t_disp = 0;
+            int bf = 0, bx = -1;
+            for (int form = 0; form <= 8; ++form) {
+                if (form >= 5 && (1 << (form - 5)) > K / QK) continue;
+                double us = timed([&] {
+                    for (int l = 0; l < NL; ++l) {
+                        const tpfmv::Args a = q6_args(c.lw[(size_t) l].*mp, xq, xd, n, y + 16, Nr * Gb, Nr);
+                        if (!tpfmv::launch_form(c.q, a, xT, xdT, form)) return false;
+                        small();
+                    }
+                    return true;
+                });
+                if (us < 0) continue;
+                us -= t_small;
+                if (form == 0) t_disp = us;
+                if (form < 5 && us < best) { best = us; bf = form; }
+                if (form >= 5 && us < bestx) { bestx = us; bx = form; }
+            }
+            if (bx >= 0 && bestx + xmx_margin < best) { best = bestx; bf = bx; }
+            f[(size_t) n] = (int8_t) bf;
+            if (bx >= 0 && bf != bx) std::snprintf(b, sizeof b, " n%d f%d %.1f (%.1f, xmx %.1f)", n, bf, best, t_disp, bestx);
+            else std::snprintf(b, sizeof b, " n%d f%d %.1f (%.1f)", n, bf, best, t_disp);
+            line += b;
+        }
+        sycl::free(xq, c.q); sycl::free(xd, c.q); sycl::free(xT, c.q); sycl::free(xdT, c.q); sycl::free(y, c.q);
+        std::fprintf(stderr, "tp: %s %lldx%lldx%lld on card %d, us a launch by width (fastmv's dispatch, the best XMX one):%s\n", name, (long long) K,
+                     (long long) Nr, (long long) Gb, c.rank, line.c_str());
+        return true;
     }
     void mv_f16(Card & c, const Mat & w, const float * x, int64_t xcs, int n, float * y, int64_t ycs) {
         tpfmv::Args a;
@@ -862,7 +999,7 @@ struct Ds41Tp::Impl {
     template <class T> T * inp(Card & c, size_t off) const { return (T *) (c.in + off); }
 
     // card c sends its partial (slot c.rank of `buf` on every peer) and waits for the peers' (sync point s)
-    void exchange(Card & c, float * buf, size_t slot_floats, size_t bytes, int s) {
+    void exchange(Card & c, float * buf, size_t slot_floats, size_t bytes, int s, int sl = -1, int si = -1) {
         if (N == 1) return;
         const size_t off = (size_t) c.rank * slot_floats;
         if (push && bytes % 16 == 0) {   // STRATA_TP_PUSH: P2P stores by two kernels
@@ -888,6 +1025,7 @@ struct Ds41Tp::Impl {
                 c.q.memcpy(cards[(size_t) j]->flags + c.rank * tpk::MAXS + s, c.seq + s, 4);
             }
         }
+        if (si >= 0) ST(c, sl, si);
         const uint32_t mask = ((1u << N) - 1) & ~(1u << c.rank);
         tpk::wait_peers(c.q, c.flags, inp<int32_t>(c, IL.pid), s, mask, c.err);
     }
@@ -907,10 +1045,12 @@ struct Ds41Tp::Impl {
         const int n = P.n;
         const int64_t r = L.ratio, cap = r ? P.cap[r] : 0;
         const size_t ar_slot = (size_t) NMAX * D;
+        ST(c, l, 0);
         // ---- the previous layer's finish, Engram, then the attention hc
         tpk::HcOut ha;
         ha.sc = w.hca_sc; ha.bs = w.hca_bs; ha.pw = w.attn_norm; ha.eps = (float) G.rms_eps; ha.hc_eps = (float) G.hc_eps;
         ha.n_iter = (int) G.hc_iters; ha.xn = c.xn; ha.pre = c.apre; ha.post = c.apost; ha.comb = c.acomb; ha.xq = c.xq; ha.xd = c.xd;
+        if (xmx(w.qkv, n)) { ha.xT = c.xT; ha.xdT = c.xdT; }
         tpk::HcIn hi;
         hi.fn = w.hca_fn; hi.fs1 = tpk::HC * D; hi.w16 = true;
         hi.pre = c.pre; hi.ps1 = tpk::HC;
@@ -932,15 +1072,20 @@ struct Ds41Tp::Impl {
         // DSpark's main_hidden taps (rank 0): the state leaving layers 36 / 37 / 38 = entering 37 / 38 / 39
         for (int j = 0; j < 3; ++j)
             if (c.rank == 0 && tap_on && l == dm_layers[j] + 1) tpk::hc_mean(c.q, c.x, n, (int) D, hvh + (size_t) j * D, 3 * D);
+        ST(c, l, 1);
         // ---- q_a + kv, q_a's norm (+ q8), q_b (this card's heads), the window row
-        mv_q6(c, w.qkv, c.xq, c.xd, n, c.qkv, RQ + DH);
+        mv_q6(c, w.qkv, c.xq, c.xd, n, c.qkv, RQ + DH, 0, c.xT, c.xdT);
+        ST(c, l, 2);
         {
             tpdec::RmsQ8Args a;
             a.x = c.qkv; a.x_cs = RQ + DH; a.w = w.qa_norm; a.eps = (float) G.rms_eps;
             a.y = c.qr; a.q = c.qrq; a.d = c.qrd; a.K = (int) RQ; a.n = n;
+            if (xmx(w.qb, n)) { a.xT = c.qrT; a.xdT = c.qrdT; }
             tpdec::rms_q8(c.q, a);
         }
-        mv_q6(c, w.qb, c.qrq, c.qrd, n, c.qh, c.nhk * DH);
+        ST(c, l, 3);
+        mv_q6(c, w.qb, c.qrq, c.qrd, n, c.qh, c.nhk * DH, 0, c.qrT, c.qrdT);
+        ST(c, l, 4);
         {
             tpdec::KvFinArgs a;
             a.x = c.qkv + RQ; a.x_cs = RQ + DH; a.w = w.kva_norm; a.pos = inp<int32_t>(c, IL.pos); a.eps = (float) G.rms_eps;
@@ -949,6 +1094,7 @@ struct Ds41Tp::Impl {
             a.slot_from = n - (int) std::min<int64_t>(n, RAW); a.tab = c.rtab; a.D = (int) DH; a.n = n;
             tpdec::kv_fin(c.q, a);
         }
+        ST(c, l, 5);
         // ---- the compressor (kv sources) and the indexer (index sources)
         const uint16_t * comp = nullptr;
         const int32_t * sel = nullptr;
@@ -966,6 +1112,7 @@ struct Ds41Tp::Impl {
                 tpk::comp_fin(c.q, a);
                 if (r == 2) tpk::comp_state(c.q, c.cy, n, inp<int32_t>(c, IL.sslot), S.st_kv, S.st_sc);
             }
+            ST(c, l, 6);
             if (cap > 0) {
                 const LS & KS = c.ls[(size_t) L.kvl];
                 comp = KS.comp;
@@ -997,6 +1144,10 @@ struct Ds41Tp::Impl {
                     sel = IS.sel; selm = IS.selm;
                 }
             }
+            ST(c, l, 7);
+        } else {
+            ST(c, l, 6);
+            ST(c, l, 7);
         }
         // ---- attention over this card's heads (+ its q8 for wo_a), the output projection -> partial A
         {
@@ -1011,17 +1162,25 @@ struct Ds41Tp::Impl {
             a.swa = (int) SWA; a.sinks = w.sinks; a.o = c.o; a.o_h = DH; a.o_b = (size_t) (c.nhk * DH);
             a.NH = (int) c.nhk; a.n = n; a.scale = 1.0f / std::sqrt((float) DH); a.part = c.apart;
             a.hpg = (int) (OGD / DH); a.oq = c.oq; a.od = c.od;
+            if (xmx(w.woa, n)) { a.oT = c.oT; a.odT = c.odT; }
             tpdec::attn_dec(c.q, a);
         }
-        mv_q6(c, w.woa, c.oq, c.od, n, c.oa, c.grp.n() * OL, OL);
-        tpfmv::quant_x(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aq, c.ad);
+        ST(c, l, 8);
+        mv_q6(c, w.woa, c.oq, c.od, n, c.oa, c.grp.n() * OL, OL, c.oT, c.odT);
+        ST(c, l, 9);
+        if (xmx(w.wob, n)) tpfmv::quant_xT(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aT, c.adT);
+        else tpfmv::quant_x(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aq, c.ad);
+        ST(c, l, 10);
         float * pa = c.ara + (size_t) c.rank * ar_slot;
-        mv_q6(c, w.wob, c.aq, c.ad, n, pa, D);
-        exchange(c, c.ara, ar_slot, (size_t) n * D * 4, sync_idx++);
+        mv_q6(c, w.wob, c.aq, c.ad, n, pa, D, 0, c.aT, c.adT);
+        ST(c, l, 11);
+        exchange(c, c.ara, ar_slot, (size_t) n * D * 4, sync_idx++, l, 12);
+        ST(c, l, 13);
         // ---- the FFN hc (the attention output = the cards' partials summed), router, shared expert -> partial B
         tpk::HcOut hf;
         hf.sc = w.hcf_sc; hf.bs = w.hcf_bs; hf.pw = w.ffn_norm; hf.eps = (float) G.rms_eps; hf.hc_eps = (float) G.hc_eps;
         hf.n_iter = (int) G.hc_iters; hf.xn = c.fn; hf.pre = c.pre; hf.post = c.fpost; hf.comb = c.fcomb; hf.xq = c.fq; hf.xd = c.fd;
+        if (cfg.shexp && xmx(w.sgu, n)) { hf.xT = c.fT; hf.xdT = c.fdT; }
         tpk::HcIn fi;
         fi.x = c.x; fi.xs1 = D; fi.xs2 = tpk::HC * D;
         fi.fn = w.hcf_fn; fi.fs1 = tpk::HC * D; fi.w16 = true;
@@ -1030,32 +1189,52 @@ struct Ds41Tp::Impl {
         fi.post = c.apost; fi.pos1 = tpk::HC; fi.comb = c.acomb; fi.cs1 = tpk::HC; fi.cs2 = tpk::HC * tpk::HC;
         fi.out = c.hcs; fi.hdst = c.hap; fi.cnt = c.cnt; fi.D = D; fi.n = n;
         tpk::hc_fab(c.q, fi, hf, true);
+        ST(c, l, 14);
         mv_f16(c, w.router, c.fn, D, n, c.lg, NE);
+        ST(c, l, 15);
         {
             tpk::RouterArgs a;
             a.lg = c.lg; a.bias = w.bias; a.rbias = w.rbias; a.ne = (int) NE; a.k = (int) NU; a.n = n;
             a.norm = G.norm_topk; a.scale = (float) G.weights_scale; a.ids = c.ids; a.wts = c.wts;
             tpk::router(c.q, a);
         }
+        ST(c, l, 16);
         if (c.rank == 0 && hooks.cpu_part) {   // the routing + the experts' input out to the host (the CPU pool's share)
             const Mail & m = mail[(size_t) l];
             c.q.memcpy(m.ids, c.ids, (size_t) 2 * NMAX * NU * 4);
             c.q.memcpy(m.fn, c.fn, (size_t) n * D * 4);
             c.q.memcpy(m.seq, c.seq + S_MAIL + l, 4);
         }
+        ST(c, l, 17);
         float * pb = c.arb + (size_t) c.rank * ar_slot;
         if (cfg.shexp) {
-            mv_q6(c, w.sgu, c.fq, c.fd, n, c.gu, 2 * c.fk);
-            tpk::swiglu_q8(c.q, c.gu, c.fk, n, (float) G.swiglu_limit, c.sh, c.shq, c.shd);
-            mv_q6(c, w.sdn, c.shq, c.shd, n, pb, D);
+            mv_q6(c, w.sgu, c.fq, c.fd, n, c.gu, 2 * c.fk, 0, c.fT, c.fdT);
+            ST(c, l, 18);
+            tpk::swiglu_q8(c.q, c.gu, c.fk, n, (float) G.swiglu_limit, c.sh, c.shq, c.shd, xmx(w.sdn, n) ? c.shT : nullptr, c.shdT);
+            ST(c, l, 19);
+            mv_q6(c, w.sdn, c.shq, c.shd, n, pb, D, 0, c.shT, c.shdT);
+            ST(c, l, 20);
         } else {
             c.q.memset(pb, 0, (size_t) n * D * 4);
+            ST(c, l, 18); ST(c, l, 19); ST(c, l, 20);
         }
         if (c.etab) {   // this card's routed experts, added to the shared expert's partial
             const int njm = n * (int) NU;
-            tpk::route_jobs(c.q, c.ids, c.wts, n, (int) NU, c.etab + (size_t) l * NE, c.rank, c.jobs, njm, c.need_cpu);
+            static const bool route_par = env_on("STRATA_TP_ROUTE_PAR", true);   // a lane a pick (0: the one-work-item form)
+            (route_par ? tpk::route_jobs : tpk::route_jobs_serial)(c.q, c.ids, c.wts, n, (int) NU, c.etab + (size_t) l * NE, c.rank,
+                                                                      c.jobs, njm, c.need_cpu);
+            ST(c, l, 21);
             strata::v41::xe::xe_quant_rows(c.q, c.fn, n, (int) D, c.X);
-            strata::v41::xe::xe_experts_q8(c.q, c.jobs, njm, n, c.X, c.H, pb, (int) D, (int) NFF, (float) G.swiglu_limit, true, n);
+            ST(c, l, 22);
+            // engine1 options of the expert kernels: STRATA_TP_NJ_DEV (default 1) the kernels stop at route_jobs' real job count,
+            // STRATA_TP_JOB_GRID=j (default 8) gate/up launched for j job slots (looping over the jobs; 0: one slot a pick) -
+            // bit-identical, a 5-token pass -1 %; STRATA_XE_DOWN_SPLIT=1 the down kernel's jobs over its sub-groups (measured
+            // slower: +1.9 % a 5-token pass)
+            static const bool nj_dev = env_on("STRATA_TP_NJ_DEV", true), dsplit = env_on("STRATA_XE_DOWN_SPLIT", false);
+            static const int jgrid = std::getenv("STRATA_TP_JOB_GRID") ? std::atoi(std::getenv("STRATA_TP_JOB_GRID")) : 8;
+            strata::v41::xe::xe_experts_q8(c.q, c.jobs, njm, n, c.X, c.H, pb, (int) D, (int) NFF, (float) G.swiglu_limit, true, n,
+                                           nj_dev ? c.need_cpu + 1 : nullptr, nj_dev && jgrid > 0 ? jgrid : 0, dsplit);
+            ST(c, l, 23);
             if (c.rank == 0 && hooks.cpu_part) {   // the CPU pool's experts: wait for the host only if the routing has any
                 tpk::wait_host(c.q, hflag + 16 * (1 + l), inp<int32_t>(c, IL.pid), S_MAIL + l, c.need_cpu, c.err);
                 const float * co = hcpu + (size_t) l * NMAX * D;
@@ -1063,8 +1242,12 @@ struct Ds41Tp::Impl {
                 const size_t cnt = (size_t) n * D;
                 c.q.parallel_for(sycl::range<1>(cnt), [=](sycl::id<1> i) { if (*need) pb[i] += co[i]; });
             }
+            ST(c, l, 24);
+        } else {
+            ST(c, l, 21); ST(c, l, 22); ST(c, l, 23); ST(c, l, 24);
         }
-        exchange(c, c.arb, ar_slot, (size_t) n * D * 4, sync_idx++);
+        exchange(c, c.arb, ar_slot, (size_t) n * D * 4, sync_idx++, l, 25);
+        ST(c, l, 26);
     }
 
     // x = hc_post(the FFN output summed over the cards, hap, post, comb): the finish on its own (before an Engram layer
@@ -1472,6 +1655,8 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
     }
     im.nsm = (int) (im.cards[0]->dev.get_info<sycl::info::device::max_compute_units>() / 16);
     im.push = env_on("STRATA_TP_PUSH", false) && im.N > 1;
+    if (const char * e = std::getenv("STRATA_TP_STAMP_LAYER")) im.stamp_l = std::atoi(e);
+    if (const char * e = std::getenv("STRATA_TP_STAMP_TPU")) im.st_tpu = std::atof(e);
     if (im.push) {   // the push kernels store into the peers' (SYCL USM) slot buffers
         for (auto & a : im.cards)
             for (auto & b : im.cards)
@@ -1553,6 +1738,7 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
             const double dt = now_us() - tc;
             if (dt > 2000) std::fprintf(stderr, "tp: first copy card %d -> %d took %.1f ms\n", k, j, dt / 1e3);
         }
+    if (!im.tune_mv()) { err = im.err; return false; }
     // a throw-away pass: every kernel's first launch on every card (module loads, command lists) before any pass whose
     // cards wait on each other (a card still loading made its peers' bounded waits give up); no state exists yet
     {
@@ -1691,6 +1877,64 @@ bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * mai
     for (auto & cp : im.cards) cp->q.wait();
     const double t5 = now_us();
     im.last_pass_us = t5 - t0;
+    if (im.stamp_l == -1 || (im.stamp_l >= 0 && im.stamp_l < im.NL)) {
+        static const char * nm[Impl::NST] = {"", "hc_a", "qkv", "rms_q8", "q_b", "kv_fin", "comp", "indexer", "attn", "wo_a", "quant",
+                                             "wo_b", "xA-copy", "xA-wait", "hc_f", "rt-mv", "router", "mailbox", "sh-gu", "swiglu", "sh-dn",
+                                             "route", "q-rows", "experts", "cpu-wait", "xB-copy", "xB-wait"};
+        const int nls = im.stamp_l == -1 ? im.NL : 1;
+        const size_t per = (size_t) nls * Impl::NST;
+        im.st_acc.resize((size_t) im.N * per, 0.0);
+        std::vector<uint64_t> h(per);
+        for (int k = 0; k < im.N; ++k) {
+            Card & c = *im.cards[(size_t) k];
+            c.q.memcpy(h.data(), c.stamps, per * 8).wait();
+            for (int ll = 0; ll < nls; ++ll)
+                for (int i = 1; i < Impl::NST; ++i)
+                    im.st_acc[(size_t) k * per + (size_t) ll * Impl::NST + i] +=
+                        (double) (int64_t) (h[(size_t) ll * Impl::NST + i] - h[(size_t) ll * Impl::NST + i - 1]) / im.st_tpu;
+        }
+        if (nls > 1 && ++im.st_n % 128 == 0) {   // every layer: per layer the expert step, the CPU wait, the sums' waits
+            auto at = [&](int k, int ll, int i) { return im.st_acc[(size_t) k * per + (size_t) ll * Impl::NST + i] / 128.0; };
+            double se[8] = {0}, sw[8] = {0}, sa[8] = {0}, sl[8] = {0}, scpu = 0;
+            for (int ll = 0; ll < im.NL; ++ll) {
+                std::string line;
+                char b[64];
+                for (int k = 0; k < im.N; ++k) {
+                    double tl = 0;
+                    for (int i = 1; i < Impl::NST; ++i) tl += at(k, ll, i);
+                    se[k] += at(k, ll, 23); sw[k] += at(k, ll, 26); sa[k] += at(k, ll, 13); sl[k] += tl;
+                    std::snprintf(b, sizeof b, " | c%d %.0f: ex %.0f xA %.0f xB %.0f", k, tl, at(k, ll, 23), at(k, ll, 13), at(k, ll, 26));
+                    line += b;
+                }
+                scpu += at(0, ll, 24);
+                std::fprintf(stderr, "tp stamps L%02d (passes %lld-%lld): cpu-wait %.0f%s\n", ll, (long long) im.st_n - 127, (long long) im.st_n,
+                             at(0, ll, 24), line.c_str());
+            }
+            std::string sum;
+            char b[96];
+            for (int k = 0; k < im.N; ++k) {
+                std::snprintf(b, sizeof b, " | c%d layers %.0f: experts %.0f, xA-wait %.0f, xB-wait %.0f", k, sl[k], se[k], sa[k], sw[k]);
+                sum += b;
+            }
+            std::fprintf(stderr, "tp stamps all layers (us a pass): cpu-wait %.0f%s\n", scpu, sum.c_str());
+            std::fill(im.st_acc.begin(), im.st_acc.end(), 0.0);
+        } else if (nls == 1 && ++im.st_n % 128 == 0) {
+            for (int k = 0; k < im.N; ++k) {
+                std::string line;
+                double tot = 0;
+                char b[48];
+                for (int i = 1; i < Impl::NST; ++i) {
+                    const double v = im.st_acc[(size_t) k * Impl::NST + i] / 128.0;
+                    tot += v;
+                    std::snprintf(b, sizeof b, " %s %.1f", nm[i], v);
+                    line += b;
+                }
+                std::fprintf(stderr, "tp stamps layer %d card %d (passes %lld-%lld, us):%s = %.1f\n", im.stamp_l, k, (long long) im.st_n - 127,
+                             (long long) im.st_n, line.c_str(), tot);
+            }
+            std::fill(im.st_acc.begin(), im.st_acc.end(), 0.0);
+        }
+    }
     if (prof) {
         im.pf[0] += t1 - t0; im.pf[1] += t2 - t1; im.pf[2] += t3 - t2; im.pf[3] += t_mail; im.pf[4] += t_cpu; im.pf[5] += t5 - t4;
         if (eng_posted) im.pf_eng += t_eng;
