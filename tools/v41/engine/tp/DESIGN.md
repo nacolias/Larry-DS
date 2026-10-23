@@ -2,7 +2,7 @@
 
 Status: phases A-D done; in the engine behind STRATA_TP=N (default 0), in the service since 2026-10-23 02:35
 (STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02, promotions in time for the next pass since 17:31, the verify
-pass's kernel round since 20:35 - see the status sections at the end.  User go-ahead
+pass's kernel round since 20:35, card 0's expert replicas since 22:20 - see the status sections at the end.  User go-ahead
 2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card count).  Mirror of
 larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
 
@@ -327,4 +327,55 @@ from code it gains +0.3-0.5 ms on the others.  The experts run near the memory r
 layer's jobs) on card 0's free decode VRAM (~3 GB), handed out per pass by route_jobs to the least-loaded holder
 (card 0 starting at its CPU estimate); and the CPU pool's latency (~455 us for a one-expert layer, ~370 of it the
 expert's bytes at 30 GB/s).
+
+## Status 2026-10-23 ~22:20 (replicas: card 0's copies of the hottest expert-card experts, balanced every pass)
+
+The waits of the last section come from where experts live: in layers 11-19 the CPU pool's experts make card 0 the
+last card, in layers 25-39 card 0 holds almost none of the hot experts and idles.  A static re-deal does not carry
+across texts, so the balance is per pass:
+
+* `TpExp` / the tier's `RtEnt` grew to 40 bytes: a second holder (`alt`) and its copy (`alt_blob`); every routed
+  expert's shapes are filled in, the CPU pool's too.
+* `route_jobs` (one work-group, every card the same arithmetic on the same routing) lays a layer's fixed jobs on their
+  owners, then the replicated ones, heaviest first, on whichever holder finishes sooner: a job costs `job_us` + its
+  bytes x `us_per_byte` (+ `tok_us` a token past the first: 19 us, 837 GB/s, 3 us - fitted on stamped passes), a rank
+  with more shared-expert columns starts that much later, and card 0 finishes no earlier than its CPU-pool estimate
+  (85 us + the CPU experts' bytes at 30 GB/s): while it waits for the host it takes others' jobs for free.  Without
+  copies the lists are the one-work-item form's (bit-identical); `STRATA_TP_BALANCE=0` gives every job to its owner.
+* The tier (`STRATA_XE_REPLICA_GIB`): each layer's hottest expert-card experts, a round over the layers at a time, up to
+  `STRATA_XE_REPLICA_PER_LAYER` (16) a layer, are read once at placement into pinned host memory (planar, repacked on
+  the host - the expert slabs are native allocations the other cards cannot read, and making them peer-visible costs
+  host RAM per GiB on larry).  Every seed / regrow uploads them to card 0 in slabs of their own while
+  `STRATA_XE_REPLICA_MARGIN_GIB` (1.0) stays free; a release / shrink drops them first.  The set: `STRATA_XE_REPLICA_USAGE`
+  (STRATA_XE_USAGE_OUT counts), else the ranking.  `STRATA_XE_REPLICA_CHECK=1` compares every copy with its card's
+  bytes (202 checked, 0 differ).
+
+Measured (one-shot DSpark at the service's settings, 1000 tokens, cycle at a common width mix):
+
+| text | no replicas | the ranking's (1.8 GiB margin: 138 fit) | its own uses | the code text's uses | three texts' uses (2.5 GiB, 1.0 margin: 203) |
+| --- | --- | --- | --- | --- | --- |
+| essay | 29.61 / 30.14 ms | 29.73 | 29.32 / 28.87 | 29.36 | 29.28 (-2 %) |
+| code (verify at width 5, 80 % of its passes) | 26.38 ms | 25.18 | 24.99 | 24.99 | 25.49 (-3.4 %) |
+| math | 39.37 ms (101 tok/s) | | | | 37.02 (-6 %, 110 tok/s) |
+
+The ranking alone predicts the essay's hot experts poorly (rank correlation of uses 0.55 essay, 0.72 code, 0.43 math;
+among VRAM experts use is flat - the calibration's top 500 average ~0.1 jobs a pass on the essay against ~0.55 for its
+own hottest 8 a layer), so the service uses `/opt/ai/dsv41/replica-usage.txt` (essay + code + math).  `tp_bench`'s own
+replicas (`STRATA_TP_BENCH_REPLICAS=k`: every k-th expert off rank 0 also on rank 0) gained only ~1 %: there card 0
+owns a quarter of the experts and is among the busiest.
+
+**The first service try crashed (21:41).**  In the service card 0 had more room at the seed than one-shot runs (250
+replicas, 1.04 GiB left); in the fourth svcbench request the dense half's ggml-sycl pool grew by 1.9 GiB (after an
+Engram head split for a small pass), the physical allocation failed, the engine aborted with copies in flight - copy
+engine CAT errors on three cards - and the restarted engine hung in its start (GT reset of all four, copy_probe:
+fine).  The headroom card 0 keeps (STRATA_XE_DENSE_RESERVE_GIB) is the dense half's, and replicas may only borrow it:
+ggml-sycl now has a reclaim hook (`ggml_backend_sycl_set_reclaim_hook`: a failed `ggml_sycl_malloc_device` or VMM pool
+commit asks it once, then retries), the engine registers the tier's `reclaim` (drops card 0's replicas, waits for the
+driver to show the pages free), and the next seed uploads what fits again.  The service sequence then passed twice at
+the 1.0 GiB margin ("replicas given back for a 1926 MiB allocation" - the crash's growth - then 203-250 again) and once at
+0.1 GiB (0.43 GiB free at times): needles, tool call, svcbench all right, no fault.  In the service since 22:20
+(ds41-xe-engine.sh: 2.5 GiB, replica-usage.txt); tsvc2: needles found, the tool call right, svcbench 82.8 / 73.4,
+essay 69.8 / 69.4, prompts 8K 831 / 931, 16K 1218, 31K 1648 tok/s, hidden RAM 43 GiB peak (+2.5 pinned).
+
+Next: an adaptive set (the tier's counts over recent requests instead of a file); the CPU pool's latency.
 

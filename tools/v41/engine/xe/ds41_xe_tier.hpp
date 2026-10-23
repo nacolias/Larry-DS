@@ -80,6 +80,10 @@ public:
     void release_cache();
     int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
     int64_t regrow_cache(std::string& err);
+    /// larry, engine1: the dense card's expert replicas (STRATA_XE_REPLICA_GIB) given back for an allocation that found
+    /// the card full - ggml-sycl's reclaim hook (`gpu`: the device's Level Zero index).  True when there were any (the
+    /// allocation is tried once more); the next seed / regrow uploads them again where there is room.
+    bool reclaim(int gpu, int64_t bytes);
     /// larry, STRATA_SERVE_KEEP_CACHE (default 1): a prompt batch of <= STRATA_SERVE_KEEP_MAX tokens gives back only the
     /// dense card's tail slabs it needs (shrink_cache_for); the decode after it refills just those (regrow_cache)
     static bool keep_cache_mode() { const char* e = std::getenv("STRATA_SERVE_KEEP_CACHE"); return !e || std::atoi(e) != 0; }

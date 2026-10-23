@@ -339,6 +339,17 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
  // devide buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
  
+@@ -46,6 +80,10 @@
+ GGML_BACKEND_API int  ggml_backend_sycl_get_device_count();
+ GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t *free, size_t *total);
+ 
++// larry: called when a device allocation fails - fn(device, bytes, ud) returns true when it freed memory on that device
++// (an engine's droppable copies) and the allocation is tried once more; fn = NULL clears it
++GGML_BACKEND_API void ggml_backend_sycl_set_reclaim_hook(bool (*fn)(int device, size_t bytes, void * ud), void * ud);
++
+ // SYCL doesn't support registering host memory, keep here for reference
+ // GGML_BACKEND_API bool ggml_backend_sycl_register_host_buffer(void * buffer, size_t size);
+ // GGML_BACKEND_API void ggml_backend_sycl_unregister_host_buffer(void * buffer);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
@@ -1311,10 +1322,65 @@ diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
  void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-sycl/common.cpp b/ggml/src/ggml-sycl/common.cpp
+--- a/ggml/src/ggml-sycl/common.cpp
++++ b/ggml/src/ggml-sycl/common.cpp
+@@ -92,9 +92,39 @@
+ }
+ #endif
+ 
++// larry: the reclaim hook (ggml_backend_sycl_set_reclaim_hook)
++static bool (*g_reclaim_fn)(int device, size_t bytes, void * ud) = nullptr;
++static void * g_reclaim_ud = nullptr;
++
++void ggml_sycl_set_reclaim(bool (*fn)(int device, size_t bytes, void * ud), void * ud) {
++    g_reclaim_fn = fn;
++    g_reclaim_ud = ud;
++}
++
++bool ggml_sycl_reclaim(int device, size_t bytes) {
++    return g_reclaim_fn && device >= 0 && g_reclaim_fn(device, bytes, g_reclaim_ud);
++}
++
++bool ggml_sycl_reclaim(const sycl::queue & q, size_t bytes) {
++    if (!g_reclaim_fn) return false;
++    const sycl::device d = q.get_device();
++    for (int i = 0; i < ggml_sycl_info().device_count; ++i)
++        if (dpct::dev_mgr::instance().get_device(i) == d) return ggml_sycl_reclaim(i, bytes);
++    return false;
++}
++
++static void * ggml_sycl_malloc_device_once(size_t size, sycl::queue &q, ggml_sycl_mem_type type);
++
++// larry: a failed allocation asks the reclaim hook once (an engine's droppable copies on that card), then retries
++void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
++    void * p = ggml_sycl_malloc_device_once(size, q, type);
++    if (!p && ggml_sycl_reclaim(q, size)) p = ggml_sycl_malloc_device_once(size, q, type);
++    return p;
++}
++
+ // Use Level Zero zeMemAllocDevice to avoid sycl::malloc_device triggering
+ // DMA-buf/TTM system RAM staging in the xe kernel driver during multi-GPU inference.
+-void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
++static void * ggml_sycl_malloc_device_once(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+     if (ggml_sycl_use_level_zero_device_alloc(q)) {
+         void *ptr = nullptr;
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
 --- a/ggml/src/ggml-sycl/common.hpp
 +++ b/ggml/src/ggml-sycl/common.hpp
-@@ -442,6 +442,14 @@
+@@ -323,6 +323,10 @@
+ extern int g_ggml_sycl_use_level_zero_api;
+ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
+                                ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT);
++// larry: ggml_backend_sycl_set_reclaim_hook's hook for the device of a failed allocation (true: try once more)
++void ggml_sycl_set_reclaim(bool (*fn)(int device, size_t bytes, void * ud), void * ud);
++bool ggml_sycl_reclaim(int device, size_t bytes);
++bool ggml_sycl_reclaim(const sycl::queue & q, size_t bytes);
+ void ggml_sycl_free_device(void *ptr, sycl::queue &q);
+ 
+ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
+@@ -442,6 +446,14 @@
  
  #ifdef GGML_SYCL_GRAPH
      std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
@@ -4805,7 +4871,25 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
      static std::mutex mutex;
      std::lock_guard<std::mutex> lock(mutex);
-@@ -2888,6 +2910,73 @@
+@@ -1835,9 +1857,15 @@
+                 ggml_sycl_memtrace_report("before pool_vmm commit");
+             }
+ 
+-            // allocate more physical memory
++            // allocate more physical memory (larry: a full card asks the reclaim hook once - an engine's droppable
++            // copies on it - before the error)
+             std::optional<sycl::ext::oneapi::experimental::physical_mem> phys;
+-            SYCL_CHECK(CHECK_TRY_ERROR(phys.emplace(dev, ctx, reserve_size)));
++            bool got = false;
++            try { phys.emplace(dev, ctx, reserve_size); got = true; } catch (const sycl::exception &) {}
++            if (!got && ggml_sycl_reclaim(device, reserve_size)) {
++                try { phys.emplace(dev, ctx, reserve_size); got = true; } catch (const sycl::exception &) {}
++            }
++            if (!got) SYCL_CHECK(CHECK_TRY_ERROR(phys.emplace(dev, ctx, reserve_size)));
+ 
+             // reserve virtual address space (if not already reserved)
+             if (pool_addr == 0) {
+@@ -2888,6 +2916,73 @@
    std::exit(1);
  }
  
@@ -4879,7 +4963,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  inline void ggml_sycl_op_mul_mat_sycl(
      ggml_backend_sycl_context & ctx,
      const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
-@@ -2918,7 +3007,11 @@
+@@ -2918,7 +3013,11 @@
  #ifdef GGML_SYCL_F16
      bool use_fp16 = true;  // TODO(Yu) SYCL capability check
  #else
@@ -4892,7 +4976,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #endif
  
  #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
-@@ -2948,18 +3041,22 @@
+@@ -2948,18 +3047,22 @@
      if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
          row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
          ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
@@ -4918,7 +5002,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
          ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
          if (src1->type != GGML_TYPE_F16) {
-@@ -3144,6 +3241,84 @@
+@@ -3144,6 +3247,84 @@
      }
  }
  
@@ -5003,7 +5087,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
      GGML_ASSERT( dst->type == GGML_TYPE_I32);
-@@ -3156,6 +3331,25 @@
+@@ -3156,6 +3337,25 @@
      const int64_t ncols = dst->src[0]->ne[0];
      const int64_t nrows = ggml_nrows(dst->src[0]);
  
@@ -5029,7 +5113,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
      argmax_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
  }
  
-@@ -4661,12 +4855,24 @@
+@@ -4661,12 +4861,24 @@
  static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
@@ -5055,7 +5139,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4940,359 @@
+@@ -4734,6 +4946,359 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -5415,7 +5499,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +5306,9 @@
+@@ -4747,6 +5312,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -5425,7 +5509,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5114,6 +5676,108 @@
+@@ -5114,6 +5682,108 @@
      }
  }
  
@@ -5534,7 +5618,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5134,6 +5798,48 @@
+@@ -5134,6 +5804,48 @@
              return;
          }
      }
@@ -5583,7 +5667,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +6140,61 @@
+@@ -5434,6 +6146,61 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -5645,7 +5729,18 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5976,6 +6737,33 @@
+@@ -5783,6 +6550,10 @@
+     return res;
+ }
+ 
++void ggml_backend_sycl_set_reclaim_hook(bool (*fn)(int device, size_t bytes, void * ud), void * ud) {
++    ggml_sycl_set_reclaim(fn, ud);
++}
++
+ void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total) try {
+     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_memory\n");
+     if (!sycl_get_mem_info(device, free, total)) {
+@@ -5976,6 +6747,33 @@
      return skip;
  }
  
@@ -5679,7 +5774,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6854,29 @@
+@@ -6066,6 +6864,29 @@
              continue;
          }
  
@@ -5709,7 +5804,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6930,64 @@
+@@ -6119,6 +6940,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -5774,7 +5869,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +7098,12 @@
+@@ -6229,6 +7108,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -5787,7 +5882,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7344,39 @@
+@@ -6469,6 +7354,39 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

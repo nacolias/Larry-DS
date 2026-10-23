@@ -103,9 +103,10 @@ constexpr int kPcBounce = 3;                     ///< STRATA_XE_PROMOTE: pinned 
 struct RtEnt {
     const uint8_t* blob;                ///< the device address on `card`
     uint32_t up_off, down_off;
-    uint16_t gu_type, d_type, gu_row, d_row;
+    uint16_t gu_type, d_type, gu_row, d_row;   ///< (larry, engine1: CPU-pool experts too - the TP core's balance sizes them)
     int32_t card;                       ///< -1: on no card
-    int32_t pad;
+    int32_t alt;                        ///< larry, engine1: a second card holding a copy (STRATA_XE_REPLICA_GIB), or -1
+    const uint8_t* alt_blob;            ///< the copy on `alt`
 };
 struct RtCpu { int32_t e, nt, tok[kMaxJobTok], k[kMaxJobTok]; float w[kMaxJobTok]; };
 struct RtHdr { int32_t ncard, ncpu, pad[2]; RtCpu cpu[kMaxDecodeJobs]; };
@@ -269,6 +270,16 @@ struct Ds41XeImpl {
     bool cache_enabled = true;
     double slot_gib = 0.0;
     std::vector<std::pair<int32_t, int32_t>> dense_set;   ///< experts currently on the dense card (seeded in ranked order)
+    // larry, engine1 (STRATA_XE_REPLICA_GIB): copies of the expert cards' hottest experts on the dense card; the TP core
+    // hands a pass's job of one to whichever holder finishes sooner (route_jobs).  rep_set in upload order, their planar
+    // bytes pinned once (rep_host + rep_off), the dense card's copies by key (rep_ptr) in slabs of their own
+    std::vector<std::pair<int32_t, int32_t>> rep_set;
+    std::vector<size_t> rep_off;
+    uint8_t* rep_host = nullptr;
+    std::vector<uint8_t*> rep_ptr;
+    std::vector<uint8_t*> rep_slabs;
+    size_t rep_slab_used = 0;
+    int64_t rep_n = 0, rep_bytes = 0;
     std::vector<std::pair<int32_t, int32_t>> seed_ranked; ///< the ranked list of the last seed (regrow_cache continues it)
     int64_t resident_n = 0;
     // CPU pool for the arena experts of a decode / verify call
@@ -483,17 +494,26 @@ void rt_put(Ds41XeImpl& im, size_t key) {
         else im.rt_dirty_all = true;
     }
     RtEnt& r = im.rt[key];
+    const int64_t l = (int64_t) key / im.g.n_experts, e = (int64_t) key % im.g.n_experts;
+    if (im.g.routed(l)) {   // the shapes of every routed expert (larry, engine1: the CPU pool's too - the TP core's balance)
+        const XeJob j = make_job(im, l, e, nullptr);
+        r.up_off = j.up_off;
+        r.down_off = j.down_off;
+        r.gu_type = j.gu_type;
+        r.d_type = j.d_type;
+        r.gu_row = j.gu_row;
+        r.d_row = j.d_row;
+    }
+    r.alt = -1;
+    r.alt_blob = nullptr;
     const int c = im.card_of[key];
     if (c < 0 || !im.dptr[key]) { r.card = -1; r.blob = nullptr; return; }
-    const XeJob j = make_job(im, (int64_t) key / im.g.n_experts, (int64_t) key % im.g.n_experts, im.dptr[key]);
-    r.blob = j.blob;
-    r.up_off = j.up_off;
-    r.down_off = j.down_off;
-    r.gu_type = j.gu_type;
-    r.d_type = j.d_type;
-    r.gu_row = j.gu_row;
-    r.d_row = j.d_row;
+    r.blob = im.dptr[key];
     r.card = c;
+    if (key < im.rep_ptr.size() && im.rep_ptr[key]) {   // larry, engine1: its copy on the dense card
+        r.alt = im.dense;
+        r.alt_blob = im.rep_ptr[key];
+    }
 }
 
 /// Copies the file-layout blob of (l, e) at `src` (host USM, or device-readable) into its planar slot `dst` on card
@@ -725,6 +745,13 @@ void read_all(Ds41XeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& li
     for (auto& t : th) t.join();
 }
 
+}  // namespace
+
+namespace {
+// larry, engine1 (STRATA_XE_REPLICA_GIB): the dense card's copies of the expert cards' hottest experts (below)
+void rep_prepare(Ds41XeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& order);
+int64_t rep_upload(Ds41XeImpl& im);
+void rep_drop(Ds41XeImpl& im);
 }  // namespace
 
 bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_in, std::string& err) {
@@ -968,6 +995,7 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
             im.pc_bounce = sycl::malloc_host<uint8_t>((size_t) im.pc_nb * im.pc_slot, im.ctx);
         }
     }
+    rep_prepare(im, order);
     im.placed = true;
     std::fprintf(stderr, "xe tier: placed in %.1f s (cards %.1f s, arena %.1f s)\n%s", (now_ms() - t0) / 1000.0,
                  (t1 - t0) / 1000.0, (now_ms() - t1) / 1000.0, report().c_str());
@@ -1049,7 +1077,9 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
     im.seed_ranked = ranked;
     c.budget = dense_budget(im, c);
     if (c.budget <= 0) return true;
-    return seed_dense(im, c, ranked, "seeded", err) >= 0;
+    if (seed_dense(im, c, ranked, "seeded", err) < 0) return false;
+    rep_upload(im);   // larry, engine1: the replicas in what the cache left (STRATA_XE_REPLICA_MARGIN_GIB kept free)
+    return true;
 }
 
 /// larry (serve keep-cache): a prompt batch of a few thousand tokens needs `need_bytes` free on the dense card - the
@@ -1061,6 +1091,7 @@ int64_t Ds41XeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     XeCard& c = *im.cards[(size_t) im.dense];
     c.q.wait();
     if (im.groute_on) { im.rt_dense_ev.wait(); im.last_sum.wait(); }   // STRATA_XE_GROUTE: its share on the dense queue
+    rep_drop(im);   // larry, engine1: the replicas first (copies: the expert cards still hold them)
     if (c.free_vram() + c.used < need_bytes) { err = "the dense card has no room for the batch even without its experts"; return -1; }
     int64_t released = 0;
     while (c.free_vram() < need_bytes && !c.slabs.empty()) {
@@ -1093,8 +1124,9 @@ int64_t Ds41XeTier::regrow_cache(std::string& err) {
     if (im.dense < 0 || !im.cache_enabled || im.seed_ranked.empty()) return 0;
     XeCard& c = *im.cards[(size_t) im.dense];
     c.budget = dense_budget(im, c);
-    if (c.used >= c.budget) return 0;
-    return seed_dense(im, c, im.seed_ranked, "regrown", err);
+    const int64_t n = c.used >= c.budget ? 0 : seed_dense(im, c, im.seed_ranked, "regrown", err);
+    if (n >= 0) rep_upload(im);   // larry, engine1: the replicas after the cache
+    return n;
 }
 
 void Ds41XeTier::set_slot_gib(double gib) { im_->slot_gib = gib; }
@@ -1334,8 +1366,27 @@ void tl_print(Ds41XeImpl& im) {
 }  // namespace
 void Ds41XeTier::set_cache_enabled(bool on) { im_->cache_enabled = on; }
 
+bool Ds41XeTier::reclaim(int gpu, int64_t bytes) {
+    Ds41XeImpl& im = *im_;
+    if (im.dense < 0 || im.rep_slabs.empty()) return false;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    if (c.gpu != gpu) return false;
+    const int64_t before = c.free_vram(), freed = (int64_t) (im.rep_slabs.size() * ((size_t) 256 << 20));
+    rep_drop(im);
+    // the driver may show the freed pages late: up to 2 s for most of them
+    for (int i = 0; i < 200; ++i) {
+        const int64_t fr = c.free_vram();
+        if (fr < 0 || before < 0 || fr >= before + freed * 9 / 10) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::fprintf(stderr, "xe tier: replicas given back for a %.0f MiB allocation on the dense card (%.2f GiB free now)\n",
+                 bytes / 1048576.0, c.free_vram() / kGiB);
+    return true;
+}
+
 void Ds41XeTier::release_cache() {
     Ds41XeImpl& im = *im_;
+    rep_drop(im);   // larry, engine1: the replicas go first (copies: the expert cards still hold them)
     if (im.dense < 0 || im.dense_set.empty()) return;
     if (im.groute_on) { im.rt_dense_ev.wait(); im.last_sum.wait(); }   // STRATA_XE_GROUTE: its share on the dense queue
     for (const auto& le : im.dense_set) {
@@ -1547,6 +1598,157 @@ void cpu_repack_mat(int type, const uint8_t* src, uint8_t* dst, size_t NB) {
             std::memcpy(dst + 24 * NB + i * 4, sb + 24, 4);
         }
     }
+}
+
+// larry, engine1 (STRATA_XE_REPLICA_GIB, default 0 = none): which expert-card experts the dense card copies - each
+// layer's hottest there (the ranked order), a round over the layers at a time, at most STRATA_XE_REPLICA_PER_LAYER (16)
+// a layer, up to the GiB - and their planar bytes read once into pinned host memory (~2 GiB of the driver-held RAM),
+// so a seed uploads them with plain copies.  Only with STRATA_TP (the TP core's route_jobs balances them).
+void rep_prepare(Ds41XeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& order) {
+    const double gib = env_d("STRATA_XE_REPLICA_GIB", 0.0);
+    if (gib <= 0.0 || im.dense < 0 || env_i("STRATA_TP", 0) <= 0 || !im.planar || im.cards.size() < 2) return;
+    const double t0 = now_ms();
+    const int per_layer = std::max(1, env_i("STRATA_XE_REPLICA_PER_LAYER", 16));
+    const int64_t NL = im.g.n_layers;
+    // the candidates' order: the ranking, or STRATA_XE_REPLICA_USAGE=<file> (STRATA_XE_USAGE_OUT's: the most jobs first)
+    std::vector<std::pair<int32_t, int32_t>> cand = order;
+    if (const char* uf = std::getenv("STRATA_XE_REPLICA_USAGE"); uf && *uf) {
+        std::vector<std::pair<uint32_t, size_t>> use;   // (jobs, key)
+        if (std::FILE* f = std::fopen(uf, "r")) {
+            char tag;
+            long long l, e, jobs, picks, card, bytes;
+            char line[256];
+            while (std::fgets(line, sizeof line, f))
+                if (std::sscanf(line, "%c %lld %lld %lld %lld %lld %lld", &tag, &l, &e, &jobs, &picks, &card, &bytes) == 7 && tag == 'U' &&
+                    l >= 0 && l < NL && e >= 0 && e < im.g.n_experts)
+                    use.emplace_back((uint32_t) jobs, (size_t) im.key(l, e));
+            std::fclose(f);
+        }
+        std::stable_sort(use.begin(), use.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        cand.clear();
+        for (const auto& u : use) cand.emplace_back((int32_t) (u.second / (size_t) im.g.n_experts), (int32_t) (u.second % (size_t) im.g.n_experts));
+        std::fprintf(stderr, "xe tier: replicas: candidates by the uses in %s (%zu experts)\n", uf, cand.size());
+    }
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> by_layer((size_t) NL);
+    for (const auto& le : cand) {
+        const int c = im.card_of[(size_t) im.key(le.first, le.second)];
+        auto& v = by_layer[(size_t) le.first];
+        if (c >= 0 && c != im.dense && (int) v.size() < per_layer) v.push_back(le);
+    }
+    const size_t cap = (size_t) (gib * kGiB);
+    size_t total = 0;
+    for (int r = 0; r < per_layer; ++r) {
+        bool any = false;
+        for (int64_t l = 0; l < NL; ++l) {
+            const auto& v = by_layer[(size_t) l];
+            if (r >= (int) v.size()) continue;
+            const size_t b = (im.bbytes(v[(size_t) r].first, v[(size_t) r].second) + 255) & ~(size_t) 255;
+            if (total + b > cap) continue;
+            im.rep_set.push_back(v[(size_t) r]);
+            im.rep_off.push_back(total);
+            total += b;
+            any = true;
+        }
+        if (!any) break;
+    }
+    if (im.rep_set.empty()) return;
+    im.rep_host = sycl::malloc_host<uint8_t>(total, im.ctx);
+    if (!im.rep_host) {
+        std::fprintf(stderr, "xe tier: replicas: %.2f GiB of pinned memory refused - none\n", total / kGiB);
+        im.rep_set.clear();
+        im.rep_off.clear();
+        return;
+    }
+    const int H = (int) im.g.n_embd, F = (int) im.g.n_ff;
+    auto qk = [](int t) { return t == xe::kQ3K ? 256 : t == xe::kQ20 ? 64 : 128; };
+    read_all(im, im.rep_set, env_i("STRATA_XE_READERS", 12), [&](size_t k, const uint8_t* buf) {
+        const auto& le = im.rep_set[k];
+        const cpu::NativeFmt& f = im.fl[(size_t) im.cls(le.first, le.second)];
+        uint8_t* dst = im.rep_host + im.rep_off[k];
+        const size_t nbg = (size_t) F * (H / qk(f.gu_type)), nbd = (size_t) H * (F / qk(f.d_type));
+        cpu_repack_mat(f.gu_type, buf, dst, nbg);
+        cpu_repack_mat(f.gu_type, buf + f.up_off, dst + f.up_off, nbg);
+        cpu_repack_mat(f.d_type, buf + f.down_off, dst + f.down_off, nbd);
+    });
+    im.rep_ptr.assign(im.card_of.size(), nullptr);
+    std::fprintf(stderr, "xe tier: replicas: %zu expert-card experts (%.2f GiB, up to %d a layer) kept pinned for the dense card "
+                 "(%.1f s)\n", im.rep_set.size(), total / kGiB, per_layer, (now_ms() - t0) / 1000.0);
+}
+
+/// The replicas onto the dense card (after its cache: seed / regrow), slab by slab while STRATA_XE_REPLICA_MARGIN_GIB
+/// (1.0: in TP decode the dense card's use barely moves after the seed - 1.97 -> 1.95 GiB free) stays free; published
+/// in the route table once their copies landed.  Returns the replicas uploaded.
+int64_t rep_upload(Ds41XeImpl& im) {
+    if (im.rep_set.empty() || im.dense < 0 || !im.rep_slabs.empty() || !im.rt) return 0;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    const double t0 = now_ms();
+    const int64_t margin = (int64_t) (env_d("STRATA_XE_REPLICA_MARGIN_GIB", 1.0) * kGiB);
+    constexpr size_t kRepSlab = (size_t) 256 << 20;
+    std::vector<size_t> keys;
+    int64_t bytes = 0;
+    for (size_t i = 0; i < im.rep_set.size(); ++i) {
+        const auto& le = im.rep_set[i];
+        const size_t key = (size_t) im.key(le.first, le.second);
+        if (im.card_of[key] < 0 || im.card_of[key] == im.dense) continue;   // (no longer on an expert card)
+        const size_t b = im.bbytes(le.first, le.second), ba = (b + 255) & ~(size_t) 255;
+        if (im.rep_slabs.empty() || im.rep_slab_used + ba > kRepSlab) {
+            const int64_t fr = c.free_vram();
+            if (fr >= 0 && fr - (int64_t) kRepSlab < margin) break;
+            uint8_t* p = local_alloc(c.q, kRepSlab);
+            if (!p) break;
+            im.rep_slabs.push_back(p);
+            im.rep_slab_used = 0;
+        }
+        uint8_t* dst = im.rep_slabs.back() + im.rep_slab_used;
+        im.rep_slab_used += ba;
+        c.q.memcpy(dst, im.rep_host + im.rep_off[i], b);
+        im.rep_ptr[key] = dst;
+        keys.push_back(key);
+        bytes += (int64_t) b;
+    }
+    c.q.wait();
+    // STRATA_XE_REPLICA_CHECK=1: every copy against its expert card's bytes (the host repack vs the card's)
+    static const bool check = env_i("STRATA_XE_REPLICA_CHECK", 0) != 0;
+    if (check && !keys.empty()) {
+        int64_t bad = 0;
+        uint8_t* ha = sycl::malloc_host<uint8_t>((size_t) im.blob_max * 2, im.ctx);
+        for (size_t key : keys) {
+            const int64_t l = (int64_t) key / im.g.n_experts, e = (int64_t) key % im.g.n_experts;
+            const size_t b = im.bbytes(l, e);
+            if (!ha) break;
+            im.cards[(size_t) im.card_of[key]]->q.memcpy(ha, im.dptr[key], b).wait();
+            c.q.memcpy(ha + im.blob_max, im.rep_ptr[key], b).wait();
+            if (std::memcmp(ha, ha + im.blob_max, b) != 0) ++bad;
+        }
+        if (ha) sycl::free(ha, im.ctx);
+        std::fprintf(stderr, "xe tier: replicas: checked %zu against their expert cards, %lld differ\n", keys.size(), (long long) bad);
+    }
+    for (size_t key : keys) rt_put(im, key);
+    im.rep_n = (int64_t) keys.size();
+    im.rep_bytes = bytes;
+    std::fprintf(stderr, "xe tier: replicas: %lld on the dense card (%.2f GiB in %zu slabs) in %.2f s; %.2f GiB free there\n",
+                 (long long) im.rep_n, bytes / kGiB, im.rep_slabs.size(), (now_ms() - t0) / 1000.0, c.free_vram() / kGiB);
+    return im.rep_n;
+}
+
+/// The replicas off the dense card (before its cache gives VRAM back; no TP pass runs then - each one waits for its
+/// cards, and the next refreshes its table first).
+void rep_drop(Ds41XeImpl& im) {
+    if (im.rep_slabs.empty()) return;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    for (const auto& le : im.rep_set) {
+        const size_t key = (size_t) im.key(le.first, le.second);
+        if (im.rep_ptr[key]) {
+            im.rep_ptr[key] = nullptr;
+            rt_put(im, key);
+        }
+    }
+    c.q.wait();
+    for (uint8_t* p : im.rep_slabs) local_free(c.q, p);
+    im.rep_slabs.clear();
+    im.rep_slab_used = 0;
+    im.rep_n = 0;
+    im.rep_bytes = 0;
 }
 
 /// larry, engine1 (STRATA_XE_PC_STREAM, default 1): an arena blob into a pinned bounce with streaming stores - no
@@ -4179,6 +4381,8 @@ void Ds41XeTier::close() {
         im.pc_thr_more.clear();
     }
     if (im.pc_bounce) { sycl::free(im.pc_bounce, im.ctx); im.pc_bounce = nullptr; }
+    rep_drop(im);
+    if (im.rep_host) { sycl::free(im.rep_host, im.ctx); im.rep_host = nullptr; }
     if (im.cpu_log) { std::fclose(im.cpu_log); im.cpu_log = nullptr; }
     if (const char* uo = std::getenv("STRATA_XE_USAGE_OUT"); uo && !im.use_jobs.empty()) {
         if (std::FILE* f = std::fopen(uo, "w")) {   // "U layer expert jobs picks card bytes", after "P passes"

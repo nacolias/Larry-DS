@@ -657,6 +657,7 @@ struct Ds41Tp::Impl {
     bool load_bench_experts() {
         const int nb = cfg.bench_experts;
         if (nb <= 0) return true;
+        const int bench_rep = std::getenv("STRATA_TP_BENCH_REPLICAS") ? std::atoi(std::getenv("STRATA_TP_BENCH_REPLICAS")) : 0;
         struct BI { int gt, dt; size_t up_off, down_off, bytes; uint16_t gu_row, d_row; std::vector<uint8_t> host; };
         std::vector<BI> bi((size_t) nb);
         for (int b = 0; b < nb; ++b) {   // spread over the layers and the expert ids (a realistic type mix)
@@ -699,6 +700,8 @@ struct Ds41Tp::Impl {
                     tpk::TpExp & x = tab[(size_t) (l * NE + e)];
                     x.owner = (e + l) % N;
                     x.blob = x.owner == c.rank ? c.blobs[(size_t) b] : nullptr;
+                    // STRATA_TP_BENCH_REPLICAS=k: every k-th expert off rank 0 has a copy on rank 0 too (its blob is there)
+                    if (bench_rep > 0 && x.owner != 0 && e % bench_rep == 0) { x.alt = 0; x.alt_blob = cards[0]->blobs[(size_t) b]; }
                     x.up_off = (uint32_t) B.up_off; x.down_off = (uint32_t) B.down_off;
                     x.gu_type = (uint16_t) B.gt; x.d_type = (uint16_t) B.dt; x.gu_row = B.gu_row; x.d_row = B.d_row;
                 }
@@ -850,6 +853,26 @@ struct Ds41Tp::Impl {
     struct PassK { int n; int64_t cap[3]; };
     int sync_idx = 0;   // the next cross-card sync point of the pass being emitted (the same on every card)
     bool push = false;  // STRATA_TP_PUSH: cross-card sums by P2P store kernels (peer access enabled at init)
+    // route_jobs' balance between an expert's holders (STRATA_TP_BALANCE, default 1; the cost model's STRATA_TP_BAL_*):
+    // set at init from the shapes - a rank with more shared-expert columns starts its layers that much later
+    tpk::BalArgs bal;
+    void bal_init() {
+        auto envf = [](const char * k, float d) { const char * v = std::getenv(k); return v && *v ? (float) std::atof(v) : d; };
+        bal.on = env_on("STRATA_TP_BALANCE", true);
+        bal.job_us = envf("STRATA_TP_BAL_JOB_US", 19.0f);
+        bal.us_per_byte = 1.0f / (envf("STRATA_TP_BAL_GBS", 837.0f) * 1e3f);
+        bal.tok_us = envf("STRATA_TP_BAL_TOK_US", 3.0f);
+        bal.cpu_us = envf("STRATA_TP_BAL_CPU_US", 85.0f);
+        bal.cpu_us_per_byte = 1.0f / (envf("STRATA_TP_BAL_CPU_GBS", 30.0f) * 1e3f);
+        const float blk_us = envf("STRATA_TP_BAL_SHEXP_US", 10.0f);   // a 256-column block of the shared expert
+        int64_t fmin = INT64_MAX;
+        for (auto & cp : cards) fmin = std::min(fmin, cp->fk);
+        for (auto & cp : cards) if (cp->rank < 8) bal.base[cp->rank] = cfg.shexp ? (float) ((cp->fk - fmin) / QK) * blk_us : 0.0f;
+        bal.dense = 0;
+        bal.ncard = std::min(N, 8);
+        bal.nff = NFF;
+        bal.d = D;
+    }
     bool tap_on = false;   // the pass records DSpark's taps (a graph per (n, caps, taps))
 
     tpdec::Rope rope_p(int64_t ratio) const {
@@ -1221,8 +1244,8 @@ struct Ds41Tp::Impl {
         if (c.etab) {   // this card's routed experts, added to the shared expert's partial
             const int njm = n * (int) NU;
             static const bool route_par = env_on("STRATA_TP_ROUTE_PAR", true);   // a lane a pick (0: the one-work-item form)
-            (route_par ? tpk::route_jobs : tpk::route_jobs_serial)(c.q, c.ids, c.wts, n, (int) NU, c.etab + (size_t) l * NE, c.rank,
-                                                                      c.jobs, njm, c.need_cpu);
+            if (route_par) tpk::route_jobs(c.q, c.ids, c.wts, n, (int) NU, c.etab + (size_t) l * NE, c.rank, c.jobs, njm, c.need_cpu, bal);
+            else tpk::route_jobs_serial(c.q, c.ids, c.wts, n, (int) NU, c.etab + (size_t) l * NE, c.rank, c.jobs, njm, c.need_cpu);
             ST(c, l, 21);
             strata::v41::xe::xe_quant_rows(c.q, c.fn, n, (int) D, c.X);
             ST(c, l, 22);
@@ -1721,9 +1744,10 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
                      im.deferred(*c) ? (" (+ " + std::to_string((int) (im.deferred(*c) >> 20)) + " MiB of KV rows mapped as the context grows)").c_str() : "");
     }
     im.q6_drop();
+    im.bal_init();
     if (!im.load_bench_experts()) { err = im.err; return false; }
     if (im.hooks.rtab) {   // the tier's experts: every card computes the selected ones it holds
-        static_assert(sizeof(tpk::TpExp) == 32, "TpExp mirrors the tier's RtEnt");
+        static_assert(sizeof(tpk::TpExp) == 40, "TpExp mirrors the tier's RtEnt");
         for (auto & c : im.cards) if (!im.expert_buffers(*c)) { err = im.err; return false; }
         im.refresh_rtab();
         for (auto & c : im.cards) c->q.wait();

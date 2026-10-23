@@ -595,9 +595,23 @@ inline sycl::event engram_add(sycl::queue & q, float * x, const float * kv, cons
 struct TpExp {   // where (layer, expert) lives: the rank holding it (-1: the CPU pool) and, on that rank, its blob
     const uint8_t * blob = nullptr;
     uint32_t up_off = 0, down_off = 0;
-    uint16_t gu_type = 0, d_type = 0, gu_row = 0, d_row = 0;
+    uint16_t gu_type = 0, d_type = 0, gu_row = 0, d_row = 0;   // (CPU-pool experts too: their bytes)
     int32_t owner = -1;
-    int32_t pad = 0;
+    int32_t alt = -1;                  // larry, engine1: a second rank holding a copy (a replica on the dense card), or -1
+    const uint8_t * alt_blob = nullptr;   // the copy on `alt`
+};
+
+// larry, engine1: route_jobs' balance between an expert's holders (identical on every card: the same routing, the
+// same table fields, the same arithmetic).  A job costs job_us + its bytes x us_per_byte (+ tok_us a token past the
+// first) on a card - fitted on stamped verify passes (bench/engine1/place.py: 837 GB/s + 19 us a job); the dense rank,
+// which adds the CPU pool's sum, finishes no earlier than cpu_us + the CPU experts' bytes x cpu_us_per_byte.
+struct BalArgs {
+    float job_us = 19.0f, us_per_byte = 1.0f / 837e3f, tok_us = 3.0f;
+    float cpu_us = 85.0f, cpu_us_per_byte = 1.0f / 30e3f;
+    float base[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // per rank: what it runs beside the routed experts (an uneven shared expert)
+    int dense = 0, ncard = 1;
+    int64_t nff = 0, d = 0;            // expert shapes: bytes = 2 nff gu_row + d d_row
+    bool on = true;                    // false: every job to its owner
 };
 
 // jobs[0..nj_max): this card's experts in pick order (token-major), then null jobs (nt = 0: the expert kernels skip
@@ -635,37 +649,86 @@ inline sycl::event route_jobs_serial(sycl::queue & q, const int32_t * ids, const
 }
 
 // the same jobs, a lane a pick (the serial form's dependent loads were 4.5 us at 1 token, 15 us at 5): an expert's
-// first pick opens its job (the job index = the first picks before it), and gathers the expert's later picks
+// first pick opens its job (the job index = this card's first picks before it), and gathers the expert's later picks.
+// larry, engine1: a job whose expert has a copy on a second rank (TpExp::alt) runs on whichever of the two finishes
+// sooner - lane 0 lays the fixed jobs on their owners, then the replicated ones heaviest first (BalArgs).  Without
+// copies every job is its owner's: the lists are the one-work-item form's.
 inline sycl::event route_jobs(sycl::queue & q, const int32_t * ids, const float * wts, int n, int nu, const TpExp * tab, int me,
-                              strata::v41::xe::XeJob * jobs, int nj_max, int32_t * need_cpu) {
+                              strata::v41::xe::XeJob * jobs, int nj_max, int32_t * need_cpu, const BalArgs & bal) {
     constexpr int WG = 64;
     const int np = n * nu;
     if (np > WG) return route_jobs_serial(q, ids, wts, n, nu, tab, me, jobs, nj_max, need_cpu);
+    const BalArgs B = bal;
     return q.submit([&](sycl::handler & h) {
-        sycl::local_accessor<int32_t, 1> le(sycl::range<1>(WG), h);   // pick p's expert when this card holds it, else -1
+        sycl::local_accessor<int32_t, 1> le(sycl::range<1>(WG), h);   // pick p's expert (-1: past the picks)
         sycl::local_accessor<float, 1> lw(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> lf(sycl::range<1>(WG), h);   // 1: the first pick of its expert
+        sycl::local_accessor<int32_t, 1> lo(sycl::range<1>(WG), h);   // its owner / its copy's rank
+        sycl::local_accessor<int32_t, 1> la(sycl::range<1>(WG), h);
+        sycl::local_accessor<float, 1> lc(sycl::range<1>(WG), h);     // its job's cost (a CPU-pool expert: the pool's)
+        sycl::local_accessor<int32_t, 1> lr(sycl::range<1>(WG), h);   // the rank that runs it
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const int p = (int) it.get_local_id(0);
             int e = -1;
-            bool cpu = false;
             TpExp x;
             if (p < np) {
-                const int ee = ids[p];
-                x = tab[ee];
-                if (x.owner == me) e = ee;
-                else if (x.owner < 0) cpu = true;
+                e = ids[p];
+                x = tab[e];
                 lw[p] = wts[p];
             }
             le[p] = e;
             sycl::group_barrier(it.get_group());
             bool first = e >= 0;
             for (int k = 0; k < p && first; ++k) first = le[k] != e;
-            const int jidx = sycl::exclusive_scan_over_group(it.get_group(), first ? 1 : 0, sycl::plus<int>());
-            const int nj = sycl::reduce_over_group(it.get_group(), first ? 1 : 0, sycl::plus<int>());
-            const bool any_cpu = sycl::any_of_group(it.get_group(), cpu);
-            if (first) {
+            int cnt = 0;
+            if (first)
+                for (int k = p; k < np; ++k) cnt += le[k] == e ? 1 : 0;
+            const float bytes = (float) (2 * B.nff * (int64_t) x.gu_row + B.d * (int64_t) x.d_row);
+            lf[p] = first ? 1 : 0;
+            lo[p] = x.owner;
+            la[p] = x.alt;
+            lc[p] = x.owner < 0 ? bytes * B.cpu_us_per_byte : B.job_us + bytes * B.us_per_byte + B.tok_us * (float) (cnt - 1);
+            lr[p] = x.owner;
+            sycl::group_barrier(it.get_group());
+            if (p == 0 && B.on) {
+                float L[8];
+                for (int k = 0; k < 8; ++k) L[k] = k < B.ncard ? B.base[k] : 0.0f;
+                float cpu = 0.0f;
+                bool anyc = false;
+                int rep[WG];
+                int nr = 0;
+                for (int k = 0; k < np; ++k) {
+                    if (!lf[k]) continue;
+                    if (lo[k] < 0) { anyc = true; cpu += lc[k]; }
+                    else if (la[k] < 0 || la[k] == lo[k] || la[k] >= B.ncard) L[lo[k]] += lc[k];
+                    else rep[nr++] = k;
+                }
+                if (anyc) cpu += B.cpu_us;
+                for (int i = 1; i < nr; ++i) {   // heaviest first (ties: pick order)
+                    const int v = rep[i];
+                    int j = i - 1;
+                    while (j >= 0 && lc[rep[j]] < lc[v]) { rep[j + 1] = rep[j]; --j; }
+                    rep[j + 1] = v;
+                }
+                for (int i = 0; i < nr; ++i) {
+                    const int k = rep[i], o = lo[k], a = la[k];
+                    const float c = lc[k];
+                    const float fo = o == B.dense ? sycl::fmax(L[o] + c, cpu) : L[o] + c;
+                    const float fa = a == B.dense ? sycl::fmax(L[a] + c, cpu) : L[a] + c;
+                    const int w = fa < fo ? a : o;
+                    L[w] += c;
+                    lr[k] = w;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            const bool mine = first && x.owner >= 0 && lr[p] == me;
+            const int jidx = sycl::exclusive_scan_over_group(it.get_group(), mine ? 1 : 0, sycl::plus<int>());
+            const int nj = sycl::reduce_over_group(it.get_group(), mine ? 1 : 0, sycl::plus<int>());
+            const bool any_cpu = sycl::any_of_group(it.get_group(), p < np && x.owner < 0);
+            if (mine) {
                 strata::v41::xe::XeJob & jb = jobs[jidx];
-                jb.blob = x.blob; jb.up_off = x.up_off; jb.down_off = x.down_off;
+                jb.blob = me == x.owner ? x.blob : x.alt_blob;
+                jb.up_off = x.up_off; jb.down_off = x.down_off;
                 jb.gu_type = x.gu_type; jb.d_type = x.d_type; jb.gu_row = x.gu_row; jb.d_row = x.d_row;
                 int nt = 0;
                 for (int k = p; k < np; ++k)

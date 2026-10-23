@@ -514,6 +514,10 @@ int main(int argc, char ** argv) {
     }
 #if defined(DS41_XE)
     if (!tier.init(TG, &src, mc, mc.cpu_only ? nullptr : dense.routed_dev(), err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+    // larry, engine1: an allocation that finds a card full first takes back the tier's droppable expert replicas there
+    // (the dense card's copies; STRATA_XE_REPLICA_GIB) - cleared before the tier goes
+    ggml_backend_sycl_set_reclaim_hook([](int dev, size_t bytes, void * ud) { return static_cast<Ds41Tier *>(ud)->reclaim(dev, (int64_t) bytes); }, &tier);
+    struct ReclaimOff { ~ReclaimOff() { ggml_backend_sycl_set_reclaim_hook(nullptr, nullptr); } } reclaim_off;
     // the decode / verify sums on the dense half's queue: no host wait per layer (STRATA_XE_SYNC=1: the tier waits)
     if (!mc.cpu_only && !std::getenv("STRATA_XE_SYNC")) {
         tier.set_dense_queue(ggml_backend_sycl_get_queue(dense.backend()));
