@@ -1260,7 +1260,11 @@ int main(int argc, char ** argv) {
                     const bool lo_pf = B >= pf_min, hi_pf = cut > 0 ? nb >= pf_min_b : nb >= pf_min;
                     const int pf_first = hi_pf && !lo_pf && cut > 0 ? CL : 0;
                     const int pf_last = hi_pf ? n_layer - 1 : (cut > 0 && lo_pf ? CL - 1 : -1);
-                    if (pf_last >= 0 && !mc.cpu_only) tier.prefetch_begin(pf_first, pf_last, pipe ? part_max : B);
+                    // STRATA_XE_PREFETCH_DEPTH (0 = off): a batch ending before this position takes none (a shallow
+                    // batch is bound by its experts: on demand with the CPU pool's light experts it runs faster)
+                    static const int64_t pf_depth = std::getenv("STRATA_XE_PREFETCH_DEPTH") ? std::atoll(std::getenv("STRATA_XE_PREFETCH_DEPTH")) : 0;
+                    const bool pf_shallow = (int64_t) pos0 + c0 + B < pf_depth;
+                    if (pf_last >= 0 && !pf_shallow && !mc.cpu_only) tier.prefetch_begin(pf_first, pf_last, pipe ? part_max : B);
                 }
                 if (pipe) {
                     // STRATA_SUBMIT_PRIO (default 1): the dense half's lock waits hold the tier's threads off
@@ -2089,6 +2093,10 @@ int main(int argc, char ** argv) {
                         const int n = (int) hist.size();
                         auto sq = [&](int i) { return i == n ? t : hist[(size_t) i]; };
                         int cap = std::min(lk_max, kVerify - 1 - (refeed ? 1 : 0));
+                        // larry, engine1 (STRATA_LOOKUP_TP=1): the pass stays on the TP core (<= 7 rows) - a wider one
+                        // takes the old path, which pages card 0's dense weights in every layer (~0.1-0.2 s a pass)
+                        static const bool lk_tp = std::getenv("STRATA_LOOKUP_TP") && std::getenv("STRATA_LOOKUP_TP")[0] == '1';
+                        if (lk_tp && tp_on) cap = std::min(cap, 7 - 1 - (refeed ? 1 : 0));
                         if (max_new > 0) cap = std::min(cap, max_new - gen);
                         cap = std::min(cap, ctxv - (P + 3));
                         if (cap >= 2 && n > lk_g + 1) {
