@@ -1255,8 +1255,12 @@ int main(int argc, char ** argv) {
                     static const int pf_min = std::getenv("STRATA_XE_PREFETCH_MIN") ? std::atoi(std::getenv("STRATA_XE_PREFETCH_MIN")) : 2048;
                     static const int pf_min_b = std::getenv("STRATA_XE_PREFETCH_MIN_B") ? std::atoi(std::getenv("STRATA_XE_PREFETCH_MIN_B")) : pf_min;
                     const int nb = cut > 0 ? B - cut : B;
-                    const int pf_last = (cut > 0 ? nb >= pf_min_b : nb >= pf_min) ? n_layer - 1 : (cut > 0 && B >= pf_min ? CL - 1 : -1);
-                    if (pf_last >= 0 && !mc.cpu_only) tier.prefetch_begin(0, pf_last, pipe ? part_max : B);
+                    // the lower layers' calls have B columns, an enc-skip batch's upper layers' (CL on) nb: each part
+                    // its own threshold; only the upper part reaching its own = layers CL..39 (a 3-4K-token prompt)
+                    const bool lo_pf = B >= pf_min, hi_pf = cut > 0 ? nb >= pf_min_b : nb >= pf_min;
+                    const int pf_first = hi_pf && !lo_pf && cut > 0 ? CL : 0;
+                    const int pf_last = hi_pf ? n_layer - 1 : (cut > 0 && lo_pf ? CL - 1 : -1);
+                    if (pf_last >= 0 && !mc.cpu_only) tier.prefetch_begin(pf_first, pf_last, pipe ? part_max : B);
                 }
                 if (pipe) {
                     // STRATA_SUBMIT_PRIO (default 1): the dense half's lock waits hold the tier's threads off
