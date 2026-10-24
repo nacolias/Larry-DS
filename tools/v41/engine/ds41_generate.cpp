@@ -1247,11 +1247,15 @@ int main(int argc, char ** argv) {
                 pipe = pipe && any2 && part_max <= piece;
                 // larry: the tier streams each layer's arena experts onto the expert cards ahead of its run_chunk_dev
                 // (layers whose tier call has >= STRATA_XE_PREFETCH_MIN tokens; with enc-skip the layers from CL on
-                // run only the phase-B columns)
+                // run only the phase-B columns: STRATA_XE_PREFETCH_MIN_B, default the same).  Below its threshold a
+                // layer's routed arena experts stream on demand and STRATA_XE_CPU_LIGHT runs the light ones on the CPU
+                // pool: a whole prompt of 2-3K tokens is faster so (2,048 tokens ~345 -> ~500 tok/s), a long prompt's
+                // upper layers (~2,560 columns over a long context, card 0's attention the bottleneck) are not (31K +5 s)
                 {
                     static const int pf_min = std::getenv("STRATA_XE_PREFETCH_MIN") ? std::atoi(std::getenv("STRATA_XE_PREFETCH_MIN")) : 2048;
+                    static const int pf_min_b = std::getenv("STRATA_XE_PREFETCH_MIN_B") ? std::atoi(std::getenv("STRATA_XE_PREFETCH_MIN_B")) : pf_min;
                     const int nb = cut > 0 ? B - cut : B;
-                    const int pf_last = nb >= pf_min ? n_layer - 1 : (cut > 0 && B >= pf_min ? CL - 1 : -1);
+                    const int pf_last = (cut > 0 ? nb >= pf_min_b : nb >= pf_min) ? n_layer - 1 : (cut > 0 && B >= pf_min ? CL - 1 : -1);
                     if (pf_last >= 0 && !mc.cpu_only) tier.prefetch_begin(0, pf_last, pipe ? part_max : B);
                 }
                 if (pipe) {
