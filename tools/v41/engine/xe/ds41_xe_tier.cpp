@@ -1048,9 +1048,15 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     }
     int64_t pinned = 0;
     std::vector<uint8_t> chunk_pinned(nchunks, 0);
+    // larry, STRATA_XE_PIN_SKIP_GIB (default 0): the first GiB of the ranked arena - what card 0's expert cache holds
+    // anyway - stay pageable; the pinned budget goes to the experts prompts stream and decode promotes
+    const int64_t pin_skip = (int64_t) (env_d("STRATA_XE_PIN_SKIP_GIB", 0.0) * kGiB);
+    int64_t ranked_bytes = 0;
     for (size_t c = 0; c < nchunks; ++c) {
         uint8_t* p = nullptr;
-        if (pinned + (int64_t) chunk_size[c] <= pin_cap) {
+        const bool skip = ranked_bytes < pin_skip;
+        ranked_bytes += (int64_t) chunk_size[c];
+        if (!skip && pinned + (int64_t) chunk_size[c] <= pin_cap) {
             p = sycl::malloc_host<uint8_t>(chunk_size[c], im.ctx);
             if (p) { pinned += (int64_t) chunk_size[c]; chunk_pinned[c] = 1; }
         }

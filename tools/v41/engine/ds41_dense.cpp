@@ -206,11 +206,11 @@ struct Ds41Dense::Impl {
     // larry, engine1: what was written since take_written() (an external decode core re-syncs from it; at first: all)
     int64_t wr_lo = 0, wr_hi = INT64_MAX;
     bool wr_changed = true;
-    int64_t parked_n = 0;
     void wrote(int64_t lo, int64_t hi) { wr_lo = std::min(wr_lo, lo); wr_hi = std::max(wr_hi, hi); wr_changed = true; }
     struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; };
-    std::vector<ParkedRows> parked;     // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites
-    int parked_pos = -1;
+    // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites; larry: two slots
+    struct ParkSlot { std::vector<ParkedRows> rows; int pos = -1; int64_t n = 0; };
+    ParkSlot pk[2];
     std::vector<Layer> ly;
 
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
@@ -2774,15 +2774,16 @@ void Ds41Dense::kv_bytes_for(int64_t positions, std::vector<size_t> & bytes) con
 
 bool Ds41Dense::kv_lazy() const { return p_->kv_buf != nullptr; }
 
-bool Ds41Dense::park(int64_t positions) {
+bool Ds41Dense::park(int64_t positions, int slot) {
     Impl & im = *p_;
-    if (im.snap_pos < 0 || positions < 1) return false;
+    if (im.snap_pos < 0 || positions < 1 || slot < 0 || slot > 1) return false;
     ggml_backend_synchronize(im.backend);
-    im.parked.clear();
+    Impl::ParkSlot & S = im.pk[slot];
+    S.rows.clear();
     auto put = [&](ggml_tensor * t, size_t off, size_t n) {
         Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
         ggml_backend_tensor_get(t, r.b.data(), off, n);
-        im.parked.push_back(std::move(r));
+        S.rows.push_back(std::move(r));
     };
     for (auto & L : im.ly) {
         for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
@@ -2795,30 +2796,32 @@ bool Ds41Dense::park(int64_t positions) {
             put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
         }
     }
-    im.parked_pos = im.snap_pos;
-    im.parked_n = positions;
+    S.pos = im.snap_pos;
+    S.n = positions;
     return true;
 }
 
-bool Ds41Dense::unpark() {
+bool Ds41Dense::unpark(int slot) {
     Impl & im = *p_;
-    if (im.parked_pos < 0) return false;
+    if (slot < 0 || slot > 1 || im.pk[slot].pos < 0) return false;
+    Impl::ParkSlot & S = im.pk[slot];
     ggml_backend_synchronize(im.backend);
-    for (auto & r : im.parked) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    for (auto & r : S.rows) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
     ggml_backend_synchronize(im.backend);
-    im.wrote(0, 2 * (im.parked_n + 1));   // the parked rows (rows [0, positions + 1] of either ratio)
-    im.snap_pos = im.parked_pos;
-    drop_park();
+    im.wrote(0, 2 * (S.n + 1));   // the parked rows (rows [0, positions + 1] of either ratio)
+    im.snap_pos = S.pos;
+    drop_park(slot);
     return true;
 }
 
-void Ds41Dense::drop_park() {
-    p_->parked.clear();
-    p_->parked.shrink_to_fit();
-    p_->parked_pos = -1;
+void Ds41Dense::drop_park(int slot) {
+    if (slot < 0 || slot > 1) return;
+    p_->pk[slot].rows.clear();
+    p_->pk[slot].rows.shrink_to_fit();
+    p_->pk[slot].pos = -1;
 }
 
-bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
+bool Ds41Dense::parked(int slot) const { return slot >= 0 && slot <= 1 && p_->pk[slot].pos >= 0; }
 
 bool Ds41Dense::state_ptrs(int il, void ** raw, void ** comp, void ** idxk, void ** st_kv, void ** st_sc) const {
     const Impl & im = *p_;

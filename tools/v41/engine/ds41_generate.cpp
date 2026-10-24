@@ -1658,9 +1658,20 @@ int main(int argc, char ** argv) {
         };
         const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
-        std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
-        std::vector<float> park_logits;
-        int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
+        // larry: STRATA_SERVE_PARK_SLOTS (default 2, 1 = the old way) conversations kept beside the live one - with one, a
+        // parked conversation nobody continued kept the slot and the next side request could not park the live one (its
+        // next turn read everything again).  A park saves the whole conversation when it fits park_max (no later write
+        // can spoil it); a bigger one only the side request's reach, and is dropped once anything writes past that.
+        static const int park_slots = std::max(1, std::min(2, std::getenv("STRATA_SERVE_PARK_SLOTS") ? std::atoi(std::getenv("STRATA_SERVE_PARK_SLOTS")) : 2));
+        struct ParkMeta {
+            std::vector<int> hist;        // the parked conversation's tokens (its snapshot length)
+            std::vector<float> logits;
+            int64_t saved = 0;            // positions saved
+            int64_t valid = 0;            // a write past this spoils it (INT64_MAX: saved whole)
+            long stamp = 0;               // when it was parked (the oldest goes first)
+        };
+        ParkMeta pk[2];
+        long park_tick = 0;
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
@@ -1715,24 +1726,44 @@ int main(int argc, char ** argv) {
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
-            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
-                size_t lp = 0;
-                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
-                lp_show = lp;
-                // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
-                // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
-                // or an EMPTY assistant turn, as the s13 harness produces - leaves lp just under park_hist.size(), and
-                // requiring an exact prefix threw away a 21,349-token cache over a 27-token difference: run8/run15 both
-                // logged "reuse lcp=27 hist=0 snap=-1 prompt=23531 -> reused=0" and re-read the whole prompt.
-                // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
-                // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
-                // at the longest common prefix even when it is below the snapshot").
-                static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
-                const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
+            int ub = -1;               // larry: the parked slot it continues best (STRATA_SERVE_PARK_SLOTS)
+            for (int s = 0; s < park_slots; ++s) {
+                if (!dense.parked(s)) continue;
+                size_t l = 0;
+                while (l < pk[s].hist.size() && l < ids.size() && pk[s].hist[l] == ids[l]) ++l;
+                if (ub < 0 || l > lp_show) { ub = s; lp_show = l; }
+            }
+            // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
+            // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
+            // or an EMPTY assistant turn, as the s13 harness produces - leaves lp just under park_hist.size(), and
+            // requiring an exact prefix threw away a 21,349-token cache over a 27-token difference: run8/run15 both
+            // logged "reuse lcp=27 hist=0 snap=-1 prompt=23531 -> reused=0" and re-read the whole prompt.
+            // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
+            // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
+            // at the longest common prefix even when it is below the snapshot").
+            static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
+            int un = 0;   // 1: unpark ub whole, 2: partially (the request re-feeds from its lcp)
+            if (ub >= 0) {
+                const size_t n_ub = pk[ub].hist.size();
+                const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) n_ub * 3 / 4);
+                if (lp_show > lcp && lp_show == n_ub) un = 1;
+                else if (lp_show > lcp && park_partial && lp_show < n_ub && lp_show >= lp_min) un = 2;
+            }
+            {   // a partially saved park is spoiled by a write past its saved rows: this request's, or the unpark of a slot that saved more
+                const int64_t reach = (int64_t) ids.size() + std::max(0, max_new);
+                for (int s = 0; s < park_slots; ++s)
+                    if (dense.parked(s) && !(un && s == ub) && (reach > pk[s].valid || (un && pk[ub].saved > pk[s].valid))) {
+                        dense.drop_park(s);
+                        std::fprintf(stderr, "serve: park %d dropped (a write past its %lld saved positions)\n", s, (long long) pk[s].valid);
+                    }
+            }
+            if (un) {   // this request continues a parked conversation (better than the live one)
                 const double tup = now_ms();
-                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there; %.2f s)\n",
-                                 park_hist.size(), lp, (now_ms() - tup) / 1000.0);
+                const std::vector<int> & park_hist = pk[ub].hist;
+                const size_t lp = lp_show;
+                if (un == 2 && dense.unpark(ub)) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation from slot %d at lcp %zu (partial: re-feeds from there; %.2f s)\n",
+                                 park_hist.size(), ub, lp, (now_ms() - tup) / 1000.0);
                     hist = park_hist;
                     snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
                     reuse_override = (int) lp;
@@ -1741,20 +1772,18 @@ int main(int argc, char ** argv) {
 #if defined(DS41_HAVE_DSPARK)
                     dsp_next = -1;        // DSpark's window holds the side request's states
 #endif
-                } else if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation (%.2f s)\n", park_hist.size(), (now_ms() - tup) / 1000.0);
+                } else if (un == 1 && dense.unpark(ub)) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation from slot %d (%.2f s)\n", park_hist.size(), ub,
+                                 (now_ms() - tup) / 1000.0);
                     hist = park_hist;
                     snap_len = (int) park_hist.size();
-                    snap_logits = park_logits;
+                    snap_logits = pk[ub].logits;
                     snap_seed_n = 0;
                     lcp = lp;
                     unparked = true;   // the live rings are the side request's: resume through restore()
 #if defined(DS41_HAVE_DSPARK)
                     dsp_next = -1;     // DSpark's window holds the side request's states
 #endif
-                } else if ((int64_t) ids.size() + std::max(0, max_new) > park_rows) {
-                    dense.drop_park();   // this request writes past the saved rows
-                    std::fprintf(stderr, "serve: park dropped (request reaches past %lld positions)\n", (long long) park_rows);
                 }
             }
             int reused = 0;
@@ -1774,21 +1803,38 @@ int main(int argc, char ** argv) {
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
                 // larry: the conversation's own rows only - it re-writes everything past its snapshot when it goes on
                 // (an agent's side call asks for 32000 tokens: a 12.6K conversation was saved as 47K positions)
-                const int64_t save = std::min<int64_t>(rows, (int64_t) snap_len + 1);
+                // (larry, two slots: the whole conversation when it fits park_max - then no later write spoils it)
+                const bool whole = park_slots > 1 && (int64_t) snap_len + 1 <= park_max;
+                const int64_t save = whole ? (int64_t) snap_len + 1 : std::min<int64_t>(rows, (int64_t) snap_len + 1);
                 const double tpk = now_ms();
-                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && save <= park_max
-                    && dense.park(save)) {
-                    park_hist.assign(hist.begin(), hist.begin() + snap_len);
-                    park_logits = snap_logits;
-                    park_rows = rows;
-                    std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved, valid to %lld; %.2f s)\n",
-                                 snap_len, (long long) save, (long long) rows, (now_ms() - tpk) / 1000.0);
+                int ps = -1;   // a free slot, else the one parked longest ago
+                for (int s = 0; s < park_slots && ps < 0; ++s) if (!dense.parked(s)) ps = s;
+                if (ps < 0) {
+                    ps = 0;
+                    for (int s = 1; s < park_slots; ++s) if (pk[s].stamp < pk[ps].stamp) ps = s;
+                }
+                if (park_on && snap_len >= park_min && hist.size() >= (size_t) snap_len && save <= park_max) {
+                    if (dense.parked(ps)) {
+                        dense.drop_park(ps);
+                        std::fprintf(stderr, "serve: park %d replaced (its %zu-token conversation was parked longest ago)\n", ps, pk[ps].hist.size());
+                    }
+                    if (dense.park(save, ps)) {
+                        pk[ps].hist.assign(hist.begin(), hist.begin() + snap_len);
+                        pk[ps].logits = snap_logits;
+                        pk[ps].saved = save;
+                        pk[ps].valid = save == (int64_t) snap_len + 1 ? INT64_MAX : rows;
+                        pk[ps].stamp = ++park_tick;
+                        std::fprintf(stderr, "serve: parked the %d-token conversation in slot %d (%lld positions saved, %s; %.2f s)\n",
+                                     snap_len, ps, (long long) save, save == (int64_t) snap_len + 1 ? "whole" : "partial",
+                                     (now_ms() - tpk) / 1000.0);
+                    }
                 }
                 hist.clear();
                 snap_len = -1;
             }
-            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
-                         park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
+            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu/%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
+                         dense.parked(0) ? pk[0].hist.size() : (size_t) 0, dense.parked(1) ? pk[1].hist.size() : (size_t) 0, lp_show,
+                         hist.size(), snap_len, ids.size(), reused);
             if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
