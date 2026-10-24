@@ -3636,16 +3636,10 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         std::vector<const XeCard*> others;
         for (auto& cp : im.cards) if (cp->busy && !cp->dense) others.push_back(cp.get());
         sycl::event cev;
-        const float* cpu_part = nullptr;   // STRATA_XE_CPU_LIGHT: the pool's sum, copied onto the dense card first
-        if (!light.empty()) {
-            std::lock_guard<PrioMutex> lk(g_submit);
-            if (!grow_dev(im.lt_dev, im.lt_dev_cap, NE, dc->q)) {
-                std::fprintf(stderr, "xe tier: dense card: CPU-light buffer allocation failed\n");
-                return false;
-            }
-            dc->q.memcpy(im.lt_dev, im.lt_hs, NE * 4);
-            cpu_part = im.lt_dev;
-        }
+        // STRATA_XE_CPU_LIGHT: the pool's sum, read by the combine straight from pinned host memory - a copy in a
+        // dense-card buffer (~70 MB after a 6.7K prompt) put DSpark's long prompts under ggml-sycl's fp16 weight-cache
+        // floor (3 GB free on card 0): their dense phase +13-20 %
+        const float* cpu_part = light.empty() ? nullptr : im.lt_hs;
         if (cmb > 0) {   // STRATA_XE_COMBINE: every busy card's part is in its slot (its thread waited for the push)
             std::lock_guard<PrioMutex> lk(g_submit);
             int idx[8] = {};
