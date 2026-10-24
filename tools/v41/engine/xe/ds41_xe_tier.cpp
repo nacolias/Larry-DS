@@ -385,6 +385,12 @@ struct Ds41XeImpl {
     int pc_par = 1;                    ///< promotions in flight a card (1; engine1's between-pass driving: more)
     std::vector<sycl::queue*> pc_q;    ///< larry, engine1: the queue a card's promotion copies go to (null: the card's own)
     std::map<int, size_t> tp_defer;    ///< larry, engine1: by GPU, the TP core's VRAM not mapped yet (the flex holds it)
+    /// larry, engine1, STRATA_XE_TP_EVICT: per card its static experts in upload order (slabs fill in that order) and the
+    /// index from which they may go back to the arena (whole slabs; each has an arena copy)
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> card_set;
+    std::vector<size_t> evict_from;
+    int64_t evicted_n = 0;
+    std::vector<uint8_t*> evict_bufs;  ///< the evicted experts' host copies (read from the model file at eviction)
     double dense_bonus_gib = 0;        ///< larry, engine1: card 0 VRAM the pager gave back (on top of STRATA_XE_DENSE_GIB)
     std::map<int, std::pair<uint8_t*, size_t>> dbg;   ///< debug captures (pinned), by slot
     /// larry, engine1 (STRATA_TP, STRATA_TP_PC_DEVREPACK=1; default 0 since 2026-10-24): a promotion copies the expert's
@@ -784,6 +790,91 @@ namespace {
 bool hot_on();
 size_t hot_chunk();
 int hot_slots();
+void rt_put(Ds41XeImpl& im, size_t key);
+void rep_drop(Ds41XeImpl& im);
+/// larry, engine1, STRATA_XE_TP_EVICT (default 0): see tp_make_room / build_arena_ranked
+bool tp_evict_on() { static const bool on = env_i("STRATA_XE_TP_EVICT", 0) != 0; return on; }
+int64_t tp_defer_flex() {
+    static const int64_t b = (int64_t) (env_d("STRATA_XE_TP_DEFER_FLEX_GIB", 0.8) * 1073741824.0);
+    return b;
+}
+/// the card's evictable last slabs back to the arena until `need` bytes are free; their experts become arena experts.
+/// Between TP passes only: no kernel reads them (the card's queues are idle; promotions write flex slots).
+int64_t evict_slabs(Ds41XeImpl& im, XeCard& c, int64_t need) {
+    const size_t ci = (size_t) c.idx;
+    if (ci >= im.card_set.size()) return 0;
+    auto& set = im.card_set[ci];
+    const size_t from = im.evict_from[ci];
+    if (set.size() <= from || c.slabs.size() < 2) return 0;
+    const double t0 = now_ms();
+    rep_drop(im);   // the dense card's copies of expert-card experts first (route tables: those entries change too)
+    c.q.wait();
+    int64_t n = 0, bytes = 0;
+    while (c.free_vram() < need && c.slabs.size() > 1 && set.size() > from) {
+        uint8_t* last = c.slabs.back();
+        size_t k = set.size();   // the slab's experts: a suffix of set
+        while (k > 0) {
+            const auto& le = set[k - 1];
+            const uint8_t* p = im.dptr[(size_t) im.key(le.first, le.second)];
+            if (p < last || p >= last + kSlab) break;
+            --k;
+        }
+        if (k < from) break;     // the slab holds experts that are not evictable
+        // their host copies first, from the model file (pageable; the arena's own blobs stay where they are)
+        std::vector<std::pair<int32_t, int32_t>> list(set.begin() + (std::ptrdiff_t) k, set.end());
+        std::vector<size_t> off(list.size());
+        size_t tot = 0;
+        for (size_t i = 0; i < list.size(); ++i) { off[i] = tot; tot += (im.bbytes(list[i].first, list[i].second) + 4095) & ~(size_t) 4095; }
+        const int64_t mem_keep = (int64_t) (env_d("STRATA_XE_TP_EVICT_MEM_GIB", 4.0) * 1073741824.0);
+        const int64_t avail = mem_available_bytes();
+        if (avail > 0 && avail - (int64_t) tot < mem_keep) {
+            std::fprintf(stderr, "xe tier: card %d: no eviction - %.2f GiB of host memory available, %.2f GiB needed\n", c.idx,
+                         avail / 1073741824.0, tot / 1073741824.0);
+            break;
+        }
+        uint8_t* hb = (uint8_t*) std::aligned_alloc(4096, tot);
+        if (!hb) break;
+        read_all(im, list, 8, [&](size_t i, const uint8_t* buf) { std::memcpy(hb + off[i], buf, im.bbytes(list[i].first, list[i].second)); });
+        im.evict_bufs.push_back(hb);
+        for (size_t i = 0; i < list.size(); ++i) {
+            const size_t key = (size_t) im.key(list[i].first, list[i].second);
+            im.aptr[key] = hb + off[i];
+            im.apin[key] = 0;
+        }
+        im.arena_bytes += (int64_t) tot;
+        im.arena_n += (int64_t) list.size();
+        for (size_t i = k; i < set.size(); ++i) {
+            const auto& le = set[i];
+            const size_t key = (size_t) im.key(le.first, le.second);
+            im.card_of[key] = -1;
+            im.dptr[key] = nullptr;
+            rt_put(im, key);
+            c.used -= (int64_t) im.bbytes(le.first, le.second);
+            bytes += (int64_t) im.bbytes(le.first, le.second);
+            --c.n_experts;
+            ++n;
+        }
+        set.resize(k);
+        const int64_t fr0 = c.free_vram();
+        local_free(c.q, last);
+        c.slabs.pop_back();
+        c.slab_used = kSlab;   // the slabs left are full: the next expert opens a new one
+        // the xe driver shows freed VRAM a little later: wait until the driver shows this slab (or the reading stops
+        // rising) before the next test - else every evictable slab went at once
+        for (int i = 0, same = 0; i < 50 && c.free_vram() < fr0 + (int64_t) kSlab * 9 / 10 && same < 5; ++i) {
+            const int64_t f0 = c.free_vram();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            same = c.free_vram() == f0 ? same + 1 : 0;
+        }
+    }
+    if (!n) return 0;
+    im.resident_n = 0;
+    for (auto& cp : im.cards) im.resident_n += cp->n_experts;
+    im.evicted_n += n;
+    std::fprintf(stderr, "xe tier: card %d gave %lld experts (%.2f GiB) back to the arena for the TP core's KV rows (%.0f ms; "
+                 "%.2f GiB free)\n", c.idx, (long long) n, bytes / 1073741824.0, now_ms() - t0, c.free_vram() / 1073741824.0);
+    return n;
+}
 }  // namespace
 
 bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_in, std::string& err) {
@@ -820,8 +911,9 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         int64_t fr = c.free_vram();
         if (fr < 0) fr = (int64_t) c.dev.get_info<sycl::info::device::global_mem_size>();
         // larry, engine1: VRAM the TP core will map later (its KV replicas) is lent to the flex region, not to experts
+        // (STRATA_XE_TP_EVICT: only STRATA_XE_TP_DEFER_FLEX_GIB of it - the rest holds evictable experts, below)
         const auto td = im.tp_defer.find(c.gpu);
-        if (td != im.tp_defer.end()) fr -= (int64_t) td->second;
+        if (td != im.tp_defer.end()) fr -= tp_evict_on() ? std::min<int64_t>((int64_t) td->second, tp_defer_flex()) : (int64_t) td->second;
         double gib = fr / kGiB - reserve;
         if (cap_gib > 0) gib = std::min(gib, cap_gib);
         c.budget = (int64_t) (std::max(0.0, gib) * kGiB);
@@ -865,6 +957,29 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         on[(size_t) best].push_back(le);
     }
     if (filled) std::fprintf(stderr, "xe tier: %.2f GiB more experts in the cards' last slabs (allocated anyway)\n", filled / kGiB);
+    // larry, engine1, STRATA_XE_TP_EVICT: the cards' last slabs over the deferred VRAM beyond the flex's share are
+    // evictable - their host copies are read from the model file when they are evicted (evict_slabs)
+    im.card_set.assign(im.cards.size(), {});
+    im.evict_from.assign(im.cards.size(), 0);
+    for (auto& cp : im.cards) {
+        const XeCard& c = *cp;
+        const size_t ci = (size_t) c.idx;
+        im.card_set[ci] = on[ci];
+        im.evict_from[ci] = on[ci].size();
+        const auto td = im.tp_defer.find(c.gpu);
+        if (!tp_evict_on() || c.dense || td == im.tp_defer.end() || (int64_t) td->second <= tp_defer_flex()) continue;
+        const int64_t want = (int64_t) td->second - tp_defer_flex();
+        const size_t nslab = (size_t) ((want + (int64_t) kSlab - 1) / (int64_t) kSlab);
+        std::vector<size_t> start;   // the index of each slab's first expert (alloc_expert's bump replayed)
+        int64_t u = -1;
+        for (size_t i = 0; i < on[ci].size(); ++i) {
+            const int64_t b = (int64_t) im.bbytes(on[ci][i].first, on[ci][i].second);
+            if (u < 0 || u + b > (int64_t) kSlab) { start.push_back(i); u = 0; }
+            u += (b + 255) & ~(int64_t) 255;
+        }
+        if (start.size() <= nslab) continue;   // keep at least one slab
+        im.evict_from[ci] = start[start.size() - nslab];
+    }
     // ---- the arena: the rest, in ranked order, up to the RAM budget, in pinned chunks (no blob straddles one)
     const char* aenv = std::getenv("STRATA_XE_ARENA_GIB");
     const double arena_cap_gib = aenv && *aenv ? std::atof(aenv) : 1e9;   // default: every expert not on a card
@@ -956,6 +1071,15 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
     }
     std::fprintf(stderr, "xe tier: arena %.2f GiB in %zu chunks (%.2f GiB pinned), %lld experts; file tier %lld\n", abytes / kGiB,
                  nchunks, pinned / kGiB, (long long) im.arena_n, (long long) im.file_n);
+    for (auto& cp : im.cards) {   // STRATA_XE_TP_EVICT
+        const size_t ci = (size_t) cp->idx;
+        if (ci >= im.card_set.size() || im.evict_from[ci] >= im.card_set[ci].size()) continue;
+        int64_t eb = 0;
+        for (size_t i = im.evict_from[ci]; i < im.card_set[ci].size(); ++i)
+            eb += (int64_t) im.bbytes(im.card_set[ci][i].first, im.card_set[ci][i].second);
+        std::fprintf(stderr, "xe tier: card %d: %zu experts (%.2f GiB, its last slabs) go back to the arena when the TP core's KV "
+                     "rows need the room (STRATA_XE_TP_EVICT)\n", cp->idx, im.card_set[ci].size() - im.evict_from[ci], eb / kGiB);
+    }
     // ---- load: the cards' experts (device copies out of pinned reader buffers), then the arena
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
@@ -1034,7 +1158,8 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
             const int64_t fr = c.free_vram();
             // larry, engine1: + what the TP core's KV replicas have not mapped yet (given back as the context grows)
             const auto td = im.tp_defer.find(c.gpu);
-            const int64_t extra = td == im.tp_defer.end() ? 0 : (int64_t) td->second;
+            int64_t extra = td == im.tp_defer.end() ? 0 : (int64_t) td->second;
+            if (tp_evict_on()) extra = std::min<int64_t>(extra, tp_defer_flex());   // STRATA_XE_TP_EVICT: the rest holds experts
             const int64_t want = std::min<int64_t>((int64_t) (fg * kGiB) + extra, fr > 0 ? fr - (int64_t) (fm * kGiB) : 0) & ~(int64_t) 255;
             if (want < 8 * im.blob_max) continue;
             c.flex = local_alloc(c.q, (size_t) want);
@@ -4438,8 +4563,14 @@ bool Ds41XeTier::tp_make_room(int gpu, size_t bytes) {
     if (tdl != im.tp_defer.end()) tdl->second = tdl->second > bytes ? tdl->second - bytes : 0;
     if (fr < 0) return true;
     int64_t give = (int64_t) bytes + keep - fr;
+    // larry, STRATA_XE_TP_EVICT: the free VRAM down to STRATA_XE_TP_EVICT_KEEP_GIB (most of the prompt reserve), then
+    // the card's evictable slabs, the flex region last
+    if (tp_evict_on() && !c.pbuf_cap) {
+        const int64_t ekeep = (int64_t) (env_d("STRATA_XE_TP_EVICT_KEEP_GIB", 1.5) * kGiB);
+        if ((int64_t) bytes + ekeep > fr && evict_slabs(im, c, (int64_t) bytes + ekeep) > 0) give = (int64_t) bytes + keep - c.free_vram();
+    }
     if (give <= 0) return true;
-    if (!c.flex || c.pbuf_cap) return fr > (int64_t) bytes;   // no flex region to give back (a prompt holds it)
+    if (!c.flex || c.pbuf_cap) return c.free_vram() > (int64_t) bytes;   // no flex region to give back (a prompt holds it)
     give = std::min<int64_t>(give, (int64_t) c.flex_cap);
     pc_drop(im);   // the promoted experts out (every card; the slots come back at the next promotion)
     c.q.wait();
@@ -4846,6 +4977,8 @@ void Ds41XeTier::close() {
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }
     }
     im.cards.clear();
+    for (uint8_t* p : im.evict_bufs) std::free(p);   // STRATA_XE_TP_EVICT: the evicted experts' copies
+    im.evict_bufs.clear();
     for (uint8_t* p : im.achunks) {
         if (sycl::get_pointer_type(p, im.ctx) == sycl::usm::alloc::host) sycl::free(p, im.ctx);
         else std::free(p);

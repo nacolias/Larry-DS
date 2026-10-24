@@ -1045,45 +1045,67 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 ggml_tensor * iw = ggml_mul_mat(gc, im.BL(il, "indexer.proj.weight"), xn);
                 iw = ggml_scale(gc, iw, 1.0f / std::sqrt((float) (im.ID * im.IH)));         // softmax_scale * heads^-0.5
                 ggml_tensor * ksrc = ggml_view_3d(gc, idxk, im.ID, 1, cap, idxk->nb[1], idxk->nb[1], 0);
-                // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
-                ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], n, (size_t) col0 * 4), 1, n);
                 ggml_tensor * ramp = ggml_view_2d(gc, im.neg_ramp, cap, 1, (size_t) cap * 4, 0);
-                ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n)), nvs)));
-                ggml_tensor * sc = ggml_lightning_indexer(gc, iq, ksrc, iw, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, n]
-                sc = ggml_reshape_2d(gc, sc, cap, n);
-                if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
-                    const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
-                    ggml_tensor * m = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, nblk, n), NEG_INF);
-                    ggml_tensor * z = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, ncb, n), 0.0f);
-                    m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
-                    m = ggml_view_2d(gc, m, cap, n, m->nb[2], 0);
-                    sc = ggml_add(gc, sc, m);
-                }
-                if (L.cand_src) {   // model.py select_candidate_blocks: block score = max, newest block pinned
-                    const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
-                    GGML_ASSERT(cap % im.CBS == 0);
-                    ggml_tensor * bm = ggml_pool_2d(gc, sc, GGML_OP_POOL_MAX, (int) im.CBS, 1, (int) im.CBS, 1, 0, 0);   // [nblk, n]
-                    // pin: + 1e30 at block (nvis - 1) / CBS of each query
-                    ggml_tensor * br = ggml_view_2d(gc, im.blk_ramp, nblk, 1, (size_t) nblk * 4, 0);
-                    ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, n, (size_t) col0 * 4), 1, n);
-                    ggml_tensor * eq = ggml_step(gc, ggml_scale_bias(gc, ggml_abs(gc, ggml_sub(gc, ggml_repeat(gc, br, bm), lb)), -1.0f, 0.5f));
-                    bm = ggml_add(gc, bm, ggml_scale(gc, eq, 1e30f));
-                    ggml_tensor * cb = ggml_cont(gc, ggml_top_k(gc, bm, (int) ncb));                     // I32 [ncb, n]
-                    outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
-                }
-                sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, n]
+                // larry: the [cap, n] tensors below in column slices of at most STRATA_LI_CHUNK_MIB (512) MiB an F32 one -
+                // at a 1M-token context a 512-column span took ~9 GiB on card 0 and a 984K prompt's last batch failed.
+                // Each query column ranks on its own: the same ids.  A slice's outputs are pushed before the next slice
+                // is built (STRATA_CPY_LAST expands their sources in that order, so its temporaries are freed first).
+                static const int64_t li_chunk = (std::getenv("STRATA_LI_CHUNK_MIB") ? std::atoll(std::getenv("STRATA_LI_CHUNK_MIB")) : 512) << 20;
+                int64_t ncol = n;
+                if (li_chunk > 0 && cap * n * 4 > li_chunk) ncol = std::min<int64_t>(n, std::max<int64_t>(16, (li_chunk / (cap * 4)) & ~(int64_t) 15));
+                std::vector<ggml_tensor *> sel_parts, selm_parts;
+                for (int64_t q0 = 0; q0 < n; q0 += ncol) {
+                    const int64_t nq = std::min<int64_t>(ncol, n - q0);
+                    const int64_t qc0 = col0 + q0;   // the slice's first column of the state
+                    ggml_tensor * iqs = nq == n ? iq : ggml_view_3d(gc, iq, im.ID, im.IH, nq, iq->nb[1], iq->nb[2], (size_t) q0 * iq->nb[2]);
+                    ggml_tensor * iws = nq == n ? iw : ggml_view_2d(gc, iw, iw->ne[0], nq, iw->nb[1], (size_t) q0 * iw->nb[1]);
+                    // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
+                    ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], nq, (size_t) qc0 * 4), 1, nq);
+                    ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, nq)), nvs)));
+                    ggml_tensor * sc = ggml_lightning_indexer(gc, iqs, ksrc, iws, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, nq]
+                    sc = ggml_reshape_2d(gc, sc, cap, nq);
+                    if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
+                        const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
+                        ggml_tensor * m = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, nblk, nq), NEG_INF);
+                        ggml_tensor * z = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, ncb, nq), 0.0f);
+                        m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, nq, im.cand->nb[1], (size_t) qc0 * im.cand->nb[1])));
+                        m = ggml_view_2d(gc, m, cap, nq, m->nb[2], 0);
+                        sc = ggml_add(gc, sc, m);
+                    }
+                    if (L.cand_src) {   // model.py select_candidate_blocks: block score = max, newest block pinned
+                        const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
+                        GGML_ASSERT(cap % im.CBS == 0);
+                        ggml_tensor * bm = ggml_pool_2d(gc, sc, GGML_OP_POOL_MAX, (int) im.CBS, 1, (int) im.CBS, 1, 0, 0);   // [nblk, nq]
+                        // pin: + 1e30 at block (nvis - 1) / CBS of each query
+                        ggml_tensor * br = ggml_view_2d(gc, im.blk_ramp, nblk, 1, (size_t) nblk * 4, 0);
+                        ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, nq, (size_t) qc0 * 4), 1, nq);
+                        ggml_tensor * eq = ggml_step(gc, ggml_scale_bias(gc, ggml_abs(gc, ggml_sub(gc, ggml_repeat(gc, br, bm), lb)), -1.0f, 0.5f));
+                        bm = ggml_add(gc, bm, ggml_scale(gc, eq, 1e30f));
+                        ggml_tensor * cb = ggml_cont(gc, ggml_top_k(gc, bm, (int) ncb));                     // I32 [ncb, nq]
+                        outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, nq, im.cand->nb[1], (size_t) qc0 * im.cand->nb[1])));
+                    }
+                    sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, nq]
                 // Canonicalise the top-k order.  ggml_cuda_op_top_k asks CUB's DeviceTopK for
                 // output_ordering::unsorted, and CUB hands the k ids back in an order its atomically assigned
                 // output slots produce - run-to-run unstable, while the SET is stable (measured: order-only on
                 // every differing row).  The ids drive the gather of the compressed rows, so that order is the
                 // flash-attn's accumulation order; left alone the whole run stops being reproducible from the
                 // first query whose compressed rows are attended (the SWA window's 128).  Sort ascending.
-                sel = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sel, 1, K, n),
-                                                        ggml_argsort(gc, ggml_cast(gc, sel, GGML_TYPE_F32),
-                                                                     GGML_SORT_ORDER_ASC)), K, n);
-                selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, n), sel), K, n);   // vis at sel
-                outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, n, L.sel->nb[1], (size_t) col0 * L.sel->nb[1])));
-                outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, n, L.selm->nb[1], (size_t) col0 * L.selm->nb[1])));
+                    sel = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sel, 1, K, nq),
+                                                            ggml_argsort(gc, ggml_cast(gc, sel, GGML_TYPE_F32),
+                                                                         GGML_SORT_ORDER_ASC)), K, nq);
+                    selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, nq), sel), K, nq);   // vis at sel
+                    outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, nq, L.sel->nb[1], (size_t) qc0 * L.sel->nb[1])));
+                    outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, nq, L.selm->nb[1], (size_t) qc0 * L.selm->nb[1])));
+                    sel_parts.push_back(sel);
+                    selm_parts.push_back(selm);
+                }
+                sel = sel_parts[0];
+                selm = selm_parts[0];
+                for (size_t i = 1; i < sel_parts.size(); ++i) {   // the span's ids / masks for its attention
+                    sel = ggml_concat(gc, sel, sel_parts[i], 1);
+                    selm = ggml_concat(gc, selm, selm_parts[i], 1);
+                }
             } else {
                 const L_t & IS = im.ly[(size_t) L.idxl];
                 sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], (size_t) col0 * IS.sel->nb[1]);
