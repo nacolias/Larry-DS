@@ -177,6 +177,10 @@ struct XeCard {
     float* cX2 = nullptr; size_t cX2_cap = 0;              ///< the dense card's copy of the other cards' sum
     sycl::half* cX2h = nullptr; size_t cX2h_cap = 0;       ///< STRATA_XE_COMBINE=2: the parts as fp16 (slot = card)
     uint8_t* bounce = nullptr; size_t bounce_cap = 0;      ///< pinned staging for streamed experts in pageable memory
+    uint8_t* hring = nullptr;                              ///< larry, STRATA_XE_HOTRING: the card thread's pinned ring
+    std::vector<sycl::event> hring_ev;                     ///< its chunks' DMAs (a slot is reused once its copy is done)
+    int hring_next = 0;
+    uint8_t* hchk = nullptr;                               ///< STRATA_XE_HOTRING_CHECK: [blob_max] pinned readback
     // prompt prefetch (Ds41XeTier::prefetch_begin): a copy queue and two layer buffers (ping-pong by layer parity)
     sycl::queue pq;
     sycl::queue oq;                 ///< prompt calls: the overflow experts' DMAs (STRATA_XE_OVERLAP)
@@ -471,6 +475,8 @@ struct Ds41XeImpl {
     int64_t pf_last = -1;
     int64_t pf_used = 0, pf_planned = 0, pf_bytes = 0;   ///< over a batch (the prof line)
     std::vector<std::thread> pf_thr;
+    std::vector<uint8_t*> pf_rings;    ///< larry, STRATA_XE_HOTRING: a pinned ring per stager thread
+    std::atomic<int64_t> hc_n{0}, hc_bad{0};   ///< STRATA_XE_HOTRING_CHECK: experts compared / differing
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     bool pf_stop = false;
@@ -774,6 +780,12 @@ int64_t rep_upload(Ds41XeImpl& im);
 void rep_drop(Ds41XeImpl& im);
 }  // namespace
 
+namespace {
+bool hot_on();
+size_t hot_chunk();
+int hot_slots();
+}  // namespace
+
 bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_in, std::string& err) {
     Ds41XeImpl& im = *im_;
     if (im.placed) return true;
@@ -889,15 +901,35 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         for (const auto& le : in_arena) lb[(size_t) le.first] += (int64_t) ((im.bbytes(le.first, le.second) + 255) & ~(size_t) 255);
         const int64_t mx = lb.empty() ? 0 : *std::max_element(lb.begin(), lb.end());
         const size_t want = (size_t) std::min<int64_t>(mx, (int64_t) (env_d("STRATA_XE_PREFETCH_STAGE_GIB", 1.5) * kGiB));
-        for (auto& sl : im.pf) {
-            sl.stage = want ? sycl::malloc_host<uint8_t>(want, im.ctx) : nullptr;
-            if (!sl.stage) { im.pf_stage_cap = 0; break; }
-            im.pf_stage_cap = want;
+        // larry, STRATA_XE_HOTRING with STRATA_XE_HOTRING_NOSTAGE (default 1): the stagers' rings carry every copy, so no
+        // stage - its pinned budget goes to the arena; `want` stays the planner's cap on a slot's pageable bytes.  The
+        // rings now, all or none (none: no prefetch at all - nothing could stage it)
+        if (hot_on() && env_i("STRATA_XE_HOTRING_NOSTAGE", 1) && want) {
+            const int ns = std::max(1, env_i("STRATA_XE_STAGERS", 4));
+            bool all = true;
+            for (int i = 0; i < ns; ++i) {
+                im.pf_rings.push_back(sycl::malloc_host<uint8_t>((size_t) hot_slots() * hot_chunk(), im.ctx));
+                all = all && im.pf_rings.back();
+            }
+            if (!all) {
+                for (uint8_t* p : im.pf_rings) if (p) sycl::free(p, im.ctx);
+                im.pf_rings.clear();
+            }
+            im.pf_stage_cap = all ? want : 0;
+            std::fprintf(stderr, "xe tier: prefetch through %d hot rings of %d x %zu KiB (no stage: %.2f GiB more pinned arena; "
+                         "largest layer's arena share %.2f GiB)%s\n", ns, hot_slots(), hot_chunk() >> 10, 2 * want / kGiB, mx / kGiB,
+                         all ? "" : " - RING ALLOCATION FAILED: no prefetch");
+        } else {
+            for (auto& sl : im.pf) {
+                sl.stage = want ? sycl::malloc_host<uint8_t>(want, im.ctx) : nullptr;
+                if (!sl.stage) { im.pf_stage_cap = 0; break; }
+                im.pf_stage_cap = want;
+            }
+            if (!im.pf_stage_cap) for (auto& sl : im.pf) if (sl.stage) { sycl::free(sl.stage, im.ctx); sl.stage = nullptr; }
+            pin_cap -= 2 * (int64_t) im.pf_stage_cap;
+            std::fprintf(stderr, "xe tier: prefetch staging 2 x %.2f GiB pinned (largest layer's arena share %.2f GiB)\n",
+                         im.pf_stage_cap / kGiB, mx / kGiB);
         }
-        if (!im.pf_stage_cap) for (auto& sl : im.pf) if (sl.stage) { sycl::free(sl.stage, im.ctx); sl.stage = nullptr; }
-        pin_cap -= 2 * (int64_t) im.pf_stage_cap;
-        std::fprintf(stderr, "xe tier: prefetch staging 2 x %.2f GiB pinned (largest layer's arena share %.2f GiB)\n",
-                     im.pf_stage_cap / kGiB, mx / kGiB);
     }
     int64_t pinned = 0;
     std::vector<uint8_t> chunk_pinned(nchunks, 0);
@@ -1836,6 +1868,39 @@ void rep_drop(Ds41XeImpl& im) {
     im.rep_bytes = 0;
 }
 
+/// larry, STRATA_XE_HOTRING (default 0): pageable experts onto a card through a small pinned ring that stays in the
+/// CPU's caches - each chunk DMA'd as soon as it is copied (plain stores, so its lines are still in the L3 when the
+/// card reads them: one DRAM trip a byte instead of three).  bench/dqb/stage_ring: 13.0 -> 21.7 GB/s onto cards 1-3.
+bool hot_on() { static const bool on = env_i("STRATA_XE_HOTRING", 0) != 0; return on; }
+size_t hot_chunk() {
+    static const size_t c = (size_t) std::max(64, std::min(env_i("STRATA_XE_HOTRING_KB", 1024), 16384)) << 10;
+    return c;
+}
+int hot_slots() { static const int n = std::max(2, std::min(env_i("STRATA_XE_HOTRING_N", 4), 64)); return n; }
+bool hot_check_on() { static const bool on = env_i("STRATA_XE_HOTRING_CHECK", 0) != 0; return on; }
+
+/// a copy that leaves the destination's lines in the caches (glibc's memcpy streams copies this large past them)
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+__attribute__((target("avx2")))
+#endif
+void hot_copy(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t i = 0;
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+    if (((uintptr_t) dst & 31) == 0)
+        for (; i + 128 <= n; i += 128) {
+            const __m256i a = _mm256_loadu_si256((const __m256i*) (src + i));
+            const __m256i b = _mm256_loadu_si256((const __m256i*) (src + i + 32));
+            const __m256i c = _mm256_loadu_si256((const __m256i*) (src + i + 64));
+            const __m256i d = _mm256_loadu_si256((const __m256i*) (src + i + 96));
+            _mm256_store_si256((__m256i*) (dst + i), a);
+            _mm256_store_si256((__m256i*) (dst + i + 32), b);
+            _mm256_store_si256((__m256i*) (dst + i + 64), c);
+            _mm256_store_si256((__m256i*) (dst + i + 96), d);
+        }
+#endif
+    if (i < n) std::memcpy(dst + i, src + i, n - i);
+}
+
 /// larry, engine1 (STRATA_XE_PC_STREAM, default 1): an arena blob into a pinned bounce with streaming stores - no
 /// read-for-ownership of the bounce's lines and none of them left in the caches.  The CPU pool beside the helpers is
 /// DRAM-bound: its one-expert layers took ~400 us with no fills beside them, ~500 beside plain-store fills and ~475
@@ -2713,6 +2778,60 @@ struct PrioMutex {
 };
 PrioMutex g_submit;
 
+/// STRATA_XE_HOTRING: `bytes` of host memory at `src` to `dst` on queue `q` in ring chunks: a slot whose last copy is
+/// still running is waited for (outside the submit lock), then filled and its DMA enqueued at once.  `pinned`: the
+/// source is DMA-able as it is (the chunks go straight, in the same order).  Returns the last copy's event.
+sycl::event hot_put(sycl::queue& q, uint8_t* dst, const uint8_t* src, size_t bytes, bool pinned, uint8_t* ring,
+                    std::vector<sycl::event>& ev, int& next) {
+    const size_t C = hot_chunk();
+    const int R = hot_slots();
+    if ((int) ev.size() != R) { ev.assign((size_t) R, sycl::event()); next = 0; }
+    sycl::event last;
+    for (size_t off = 0; off < bytes; off += C) {
+        const size_t nb = std::min(C, bytes - off);
+        if (pinned) {
+            std::lock_guard<PrioMutex> lk(g_submit);
+            last = q.memcpy(dst + off, src + off, nb);
+            continue;
+        }
+        const int k = next;
+        next = (k + 1) % R;
+        ev[(size_t) k].wait();   // a default-constructed event is complete
+        uint8_t* slot = ring + (size_t) k * C;
+        hot_copy(slot, src + off, nb);
+        std::lock_guard<PrioMutex> lk(g_submit);
+        last = ev[(size_t) k] = q.memcpy(dst + off, slot, nb);
+    }
+    return last;
+}
+
+/// STRATA_XE_HOTRING_CHECK: an expert's bytes on its card (queue q, after its copies) against its host source
+void hot_check(Ds41XeImpl& im, XeCard& c, sycl::queue& q, const uint8_t* dev, const uint8_t* src, size_t bytes,
+               int64_t l, int64_t e, const char* what) {
+    if (!c.hchk) {
+        std::lock_guard<PrioMutex> lk(g_submit);
+        c.hchk = sycl::malloc_host<uint8_t>((size_t) im.blob_max, im.ctx);
+    }
+    if (!c.hchk || bytes > (size_t) im.blob_max) return;
+    sycl::event ev;
+    {
+        std::lock_guard<PrioMutex> lk(g_submit);
+        ev = q.memcpy(c.hchk, dev, bytes);
+    }
+    ev.wait();
+    const int64_t n = ++im.hc_n;
+    if (std::memcmp(c.hchk, src, bytes) != 0) {
+        size_t d = 0;
+        for (size_t i = 0; i < bytes; ++i) d += c.hchk[i] != src[i];
+        const int64_t bad = ++im.hc_bad;
+        if (bad <= 20)
+            std::fprintf(stderr, "xe tier: HOTRING_CHECK %s: layer %lld expert %lld on card %d: %zu of %zu bytes differ\n", what,
+                         (long long) l, (long long) e, c.idx, d, bytes);
+    }
+    if (n % 20000 == 0)
+        std::fprintf(stderr, "xe tier: HOTRING_CHECK: %lld experts compared, %lld differ\n", (long long) n, (long long) im.hc_bad.load());
+}
+
 /// STRATA_XE_PROF=1: run_big's phases (wall ms of the whole call / per-card busy ms summed over the cards), printed
 /// every 40 calls.
 struct BigProf {
@@ -2771,15 +2890,19 @@ void pf_plan(Ds41XeImpl& im, int s, int64_t l) {
     std::lock_guard<std::mutex> lk(im.pf_mu);
     ps.next = 0;
     ps.active = 0;
-    ps.staged = sused > 0 ? 1 : 0;
+    ps.staged = (hot_on() && !im.pf_rings.empty() ? ps.n : (int64_t) sused) > 0 ? 1 : 0;
     if (ps.staged) im.pf_cv.notify_all();
 }
 
 /// A stager thread (STRATA_XE_STAGERS of them): copies planned slots' pageable experts into their pinned stage, an
 /// expert at a time, the older request (lower layer) first; whoever finishes a slot's last expert marks it staged.
 /// No SYCL calls here: the Level Zero driver must not see another submitting thread.
-void pf_stager(Ds41XeImpl& im) {
+void pf_stager(Ds41XeImpl& im, int idx) {
     const int64_t E = im.g.n_experts;
+    // larry, STRATA_XE_HOTRING: this stager's ring - it puts each planned expert of a slot on its card itself
+    const bool hot = hot_on() && idx < (int) im.pf_rings.size() && im.pf_rings[(size_t) idx];
+    std::vector<sycl::event> hev;
+    int hnext = 0;
     auto has_work = [&](int s) { return im.pf[s].staged == 1 && im.pf[s].next < E; };
     for (;;) {
         int s = -1;
@@ -2791,7 +2914,7 @@ void pf_stager(Ds41XeImpl& im) {
             if (has_work(0) && has_work(1)) s = im.pf[0].layer <= im.pf[1].layer ? 0 : 1;
             else s = has_work(0) ? 0 : 1;
             Ds41XeImpl::PfSlot& ps = im.pf[s];
-            while (ps.next < E && !(ps.card[(size_t) ps.next] >= 0 && ps.soff[(size_t) ps.next] != SIZE_MAX)) ++ps.next;
+            while (ps.next < E && !(ps.card[(size_t) ps.next] >= 0 && (hot || ps.soff[(size_t) ps.next] != SIZE_MAX))) ++ps.next;
             if (ps.next < E) { e = ps.next++; ++ps.active; }
             if (e < 0 && ps.active == 0) { ps.staged = 0; im.pf_cv.notify_all(); continue; }
             if (e < 0) continue;
@@ -2799,7 +2922,13 @@ void pf_stager(Ds41XeImpl& im) {
         Ds41XeImpl::PfSlot& ps = im.pf[s];
         const int64_t l = ps.layer;
         const double ts = xe_prof() ? now_ms() : 0;
-        std::memcpy(ps.stage + ps.soff[(size_t) e], im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e));
+        if (hot) {
+            XeCard& cd = *im.cards[(size_t) ps.card[(size_t) e]];
+            hot_put(cd.pq, cd.pbuf[s] + ps.off[(size_t) e], im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e),
+                    ps.soff[(size_t) e] == SIZE_MAX, im.pf_rings[(size_t) idx], hev, hnext);
+        } else {
+            std::memcpy(ps.stage + ps.soff[(size_t) e], im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e));
+        }
         if (xe_prof()) { g_bp.st_us += (int64_t) ((now_ms() - ts) * 1000.0); g_bp.st_bytes += (int64_t) im.bbytes(l, e); }
         std::lock_guard<std::mutex> lk(im.pf_mu);
         --ps.active;
@@ -2821,6 +2950,13 @@ void pf_enqueue(Ds41XeImpl& im, int s, bool block) {
     }
     ps.t_enq = now_ms();
     const int64_t l = ps.layer;
+    if (hot_on() && !im.pf_rings.empty()) {   // STRATA_XE_HOTRING: the stagers put every copy on the queues already
+        std::lock_guard<PrioMutex> lk(g_submit);
+        for (auto& cp : im.cards)
+            if (cp->pbuf_cap && cp->pbuf[s]) cp->pev[s] = cp->pq.ext_oneapi_submit_barrier();
+        ps.enqueued = true;
+        return;
+    }
     std::unique_lock<PrioMutex> lk(g_submit, std::defer_lock);
     int held = 0;
     for (int64_t e = 0; e < im.g.n_experts; ++e) {
@@ -3051,6 +3187,11 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             std::lock_guard<PrioMutex> lk(g_submit);
             c.q.ext_oneapi_submit_barrier({c.pev[pslot]});
         }
+        if (ps && ps->enqueued && hot_check_on() && last_call)   // STRATA_XE_HOTRING_CHECK: this card's prefetched experts
+            for (int64_t e = 0; e < E; ++e)
+                if (ps->card[(size_t) e] == c.idx)
+                    hot_check(im, c, c.q, c.pbuf[pslot] + ps->off[(size_t) e], im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e), l, e,
+                              "prefetch");
         double tp = now_ms();
         auto lap = [&](std::atomic<int64_t>& acc) {
             if (!prof) return;
@@ -3150,6 +3291,11 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     if (pinned) {
                         std::lock_guard<PrioMutex> lk(g_submit);
                         c.q.memcpy(c.stream + soff[(size_t) e], hb, bytes);
+                    } else if (hot_on() && (c.hring || (c.hring = sycl::malloc_host<uint8_t>((size_t) hot_slots() * hot_chunk(), im.ctx)))) {
+                        // STRATA_XE_HOTRING: through the card thread's ring, a DMA a chunk as it is copied
+                        hot_put(c.q, c.stream + soff[(size_t) e], hb, bytes, false, c.hring, c.hring_ev, c.hring_next);
+                        if (hot_check_on())
+                            hot_check(im, c, c.q, c.stream + soff[(size_t) e], hb, bytes, l, e, "stream");
                     } else {
                         if (hused + bytes > half) flush();
                         if (hused == 0) hev[hcur].wait();   // this half's previous DMAs are done
@@ -4529,7 +4675,19 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
     if (im.pf_thr.empty()) {
         im.pf_stop = false;
         const int ns = std::max(1, env_i("STRATA_XE_STAGERS", 4));
-        for (int i = 0; i < ns; ++i) im.pf_thr.emplace_back([&im] { pf_stager(im); });
+        if (hot_on() && im.pf_rings.empty()) {   // STRATA_XE_HOTRING: a ring per stager (all or none: pf_enqueue counts on the stagers' copies)
+            std::lock_guard<PrioMutex> lk(g_submit);
+            for (int i = 0; i < ns; ++i) im.pf_rings.push_back(sycl::malloc_host<uint8_t>((size_t) hot_slots() * hot_chunk(), im.ctx));
+            bool all = true;
+            for (uint8_t* p : im.pf_rings) all = all && p;
+            if (!all) {
+                for (uint8_t* p : im.pf_rings) if (p) sycl::free(p, im.ctx);
+                im.pf_rings.clear();
+            }
+            std::fprintf(stderr, "xe prefetch: hot rings %s %d x %d x %zu KiB\n", all ? "on," : "FAILED (old copies),", ns, hot_slots(),
+                         hot_chunk() >> 10);
+        }
+        for (int i = 0; i < ns; ++i) im.pf_thr.emplace_back([&im, i] { pf_stager(im, i); });
     }
     static bool logged = false;
     if (!logged || xe_prof()) {
@@ -4654,6 +4812,11 @@ void Ds41XeTier::close() {
         im.pf_thr.clear();
     }
     for (auto& sl : im.pf) if (sl.stage) { sycl::free(sl.stage, im.ctx); sl.stage = nullptr; }
+    for (uint8_t* p : im.pf_rings) if (p) sycl::free(p, im.ctx);
+    im.pf_rings.clear();
+    if (im.hc_n > 0)
+        std::fprintf(stderr, "xe tier: HOTRING_CHECK: %lld experts compared, %lld differ\n", (long long) im.hc_n.load(),
+                     (long long) im.hc_bad.load());
     for (auto& kv : im.heads)   // the head split's slices and scratch, on their cards (before the cards go)
         for (size_t i = 0; i < kv.second.c.size(); ++i) {
             sycl::queue& q = kv.second.c[i]->q;
@@ -4679,6 +4842,7 @@ void Ds41XeTier::close() {
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
         fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY); fr(c.stream);
         fr(c.gscratch); fr(c.cX2); fr(c.cX2h); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
+        fr(c.hring); fr(c.hchk);
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }
     }
     im.cards.clear();
