@@ -2,7 +2,8 @@
 
 Status: phases A-D done; in the engine behind STRATA_TP=N (default 0), in the service since 2026-10-23 02:35
 (STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02, promotions in time for the next pass since 17:31, the verify
-pass's kernel round since 20:35, card 0's expert replicas since 22:20 - see the status sections at the end.  User go-ahead
+pass's kernel round since 20:35, card 0's expert replicas since 22:20, DSpark's draft on the cards since 2026-10-24 01:55
+- see the status sections at the end.  User go-ahead
 2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card count).  Mirror of
 larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
 
@@ -379,3 +380,72 @@ essay 69.8 / 69.4, prompts 8K 831 / 931, 16K 1218, 31K 1648 tok/s, hidden RAM 43
 
 Next: an adaptive set (the tier's counts over recent requests instead of a file); the CPU pool's latency.
 
+## Status 2026-10-24 ~01:55 (engine1's draft: DSpark's stack on the four cards)
+
+Where a DSpark cycle went (essay at the service's settings, replicas on): the verify pass ~24 ms, the ggml draft on
+card 0 4.9 ms a step (host submission of ~340 kernels 2.1 ms, then 2.4 ms waiting for the card; unitrace: card 0 3.65 ms
+of device time, 2.4 of it the three blocks' 5-column mat-vecs and Q2_K experts - `larry_mmid_q2k` runs every (token,
+slot) pair, no dedup), ~1 ms of host work between passes.  The CPU pool sets the FFN phase's pace (card 0 waits ~2.9 ms
+a pass for the host, the others ~4 ms for card 0; stamps with every layer).
+
+The draft's three blocks are trunk layers at compress ratio 0 (window attention only) with the trunk's dense shapes, so
+`Ds41Tp::draft_*` (tp_core.cpp, STRATA_TP_DRAFT=1) runs them on the core's kernels, split as a trunk layer: q_b rows /
+attention / wo_a of the rank's o-groups, wo_b's K columns, the shared expert's n_ff blocks; hc mixes (the sidecar's F32
+weights: hc_fab's F32 form), norms, q_a + kv (one Q6_K matrix, the kv rows FIRST: the feed's projection is its row
+prefix) and the router (Q8_0 -> F16, 128 experts, top-3) replicated.  Its 128 Q2_K routed experts a block live on rank
+e % N, planar (the planar int8 kernels' Q2_K form, `xe_experts_q8(..., q2k)` - kernels of their own: 513 GB/s on 2
+experts x 5 tokens, the trunk's three types' kernels untouched; `test_xe_q2k`: rel 2e-7 against the same int8
+roundings, 1e-2 against F32 as the trunk's).  The window feed's main_proj is K-split (a rank its 3D / N input columns:
+a partial of main_x, summed as the trunk's partials), the head is the trunk's LM head shards, the Markov head's bias
+rows split as the vocabulary and its argmax merged across the cards one draft slot at a time (a 16-byte cross-card sum
+a slot; ties: the lowest token, as ggml_argmax).  The accepted rows come from the verify pass's taps, which every card
+now keeps (the pass graphs write main_hidden on every rank); host rows (seeds, lookup passes on the dense path) are
+read from a pinned block.  Consecutive cross-card sums alternate the two slot buffers (ara / arb) and read a buffer
+before the next sum's send - the feed's chunks are laid out so that the last is arb, the Markov slots start on ara.
+One recorded graph a card per (feed rows, draft?, host rows?).  ~1.2 GiB a card.
+
+Check mode (STRATA_TP_DRAFT_CHECK=1: both stacks on the same inputs): the same draft token by slot 98 / 97 / 94 / 92 /
+92 %, the leading run 4.65 of 5 - the two stacks' roundings (int8 activations in the experts, F16 router weights).
+Stamps (STRATA_TP_DRAFT_STAMP=1) with promotions off: feed 0.1-0.15 ms, each block ~0.41 ms, head 0.28, Markov chain
+0.21 = ~1.85 ms on every card, 2.36 ms wall (the ggml draft 4.55 ms in the same run).
+
+Two things stood in its way:
+
+* **The promotions' GPU work.**  A promotion copied the expert's file layout into its slot by kernels reading pinned
+  memory (~270 us a 4 MB chunk) and repacked it on the card (Q3_K 740 us an expert).  Beside the ggml draft on card 0
+  that cost nothing; beside this one it held every expert card's compute units at the draft's start, and card 0 waited
+  for them at the first cross-card sum: its feed phase 3.5 ms (essay) / 5.5 ms (math) instead of 0.1.  Now the chunks go
+  on the copy engine (STRATA_TP_PC_DMA, default 1 under STRATA_TP) and the host writes the planes into the pinned bounce
+  (STRATA_TP_PC_DEVREPACK default 0: a 32-block repack with streaming stores, byte-identical to the card's - the Q2_0
+  codes by two delta swaps instead of table lookups; ~2 ms an expert on a helper, the old host form 10-20).  The card's
+  repack is 3.7x faster where it still runs (coalesced stores, Q3_K 779 -> 212 us, Q2_K 478 -> 131; STRATA_XE_REPACK_FAST).
+  Copies on a card's copy engine run in order across its queues, so the draft's inputs / outputs and the passes' inputs
+  are kernels reading / writing the pinned blocks now (STRATA_TP_ZC_IN): a memcpy waited behind the queued promotions.
+* **VRAM.**  Loaded at open_cache, the draft took 1.2 GiB of each expert card's prompt reserve (0.26-0.5 GiB left: the
+  21:41 pattern).  It loads right after the TP core now, before the tier places experts (cards 1-3: ~390 experts fewer),
+  and card 0's expert cap grows by what the ggml stack held there less this draft's share (5.0 - 1.3 GB): in the
+  service card 0 caches 1648 experts instead of 1323, the replicas keep their 2.5 GiB and 1 GiB free.
+
+Measured (one-shot DSpark at the service's settings with the replicas, 1000 tokens, clocks pinned; cycle at a common
+width mix; "before" = the ggml draft and the old promotions, tr13):
+
+| text | before | the TP draft |
+| --- | --- | --- |
+| essay | 29.43 ms, 78.1 tok/s, draft 4.93 ms | 27.45-28.07 ms (-5..-7 %), 80.3-81.3 tok/s, draft 3.1-3.2 ms |
+| code | 31.37 ms, 129.9 tok/s, draft 4.50 ms | 28.63 ms (-8.7 %), 148.1 tok/s, draft 2.5 ms |
+| math | 37.6 ms, 107.8 tok/s, draft 6.18 ms | 36.5-38.6 ms, 102-110 tok/s, draft 5.1-5.5 ms |
+
+Math stays noisy and is the CPU pool's text (14 CPU-pool layers a pass): its one-expert layers went 475 -> 545 us - the
+host fills (twice the plain copy's time) share DRAM with the pool - and its draft's sums wait behind ~65 MB of
+promotion copies a card a pass on the copy engines (smaller chunks, one fill helper, STRATA_TP_PUSH's store kernels:
+within the noise).  The ggml draft with only the promotion changes: essay -1.6 %.  Also in this round: the trunk pass's
+logits straight into the verify rows (one copy of n x vocab floats less) and --serve's sampling candidates by a
+block-maximum bound instead of std::partial_sort over the vocabulary (the same candidates, 0.31 -> 0.08 ms a row; the
+service samples ~2.5 rows a pass).
+
+Service (tpg.sh x2 with STRATA_TP_DRAFT=1, then ds41-xe-engine.sh STRATA_TP_DRAFT=1 + tsvc2 at 01:55): needles 200 /
+8K / 8K / 16K / 31K found, the tool call right, svcbench 85.8 / 83.9 tok/s (22:20: 82.8 / 73.4), essay 76.5 / 70.4
+(69.8 / 69.4), prompts 8K 761 / 881, 16K 1241, 31K 1598 tok/s, hidden RAM 42 GiB peak, 41828 promotions, 0 bad.
+
+Next: the CPU pool (math: ~8 ms of a 33 ms cycle) and what the fills cost it; a low-priority queue for the promotions'
+remaining GPU work; the draft's Markov chain (5 sequential cross-card sums, 0.2-0.5 ms).

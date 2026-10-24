@@ -26,6 +26,9 @@
 namespace strata::v41::xe {
 
 inline constexpr int kQ3K = 11, kQ20 = 42, kPtq1 = 143;
+/// larry, engine1's DSpark draft: its routed experts are Q2_K (ggml 10, 256 weights / 84 bytes: scales[16] qs[64] d dmin)
+/// - the planar int8 kernels below take it too (the GSQ trunk has none; xe_type_ok stays the trunk's three)
+inline constexpr int kQ2K = 10;
 inline constexpr int kMaxJobTok = 8;
 
 struct XeJob {
@@ -73,17 +76,19 @@ struct XeQ8 {
 };
 
 /// The file layout of an expert blob (gate | up | down) -> the planar layout, out of place, same size and offsets.
+/// form: 0 the first kernel (a block a work-item), 1 the coalesced one (byte-identical), -1 STRATA_XE_REPACK_FAST (default 1).
 sycl::event xe_repack_blob(sycl::queue& q, const uint8_t* src, uint8_t* dst, int gu_type, int d_type, size_t up_off,
-                           size_t down_off, int n_embd, int n_ff);
+                           size_t down_off, int n_embd, int n_ff, int form = -1);
 /// Quantises `nrows` rows of n f32 values (n % 32 == 0) into `out`.
 sycl::event xe_quant_rows(sycl::queue& q, const float* x, int nrows, int n, XeQ8 out);
 /// xe_experts on PLANAR experts: X quantised (xe_quant_rows of the call's ntok rows), H = scratch [nj][8] rows of n_ff.
 /// max_nt = the most tokens any of the jobs has (0: ntok).  engine1 (STRATA_XE_JOBNT forms): nj_dev = the real job
 /// count on the device (slots past it are null), jst > 0 = gate/up launched for jst job slots (looping over the jobs),
 /// split = the down kernel's jobs split over its sub-groups (deterministic, a different summation order).
+/// q2k (engine1's DSpark draft): every job Q2_K - kernels of their own (the trunk's three types keep theirs as they were).
 sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
                           int n_ff, float swiglu_limit, bool accumulate, int max_nt = 0, const int32_t* nj_dev = nullptr,
-                          int jst = 0, bool split = false);
+                          int jst = 0, bool split = false, bool q2k = false);
 
 /// larry (xe_xmx.cpp): the same on the XMX engines (fp16 DPAS) - xt = xe_xt of the call's rows ([n_embd][8] fp16,
 /// rows >= ntok zero), ht = scratch [nj][n_ff][8] fp16.  The weights stream once whatever a job's tokens.

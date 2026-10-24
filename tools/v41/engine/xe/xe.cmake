@@ -36,5 +36,11 @@ if(TARGET ggml-sycl AND TARGET ds41_dense AND TARGET ds41_moe_cpu)
     target_link_libraries(test_ds41_xe PRIVATE ds41_xe ds41_moe_cpu strata_kernels_cpu ggml-cpu ggml-base MKL::MKL_SYCL::BLAS)
     target_compile_options(test_ds41_xe PRIVATE -fsycl)
     target_link_options(test_ds41_xe PRIVATE ${_xe_sycl})
+    # larry: the planar kernels' Q2_K form (engine1's DSpark draft experts) against host references
+    add_executable(test_xe_q2k ${_xe_dir}/test_xe_q2k.cpp)
+    target_link_libraries(test_xe_q2k PRIVATE ds41_xe ggml-base)
+    target_compile_options(test_xe_q2k PRIVATE -fsycl)
+    target_link_options(test_xe_q2k PRIVATE ${_xe_sycl})
+    set_target_properties(test_xe_q2k PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
     include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/tp/tp.cmake OPTIONAL)   # larry: engine1, the TP decode core
 endif()

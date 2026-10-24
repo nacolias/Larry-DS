@@ -183,13 +183,55 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// the K largest logits, largest first (equal ones: the lower token first) - exactly std::partial_sort's candidates
+// over the whole vocabulary, ~3.7x faster (0.31 -> 0.08 ms a 129K row; --serve's speculative sampling takes one a
+// verified row): the K-th largest of 2K block maxima bounds the K-th largest logit from below, so only the logits at
+// or above it (a few hundred) are sorted
+void top_k_idx(const float * lg, int n, int K, std::vector<int> & out) {
+    K = std::min(K, n);
+    static thread_local std::vector<std::pair<float, int>> c;
+    static thread_local std::vector<float> bm;
+    c.clear();
+    if (K > 0 && n >= 8 * K) {
+        const int bs = (n + 2 * K - 1) / (2 * K);
+        bm.clear();
+        for (int b = 0; b < n; b += bs) {
+            const int e = std::min(n, b + bs);
+            float m8[8];   // eight independent chains (one dependent max chain runs at the max's latency)
+            for (int j = 0; j < 8; ++j) m8[j] = lg[b];
+            int i = b;
+            for (; i + 8 <= e; i += 8)
+                for (int j = 0; j < 8; ++j) m8[j] = m8[j] > lg[i + j] ? m8[j] : lg[i + j];
+            for (; i < e; ++i) m8[0] = m8[0] > lg[i] ? m8[0] : lg[i];
+            float m = m8[0];
+            for (int j = 1; j < 8; ++j) m = m > m8[j] ? m : m8[j];
+            bm.push_back(m);
+        }
+        if ((int) bm.size() >= K) {
+            std::nth_element(bm.begin(), bm.begin() + (K - 1), bm.end(), [](float a, float b) { return a > b; });
+            const float t0 = bm[(size_t) (K - 1)];
+            for (int i = 0; i < n; i += 8) {   // (a run of 8 below the bound: one test)
+                const int e = std::min(n, i + 8);
+                float m = lg[i];
+                for (int j = i + 1; j < e; ++j) m = m > lg[j] ? m : lg[j];
+                if (m < t0) continue;
+                for (int j = i; j < e; ++j) if (lg[j] >= t0) c.push_back({ lg[j], j });
+            }
+        }
+    }
+    if ((int) c.size() < K) { c.clear(); for (int i = 0; i < n; ++i) c.push_back({ lg[i], i }); }
+    auto better = [](const std::pair<float, int> & a, const std::pair<float, int> & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
+    std::partial_sort(c.begin(), c.begin() + K, c.end(), better);
+    out.resize((size_t) K);
+    for (int i = 0; i < K; ++i) out[(size_t) i] = c[(size_t) i].second;
+}
+
 // temperature + top-k / min-p / top-p over the top candidates (top_k 0 = the 256 best); temp 0 = argmax
 int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
     if (temp <= 0.0f) return (int) (std::max_element(logits, logits + n_vocab) - logits);
     const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
-    std::vector<int> idx((size_t) n_vocab);
-    for (int i = 0; i < n_vocab; ++i) idx[(size_t) i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int x, int y) { return logits[x] > logits[y]; });
+    static thread_local std::vector<int> idx;
+    top_k_idx(logits, n_vocab, K, idx);
     const double mx = logits[idx[0]];
     std::vector<double> p((size_t) K);
     for (int i = 0; i < K; ++i) p[(size_t) i] = std::exp(((double) logits[idx[(size_t) i]] - mx) / temp);
@@ -215,9 +257,8 @@ void sample_dist(const float * logits, int n_vocab, float temp, int top_k, float
     out.clear();
     if (temp <= 0.0f) { out.push_back({ (int) (std::max_element(logits, logits + n_vocab) - logits), 1.0 }); return; }
     const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
-    std::vector<int> idx((size_t) n_vocab);
-    for (int i = 0; i < n_vocab; ++i) idx[(size_t) i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int x, int y) { return logits[x] > logits[y]; });
+    static thread_local std::vector<int> idx;
+    top_k_idx(logits, n_vocab, K, idx);
     const double mx = logits[idx[0]];
     std::vector<double> p((size_t) K);
     for (int i = 0; i < K; ++i) p[(size_t) i] = std::exp(((double) logits[idx[(size_t) i]] - mx) / temp);
@@ -434,6 +475,18 @@ int main(int argc, char ** argv) {
         tp = std::make_unique<Ds41Tp>();
         if (!tp->init(tc, th, err)) { std::fprintf(stderr, "ds41_generate: STRATA_TP: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "tp: %d cards, loaded in %.1f s\n", tp_n, (now_ms() - t0) / 1000.0);
+#if defined(DS41_HAVE_DSPARK)
+        // engine1 (STRATA_TP_DRAFT=1): DSpark's stack on these cards - its weights NOW, before the expert tier fills the
+        // cards (loaded at open_cache it took the expert cards' prompt reserve); open_cache's Ds41DSpark::init finds it
+        if (const char * dp = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+            dp && std::getenv("STRATA_TP_DRAFT") && std::atoi(std::getenv("STRATA_TP_DRAFT")) != 0) {
+            const Ds41DSparkConfig dc0;   // its defaults (n_used, noise id, block): open_cache's config
+            if (!tp->draft_init(dp, dc0.n_used, dc0.noise_id, dc0.block, err)) {
+                std::fprintf(stderr, "ds41_generate: STRATA_TP_DRAFT: %s\n", err.c_str());
+                return 1;
+            }
+        }
+#endif
     }
     // the paged units' load-time pages back (the TP ranks own every shard now); a failure keeps them resident
     if (pager && tp && std::getenv("STRATA_TP_PAGE_DUMMY")) {   // debug: the region kept as loaded, hooks only (timing)
@@ -549,7 +602,11 @@ int main(int argc, char ** argv) {
 #endif
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
 #if defined(DS41_TP) && defined(DS41_XE)
-    if (pager && pager->enabled()) tier.tp_dense_bonus(pager->freed());   // card 0's expert cap + what paging gave back
+    {   // card 0's expert cap + what paging gave back + (engine1's draft) the ggml stack's VRAM less this draft's share
+        size_t bonus = pager && pager->enabled() ? pager->freed() : 0;
+        if (tp && tp->draft_ready() && tp->draft_ggml_bytes() > tp->draft_bytes()) bonus += tp->draft_ggml_bytes() - tp->draft_bytes();
+        if (bonus) tier.tp_dense_bonus(bonus);
+    }
     // larry, engine1: the TP core's KV replicas map their rows as the context grows (STRATA_TP_LAZY_KV) - the expert
     // cards' flex regions hold that VRAM until then, and give it back when the core asks
     if (tp) {
@@ -702,8 +759,9 @@ int main(int argc, char ** argv) {
     // larry, engine1: a TP pass (its logits read by logits_rows below; DSpark's taps into vh_out when given)
     bool last_tp = false;
     std::vector<float> tp_logits;
+    const float * tp_lg = nullptr;   // the last TP pass's logits rows (tp_logits, or the caller's)
 #if defined(DS41_TP)
-    auto tp_run = [&](const int * toks, int m, int pos, float * vh_out) -> bool {
+    auto tp_run = [&](const int * toks, int m, int pos, float * vh_out, float * lg_out = nullptr) -> bool {
         int64_t lo = 0, hi = 0;
         bool changed = false;
         dense.take_written(&lo, &hi, &changed);
@@ -711,9 +769,11 @@ int main(int argc, char ** argv) {
             dense.pass_sync();
             if (!tp->sync_state(lo, hi, false)) { ferr = tp->last_error(); return false; }
         }
-        tp_logits.resize((size_t) m * nv);
-        if (!tp->pass(toks, m, pos, tp_logits.data(), vh_out, true)) { ferr = tp->last_error(); return false; }
+        float * lg = lg_out;
+        if (!lg) { tp_logits.resize((size_t) m * nv); lg = tp_logits.data(); }
+        if (!tp->pass(toks, m, pos, lg, vh_out, true)) { ferr = tp->last_error(); return false; }
         last_tp = true;
+        tp_lg = lg;   // logits_rows reads them there (the caller's rows: pass_v's vlog)
         // the tier's promotion cache between passes (STRATA_TP_PROMOTE_CHUNKS copy chunks of 1 MB a pass)
         static const int pchunks = std::getenv("STRATA_TP_PROMOTE_CHUNKS") ? std::atoi(std::getenv("STRATA_TP_PROMOTE_CHUNKS")) : 64;
         tier.tp_between_passes(pchunks);
@@ -721,13 +781,13 @@ int main(int argc, char ** argv) {
     };
     const bool tp_on = tp != nullptr;
 #else
-    auto tp_run = [&](const int *, int, int, float *) -> bool { return false; };
+    auto tp_run = [&](const int *, int, int, float *, float * = nullptr) -> bool { return false; };
     const bool tp_on = false;
 #endif
     // the logits rows of the last pass: the TP core's (host) or the dense half's
     auto logits_rows = [&](int row0, int nrows, float * out) -> bool {
         if (last_tp) {
-            std::memcpy(out, tp_logits.data() + (size_t) row0 * nv, (size_t) nrows * nv * sizeof(float));
+            std::memcpy(out, tp_lg + (size_t) row0 * nv, (size_t) nrows * nv * sizeof(float));
             return true;
         }
         if (!dense.logits(row0, nrows, out)) { ferr = dense.last_error(); return false; }
@@ -869,6 +929,7 @@ int main(int argc, char ** argv) {
     std::vector<int> pv_pred, pv_rank;                 // D3 prefetch: per-token predictions, the ranked union
     std::vector<std::pair<int, int>> pv_score;
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
+    bool pv_tp = false;               // the last pass_v ran on the TP cards (its taps are on the cards: engine1's draft)
     long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
 #if defined(DS41_XE)
@@ -881,12 +942,14 @@ int main(int argc, char ** argv) {
         auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
         if (tp_on && m <= 7) {   // larry, engine1: the whole pass on the TP cards (logits + DSpark's taps)
-            vh.assign((size_t) m * 3 * n_embd, 0.0f);
-            if (!tp_run(toks, m, pos, vh.data())) return false;
-            vlog.assign(tp_logits.begin(), tp_logits.begin() + (ptrdiff_t) m * nv);
+            vh.resize((size_t) m * 3 * n_embd);   // (the pass writes every value)
+            vlog.resize((size_t) m * nv);
+            if (!tp_run(toks, m, pos, vh.data(), vlog.data())) return false;
+            pv_tp = true;
             lap(0);
             return true;
         }
+        pv_tp = false;
         last_tp = false;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
@@ -1033,6 +1096,10 @@ int main(int argc, char ** argv) {
             sc.main_gguf = a.model;
             sc.max_append = 16;
             if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
+#if defined(DS41_TP)
+            // larry, engine1 (STRATA_TP_DRAFT=1): the stack on the TP core's cards (its weights split over them)
+            if (tp && std::getenv("STRATA_TP_DRAFT") && std::atoi(std::getenv("STRATA_TP_DRAFT")) != 0) sc.tp = tp.get();
+#endif
             dsp = std::make_unique<Ds41DSpark>();
             const double ti = now_ms();
             if (!dsp->init(sc, err)) { err = "DSpark init: " + err; return false; }
@@ -2054,7 +2121,7 @@ int main(int argc, char ** argv) {
                     for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
                     int drafts[kVerify];
                     for (int i = 0; i < k; ++i) drafts[i] = dr[i];
-                    if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
+                    if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf, pv_tp ? r0 : -1)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
                     hist.push_back(t);
@@ -2310,7 +2377,7 @@ int main(int argc, char ** argv) {
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
             const int drafts[5] = { sp_ids[0], sp_ids[1], sp_ids[2], sp_ids[3], sp_ids[4] };
             const double td = now_ms();
-            if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, g[acc], sp_ids, sp_conf)) {
+            if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, g[acc], sp_ids, sp_conf, pv_tp ? r0 : -1)) {
                 std::fprintf(stderr, "ds41_generate: DSpark step: %s\n", dsp->last_error().c_str());
                 return 1;
             }

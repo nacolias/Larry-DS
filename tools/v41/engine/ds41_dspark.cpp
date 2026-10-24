@@ -6,6 +6,9 @@
 #include "ds41_ops.hpp"
 
 #include "ggml-alloc.h"
+#if defined(DS41_TP)
+#include "tp_core.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -58,6 +61,12 @@ struct Ds41DSpark::Impl {
     std::map<std::pair<int, bool>, G> graphs;
     std::pair<int, bool> last_key { -1, false };   ///< the graph ga was last planned for
     double ms = 0;
+    // larry, engine1: the TP core's stack (cfg.tp) - alone, or (STRATA_TP_DRAFT_CHECK) beside this one, compared
+    strata::v41::Ds41Tp * tp = nullptr;
+    bool check = false, ggml_on = true;
+    long ck_n = 0, ck_id[5] = {0, 0, 0, 0, 0}, ck_lead = 0;
+    double ck_conf = 0;
+    bool ggml_step(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf);
 
     ~Impl() {
         if (const char * cf = std::getenv("STRATA_DSPARK_COUNT"); cf && !counts.empty()) {
@@ -257,6 +266,19 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
     im.D = G.n_embd; im.HC = G.hc; im.DH = G.d_head; im.NH = G.n_head; im.OG = G.o_groups; im.OL = G.o_lora;
     im.OGD = G.n_head * G.d_head / G.o_groups; im.NFF = G.n_ff; im.V = G.vocab; im.BS = cfg.block; im.KM = cfg.max_append;
     im.NU = cfg.n_used;
+#if defined(DS41_TP)
+    if (cfg.tp) {
+        im.tp = cfg.tp;
+        if (im.KM > 16) im.KM = 16;
+        if (!im.tp->draft_init(cfg.sidecar, cfg.n_used, cfg.noise_id, cfg.block, err)) return false;
+        im.wbytes = im.tp->draft_bytes();
+        im.check = std::getenv("STRATA_TP_DRAFT_CHECK") && std::atoi(std::getenv("STRATA_TP_DRAFT_CHECK")) != 0;
+        im.ggml_on = im.check && cfg.backend;
+        if (!im.ggml_on) { reset(); return true; }
+    }
+#else
+    if (cfg.tp) { err = "Ds41DSpark: built without the TP core"; return false; }
+#endif
     if (!im.load(err)) return false;
     im.NE = im.BW(0, "ffn.experts.w1.weight")->ne[2];
     if (im.BW(0, "main_proj.weight")->ne[0] != 3 * im.D) { err = "mtp.0.main_proj is not [3*n_embd, n_embd]"; return false; }
@@ -285,6 +307,9 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
 
 void Ds41DSpark::reset() {
     p_->filled.assign(WIN, -1);
+#if defined(DS41_TP)
+    if (p_->tp) p_->tp->draft_reset();
+#endif
 }
 
 static ggml_tensor * fake_quant_fp8(ggml_context * c, ggml_tensor * x) {
@@ -426,8 +451,42 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
     return gr;
 }
 
-bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf) {
+bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf, int tap_r0) {
     Impl & im = *p_;
+#if defined(DS41_TP)
+    if (im.tp) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (k < 1 || k > im.KM) { im.err = "DSpark step: k out of range"; return false; }
+        if (!im.tp->draft_step(tap_r0 >= 0 ? nullptr : mh, tap_r0, pos, k, bonus, ids, conf)) { im.err = im.tp->last_error(); return false; }
+        if (im.ggml_on) {   // STRATA_TP_DRAFT_CHECK: the ggml stack on the same rows; agreement per slot, every 64 drafts
+            int gi[8];
+            float gc[8];
+            if (!im.ggml_step(mh, pos, k, bonus, gi, gc)) return false;
+            if (bonus >= 0) {
+                ++im.ck_n;
+                int lead = 0;
+                while (lead < (int) im.BS && gi[lead] == ids[lead]) ++lead;
+                im.ck_lead += lead;
+                for (int i = 0; i < (int) im.BS && i < 5; ++i) {
+                    im.ck_id[i] += gi[i] == ids[i];
+                    im.ck_conf = std::max(im.ck_conf, (double) std::fabs(gc[i] - conf[i]));
+                }
+                if (im.ck_n % 64 == 0)
+                    std::fprintf(stderr, "tp draft check (%ld drafts): same id by slot %.3f %.3f %.3f %.3f %.3f, leading run %.2f, max |conf diff| %.3f\n",
+                                 im.ck_n, im.ck_id[0] / (double) im.ck_n, im.ck_id[1] / (double) im.ck_n, im.ck_id[2] / (double) im.ck_n,
+                                 im.ck_id[3] / (double) im.ck_n, im.ck_id[4] / (double) im.ck_n, im.ck_lead / (double) im.ck_n, im.ck_conf);
+            }
+        }
+        im.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
+#endif
+    (void) tap_r0;
+    return im.ggml_step(mh, pos, k, bonus, ids, conf);
+}
+
+bool Ds41DSpark::Impl::ggml_step(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf) {
+    Impl & im = *this;
     if (k < 1 || k > im.KM) { im.err = "DSpark step: k out of range"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> mp(pos, pos + k), ms((size_t) k);

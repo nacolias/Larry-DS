@@ -358,6 +358,11 @@ struct Ds41Tp::Impl {
     std::function<bool(int, size_t)> make_room;   // the tier: room for that many more bytes on that GPU
 
     ~Impl() {
+        for (auto & c : cards) { try { c->q.wait(); } catch (...) {} }
+        dc.clear();
+        if (dhin) sycl::free(dhin, ctx);
+        if (dhrows) sycl::free(dhrows, ctx);
+        if (dhout) sycl::free(dhout, ctx);
         if (eng_thr.joinable()) {
             { std::lock_guard<std::mutex> lk(eng_mu); eng_state.store(3); }
             eng_cv.notify_one();
@@ -387,11 +392,14 @@ struct Ds41Tp::Impl {
     // row, as ds41_dense's loader does with STRATA_DENSE_REQUANT=q6_K: the same bits)
     struct Q6 { const uint8_t * p = nullptr; int64_t rows = 0, K = 0; std::vector<uint8_t> own; void * map = nullptr; size_t len = 0; };
     std::map<std::string, std::shared_ptr<Q6>> q6cache;
+    // the GGUF the weight helpers read: the trunk's, or the DSpark sidecar while the draft loads (draft_init)
+    GgufModel * wsrc = nullptr;
+    const GgufModel & M() const { return wsrc ? *wsrc : *model; }
     std::shared_ptr<Q6> q6(const std::string & name) {
         auto it = q6cache.find(name);
         if (it != q6cache.end()) return it->second;
         size_t s = 0;
-        const TensorInfo * ti = model->find(name, &s);
+        const TensorInfo * ti = M().find(name, &s);
         if (!ti || ti->shape.size() != 2) { err = "tp: no 2-D tensor " + name; return nullptr; }
         auto r = std::make_shared<Q6>();
         r->K = (int64_t) ti->shape[0];
@@ -412,7 +420,7 @@ struct Ds41Tp::Impl {
             }
         }
         if (!r->p) {
-            const uint8_t * src = model->shard(s).tensor_data(*ti);
+            const uint8_t * src = M().shard(s).tensor_data(*ti);
             const ggml_type st = (ggml_type) ti->type;
             const size_t src_row = ggml_row_size(st, r->K);
             r->own.resize(bytes);
@@ -468,13 +476,13 @@ struct Ds41Tp::Impl {
     }
     const uint8_t * raw(const std::string & name, uint32_t want_type, size_t want_bytes) {
         size_t s = 0;
-        const TensorInfo * ti = model->find(name, &s);
+        const TensorInfo * ti = M().find(name, &s);
         if (!ti) { err = "tp: missing tensor " + name; return nullptr; }
         if (ti->type != want_type) { err = "tp: " + name + " has type " + ggml_type_name(ti->type); return nullptr; }
         if (want_bytes && ti->elements() * ggml_type_size((ggml_type) ti->type) / ggml_blck_size((ggml_type) ti->type) != want_bytes) {
             err = "tp: " + name + " size mismatch"; return nullptr;
         }
-        return model->shard(s).tensor_data(*ti);
+        return M().shard(s).tensor_data(*ti);
     }
 
     // device upload helpers (card c's arena; queue copies from host memory - init only)
@@ -497,9 +505,9 @@ struct Ds41Tp::Impl {
     }
     bool up_f16(Card & c, const std::string & name, const sycl::half * & dst) {
         size_t s = 0;
-        const TensorInfo * ti = model->find(name, &s);
+        const TensorInfo * ti = M().find(name, &s);
         if (!ti || ti->type != ty::F16) { err = "tp: no F16 tensor " + name; return false; }
-        dst = up<sycl::half>(c, model->shard(s).tensor_data(*ti), ti->elements() * 2);
+        dst = up<sycl::half>(c, M().shard(s).tensor_data(*ti), ti->elements() * 2);
         return dst != nullptr;
     }
     // F16 rows as a mat-vec weight (an F32 tensor converted, as STRATA_ROUTER_F16 does); several tensors stacked by rows
@@ -508,17 +516,24 @@ struct Ds41Tp::Impl {
         int64_t K = -1, rows = 0;
         for (const auto & n : names) {
             size_t s = 0;
-            const TensorInfo * ti = model->find(n, &s);
+            const TensorInfo * ti = M().find(n, &s);
             if (!ti || ti->shape.size() != 2) { err = "tp: no 2-D tensor " + n; return false; }
             if (K >= 0 && (int64_t) ti->shape[0] != K) { err = "tp: " + n + " row length differs"; return false; }
             K = (int64_t) ti->shape[0];
             const int64_t r = (int64_t) ti->shape[1];
             const size_t o = buf.size();
             buf.resize(o + (size_t) (r * K));
-            const uint8_t * p = model->shard(s).tensor_data(*ti);
+            const uint8_t * p = M().shard(s).tensor_data(*ti);
             if (ti->type == ty::F16) std::memcpy(buf.data() + o, p, (size_t) (r * K) * 2);
             else if (ti->type == ty::F32) ggml_fp32_to_fp16_row((const float *) p, (ggml_fp16_t *) (buf.data() + o), r * K);
-            else { err = "tp: " + n + " is not F16 / F32"; return false; }
+            else if (ggml_get_type_traits((ggml_type) ti->type)->to_float) {   // a quantised router (the DSpark draft's Q8_0 gate)
+                std::vector<float> f((size_t) K);
+                const size_t rb = ggml_row_size((ggml_type) ti->type, K);
+                for (int64_t i = 0; i < r; ++i) {
+                    ggml_get_type_traits((ggml_type) ti->type)->to_float(p + (size_t) i * rb, f.data(), K);
+                    ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t *) (buf.data() + o + (size_t) (i * K)), K);
+                }
+            } else { err = "tp: " + n + " has no F16 form"; return false; }
             rows += r;
         }
         m.p = up<uint8_t>(c, buf.data(), buf.size() * 2);
@@ -1054,8 +1069,18 @@ struct Ds41Tp::Impl {
     }
 
     void emit_prologue(Card & c, const PassK & P) {
-        // the pass's inputs (the used prefix of the block), then the sync sequence numbers and the initial state
-        c.q.memcpy(c.in, hin, IL.bytes_for(P.n, (int) D));
+        // the pass's inputs (the used prefix of the block), then the sync sequence numbers and the initial state.
+        // STRATA_TP_ZC_IN (default 1): by a kernel reading the pinned block - a copy-engine memcpy waited behind the
+        // promotions' copies queued on that engine (engine1's draft does the same)
+        static const bool zc = env_on("STRATA_TP_ZC_IN", true);
+        const size_t ib = IL.bytes_for(P.n, (int) D);
+        if (zc && ib % 16 == 0) {
+            const sycl::uint4 * src = (const sycl::uint4 *) hin;
+            sycl::uint4 * dst = (sycl::uint4 *) c.in;
+            c.q.parallel_for(sycl::range<1>(ib / 16), [=](sycl::id<1> i) { dst[i] = src[i]; });
+        } else {
+            c.q.memcpy(c.in, hin, ib);
+        }
         c.q.memset(c.err, 0, 16);
         tpk::seq_init(c.q, inp<int32_t>(c, IL.pid), c.seq);
         tpk::init_state(c.q, inp<float>(c, IL.emb), P.n, (int) D, c.x, c.pre);
@@ -1093,8 +1118,11 @@ struct Ds41Tp::Impl {
         }
         tpk::hc_fab(c.q, hi, ha, fin_in);
         // DSpark's main_hidden taps (rank 0): the state leaving layers 36 / 37 / 38 = entering 37 / 38 / 39
-        for (int j = 0; j < 3; ++j)
+        for (int j = 0; j < 3; ++j) {
             if (c.rank == 0 && tap_on && l == dm_layers[j] + 1) tpk::hc_mean(c.q, c.x, n, (int) D, hvh + (size_t) j * D, 3 * D);
+            // engine1's draft: every card's own copy (its feed reads them there; the state is replicated)
+            if (d_tap && tap_on && l == dm_layers[j] + 1) tpk::hc_mean(c.q, c.x, n, (int) D, dc[(size_t) c.rank].tap + (size_t) j * D, 3 * D);
+        }
         ST(c, l, 1);
         // ---- q_a + kv, q_a's norm (+ q8), q_b (this card's heads), the window row
         mv_q6(c, w.qkv, c.xq, c.xd, n, c.qkv, RQ + DH, 0, c.xT, c.xdT);
@@ -1361,6 +1389,457 @@ struct Ds41Tp::Impl {
         mv_q6(c, c.head, c.zq, c.zd, P.n, c.lgt, c.vk);
         for (int t = 0; t < P.n; ++t) c.q.memcpy(hlog + (size_t) t * V + c.vrow.lo * 16, c.lgt + (size_t) t * c.vk, (size_t) c.vk * 4);
         c.q.memcpy(herr + c.rank * 4, c.err, 16);
+    }
+
+    // ================================================================== engine1's DSpark draft (Ds41Tp::draft_*)
+    // The checkpoint's mtp.0-2 stack (ds41_dspark.cpp's ggml graph, DeepSeek's model.py) on the trunk's N cards.  Its
+    // blocks have the trunk layer's shapes (compress ratio 0: window attention only) and split as one: q_b rows /
+    // attention / wo_a of the rank's o-groups, wo_b's K columns, the shared expert's n_ff blocks; hc mixes, norms,
+    // q_a + kv and the router replicated.  The 128 Q2_K routed experts of a block (top-3) live on rank e % N (the planar
+    // int8 kernels' Q2_K form).  The window feed's main_proj is K-split (a rank its 3D / N input columns: a partial of
+    // main_x, summed as the trunk's partials), the head is the trunk's LM head shards, the Markov head's bias rows split
+    // as the vocabulary, its argmax merged across the cards one draft slot at a time.  One recorded graph a card per
+    // (feed rows, draft?, rows from the host?).  Consecutive cross-card sums alternate the two slot buffers (ara / arb)
+    // and read a buffer before the next sum's send: a card running ahead then never overwrites unread slots.
+    static constexpr int DWIN = 128, DBS = 5, DKMAX = 16, DM = DWIN + DBS, MKE = 256;
+    struct DLW {   // one card's weights of one draft block
+        const float * hca_fn = nullptr, * hcf_fn = nullptr;   // [24][HC * D] F32 (the sidecar's type)
+        const float * hca_sc = nullptr, * hca_bs = nullptr, * attn_norm = nullptr;
+        const float * hcf_sc = nullptr, * hcf_bs = nullptr, * ffn_norm = nullptr;
+        const float * sinks = nullptr;
+        Mat qkv, kv;   // Q6_K [DH + RQ][D]: the kv rows FIRST (kv = that row prefix: the feed's projection), then q_a
+        const float * qa_norm = nullptr, * kva_norm = nullptr;
+        Mat qb, woa, wob, router, sgu, sdn;
+        const float * bias = nullptr, * rbias = nullptr;
+    };
+    struct DCard {   // a card's share of the draft
+        std::vector<DLW> lw;
+        float * ring[3] = { nullptr, nullptr, nullptr };   // [DWIN][DH] the blocks' window rings (replicated)
+        Mat mproj;                                         // main_proj: [D][this rank's mck of the 3D columns]
+        int64_t mc0 = 0, mck = 0;
+        const float * mnorm = nullptr, * onorm = nullptr, * cw = nullptr;   // main_norm, mtp.2.norm, confidence [D + MKE]
+        Mat mkh;                                           // markov_head.head, this rank's vocab rows: Q6_K [vk][MKE]
+        const uint8_t * mke = nullptr;                     // markov_head.embed: Q8_0 [V][MKE], every row
+        tpk::TpExp * etab = nullptr;                       // [3][DNE] the routed experts (this card's blobs)
+        float * tap = nullptr;                             // [NMAX][3D] the last verify pass's main_hidden (every rank)
+        float * frows = nullptr;                           // [DKMAX][3D] this step's feed rows
+        int32_t * din = nullptr;                           // the input block
+        float * mx = nullptr, * mxn = nullptr; int8_t * mxq = nullptr; float * mxd = nullptr;   // [NMAX][D] main_x
+        int8_t * fxq = nullptr; float * fxd = nullptr;     // [NMAX][mck] the feed rows' columns, q8
+        float * kvr = nullptr, * kvy = nullptr, * kvt = nullptr;   // [NMAX][DH] x 2, [NMAX][ND]
+        float * me = nullptr; int8_t * meq = nullptr; float * med = nullptr;   // [MKE] a slot's markov embedding + q8
+        float * mb = nullptr;                              // [vk] a slot's markov bias rows
+        int32_t * tok = nullptr;                           // [8] the chain's tokens (replicated)
+        float * conf = nullptr;                            // [8] the confidence logits
+        uint64_t * stamps = nullptr;                       // STRATA_TP_DRAFT_STAMP: the clock after each phase
+        std::map<int, sx::command_graph<sx::graph_state::executable>> graphs;
+    };
+    // STRATA_TP_DRAFT_STAMP=1 (diagnostic): the sub-group clock after each phase of a draft step on every card (inputs,
+    // feed, the three blocks, the LM head, the Markov chain); per 64 drafting steps each card's average phase times
+    static constexpr int DNST = 7;
+    bool d_stamp = false;
+    std::vector<double> d_st;   // [card][DNST]
+    int64_t d_st_n = 0;
+    void DST(Card & c, DCard & d, int i) {
+        if (!d.stamps) return;
+        uint64_t * p = d.stamps + i;
+        c.q.single_task([=] { *p = sx::clock<sx::clock_scope::sub_group>(); });
+    }
+    struct DIn {   // the draft's input block (int32 / float words), pinned and on every card
+        size_t pid, fpos, fslot, r0, bonus, bpos, widx, wmask, emb, words;
+        void make(int64_t D) {
+            size_t o = 0;
+            auto take = [&](size_t n) { const size_t r = o; o += (n + 15) & ~(size_t) 15; return r; };
+            pid = take(1); fpos = take(DKMAX); fslot = take(DKMAX); r0 = take(1); bonus = take(1); bpos = take(DBS);
+            widx = take((size_t) DBS * DM); wmask = take((size_t) DBS * DM); emb = take((size_t) DBS * D);
+            words = o;
+        }
+    };
+    std::vector<DCard> dc;
+    DIn DL;
+    std::unique_ptr<GgufModel> dmodel;
+    int64_t DNE = 0;
+    int DNU = 3;
+    std::vector<int> d_filled;      // ring slot -> the position it holds (-1: none)
+    std::vector<float> d_noise;     // [D] the noise token's embedding
+    int32_t * dhin = nullptr;       // pinned: the input block
+    float * dhrows = nullptr;       // pinned: [DKMAX][3D] feed rows from the host
+    float * dhout = nullptr;        // pinned: [16] ids (int bits) | confidences
+    bool d_tap = false;             // the trunk's DSpark passes write main_hidden into every card's dc[k].tap
+    double d_ms = 0;
+    size_t d_bytes = 0;
+    size_t d_ggml_bytes = 0;        // what the ggml stack (ds41_dspark.cpp) would hold on card 0 for this sidecar
+    template <class T> T * dinp(DCard & d, size_t off) const { return (T *) (d.din + off); }
+
+    bool draft_load(Card & c, DCard & d) {
+        const int64_t h0 = c.grp.lo * (NH / OG);
+        const size_t a0 = c.ar.total;
+        d.lw.assign(3, {});
+        for (int b = 0; b < 3; ++b) {
+            DLW & w = d.lw[(size_t) b];
+            const std::string p = "mtp." + std::to_string(b) + ".";
+            if (!up_f32(c, p + "hc_attn_fn", tpk::HC * D * tpk::NMIX, w.hca_fn) || !up_f32(c, p + "hc_ffn_fn", tpk::HC * D * tpk::NMIX, w.hcf_fn) ||
+                !up_f32(c, p + "hc_attn_scale", 3, w.hca_sc) || !up_f32(c, p + "hc_attn_base", tpk::NMIX, w.hca_bs) ||
+                !up_f32(c, p + "hc_ffn_scale", 3, w.hcf_sc) || !up_f32(c, p + "hc_ffn_base", tpk::NMIX, w.hcf_bs) ||
+                !up_f32(c, p + "attn_norm.weight", D, w.attn_norm) || !up_f32(c, p + "ffn_norm.weight", D, w.ffn_norm) ||
+                !up_f32(c, p + "attn.attn_sink", c.nhk, w.sinks, h0) || !up_f32(c, p + "attn.q_norm.weight", RQ, w.qa_norm) ||
+                !up_f32(c, p + "attn.kv_norm.weight", DH, w.kva_norm) || !up_f32(c, p + "ffn.gate.bias", DNE, w.bias))
+                return false;
+            std::vector<float> zero((size_t) DNE, 0.0f);
+            w.rbias = up<float>(c, zero.data(), zero.size() * 4);
+            if (!mat_q6(c, { { p + "attn.wkv.weight", 0, DH, 0, D / QK }, { p + "attn.wq_a.weight", 0, RQ, 0, D / QK } }, 1, w.qkv)) return false;
+            w.kv = w.qkv;
+            w.kv.N = DH;
+            w.kv.nbt = (DH + RQ) * (D / QK);
+            if (!mat_q6(c, { { p + "attn.wq_b.weight", h0 * DH, (h0 + c.nhk) * DH, 0, RQ / QK } }, 1, w.qb)) return false;
+            std::vector<Part> sl;
+            for (int64_t g = c.grp.lo; g < c.grp.hi; ++g) sl.push_back({ p + "attn.wo_a.weight", g * OL, (g + 1) * OL, 0, OGD / QK });
+            if (!mat_q6(c, sl, c.grp.n(), w.woa)) return false;
+            if (!mat_q6(c, { { p + "attn.wo_b.weight", 0, D, c.grp.lo * OL / QK, c.grp.hi * OL / QK } }, 1, w.wob)) return false;
+            if (!mat_f16(c, { p + "ffn.gate.weight" }, w.router)) return false;
+            if (!mat_q6(c, { { p + "ffn.shared_experts.w1.weight", c.ffb.lo * QK, c.ffb.hi * QK, 0, D / QK },
+                             { p + "ffn.shared_experts.w3.weight", c.ffb.lo * QK, c.ffb.hi * QK, 0, D / QK } }, 1, w.sgu)) return false;
+            if (!mat_q6(c, { { p + "ffn.shared_experts.w2.weight", 0, D, c.ffb.lo, c.ffb.hi } }, 1, w.sdn)) return false;
+            // the mat-vec forms the trunk's layer 0 was tuned to (the same shapes; the kv prefix: fastmv's dispatch)
+            const LW & t = c.lw[0];
+            std::memcpy(w.qkv.form, t.qkv.form, sizeof w.qkv.form);
+            std::memset(w.kv.form, 0, sizeof w.kv.form);
+            std::memcpy(w.qb.form, t.qb.form, sizeof w.qb.form);
+            std::memcpy(w.woa.form, t.woa.form, sizeof w.woa.form);
+            std::memcpy(w.wob.form, t.wob.form, sizeof w.wob.form);
+            std::memcpy(w.sgu.form, t.sgu.form, sizeof w.sgu.form);
+            std::memcpy(w.sdn.form, t.sdn.form, sizeof w.sdn.form);
+        }
+        {   // main_proj: this rank's K columns (whole 256-blocks of the 3D inputs)
+            const Range kb = split(3 * D / QK, N, c.rank);
+            d.mc0 = kb.lo * QK;
+            d.mck = kb.n() * QK;
+            if (!mat_q6(c, { { "mtp.0.main_proj.weight", 0, D, kb.lo, kb.hi } }, 1, d.mproj)) return false;
+        }
+        if (!up_f32(c, "mtp.0.main_norm.weight", D, d.mnorm) || !up_f32(c, "mtp.2.norm.weight", D, d.onorm) ||
+            !up_f32(c, "mtp.2.confidence_head.proj.weight", D + MKE, d.cw))
+            return false;
+        if (!mat_q6(c, { { "mtp.2.markov_head.head.weight", c.vrow.lo * 16, c.vrow.hi * 16, 0, MKE / QK } }, 1, d.mkh)) return false;
+        {
+            const uint8_t * e = raw("mtp.2.markov_head.embed.weight", ty::Q8_0, (size_t) V * (MKE / 32) * 34);
+            if (!e || !(d.mke = up<uint8_t>(c, e, (size_t) V * (MKE / 32) * 34))) return false;
+        }
+        // the routed experts: expert e of every block on rank e % N, planar, its blob [gate rows | up rows | down rows]
+        const size_t gr = (size_t) (D / QK) * 84, dr = (size_t) (NFF / QK) * 84, gb = (size_t) NFF * gr, db = (size_t) D * dr;
+        const size_t eb = 2 * gb + db;
+        uint8_t * stage = sycl::malloc_host<uint8_t>(eb, ctx);
+        if (!stage) { err = "tp draft: pinned staging failed"; return false; }
+        std::vector<tpk::TpExp> tab((size_t) (3 * DNE));
+        for (int b = 0; b < 3 && err.empty(); ++b) {
+            const std::string p = "mtp." + std::to_string(b) + ".ffn.experts.";
+            const uint8_t * g = raw(p + "w1.weight", (uint32_t) GGML_TYPE_Q2_K, gb * (size_t) DNE), * u = raw(p + "w3.weight", (uint32_t) GGML_TYPE_Q2_K, gb * (size_t) DNE);
+            const uint8_t * dn = raw(p + "w2.weight", (uint32_t) GGML_TYPE_Q2_K, db * (size_t) DNE);
+            if (!g || !u || !dn) break;
+            for (int64_t e = 0; e < DNE; ++e) {
+                tpk::TpExp & x = tab[(size_t) (b * DNE + e)];
+                x.owner = (int32_t) (e % N);
+                x.up_off = (uint32_t) gb; x.down_off = (uint32_t) (2 * gb);
+                x.gu_type = x.d_type = (uint16_t) strata::v41::xe::kQ2K;
+                x.gu_row = (uint16_t) gr; x.d_row = (uint16_t) dr;
+                if (x.owner != c.rank) continue;
+                uint8_t * blob = (uint8_t *) c.ar.get(eb, err);
+                if (!blob) break;
+                std::memcpy(stage, g + (size_t) e * gb, gb);
+                std::memcpy(stage + gb, u + (size_t) e * gb, gb);
+                std::memcpy(stage + 2 * gb, dn + (size_t) e * db, db);
+                strata::v41::xe::xe_repack_blob(c.q, stage, blob, strata::v41::xe::kQ2K, strata::v41::xe::kQ2K, gb, 2 * gb, (int) D, (int) NFF).wait();
+                x.blob = blob;
+            }
+        }
+        sycl::free(stage, ctx);
+        if (!err.empty()) return false;
+        d.etab = up<tpk::TpExp>(c, tab.data(), tab.size() * sizeof(tpk::TpExp));
+        d_bytes = std::max(d_bytes, c.ar.total - a0);
+        return d.etab != nullptr;
+    }
+
+    bool draft_buffers(Card & c, DCard & d) {
+        const size_t n = (size_t) NMAX;
+        for (int b = 0; b < 3; ++b) d.ring[b] = dalloc<float>(c, (size_t) (DWIN * DH));
+        d.tap = dalloc<float>(c, n * 3 * D);
+        d.frows = dalloc<float>(c, (size_t) DKMAX * 3 * D);
+        d.din = dalloc<int32_t>(c, DL.words);
+        d.mx = dalloc<float>(c, n * D); d.mxn = dalloc<float>(c, n * D); d.mxq = dalloc<int8_t>(c, n * D); d.mxd = dalloc<float>(c, n * D / 32);
+        d.fxq = dalloc<int8_t>(c, n * (size_t) d.mck); d.fxd = dalloc<float>(c, n * (size_t) d.mck / 32);
+        d.kvr = dalloc<float>(c, n * DH); d.kvy = dalloc<float>(c, n * DH); d.kvt = dalloc<float>(c, n * ND);
+        d.me = dalloc<float>(c, MKE); d.meq = dalloc<int8_t>(c, MKE); d.med = dalloc<float>(c, MKE / 32);
+        d.mb = dalloc<float>(c, (size_t) c.vk);
+        d.tok = dalloc<int32_t>(c, 8); d.conf = dalloc<float>(c, 8);
+        if (d_stamp) d.stamps = dalloc<uint64_t>(c, DNST);
+        c.q.wait();
+        return err.empty();
+    }
+
+    // x[t] = the sum of the cards' slots of `buf` (rank order, as tpk::PSum's consumers add them)
+    void psum(Card & c, const float * buf, size_t slot, int n, float * out) {
+        const int64_t Dd = D;
+        const int NN = N;
+        c.q.parallel_for(sycl::range<1>((size_t) n * Dd), [=](sycl::id<1> id) {
+            float v = buf[id[0]];
+            for (int k = 1; k < NN; ++k) v += buf[(size_t) k * slot + id[0]];
+            out[id[0]] = v;
+        });
+    }
+
+    // the draft program on card c: inputs, the window feed (k rows), then - draft - the block and its head
+    void emit_draft(Card & c, DCard & d, int k, bool draft, bool host) {
+        const size_t ar_slot = (size_t) NMAX * D;
+        const int64_t D3 = 3 * D;
+        // the inputs by a kernel reading the pinned block (zero-copy), not a copy-engine memcpy: the promotions' copies
+        // queue on the card's copy engine (tens of MB a pass) and a memcpy behind them started the draft ~1-3 ms late
+        {
+            const sycl::uint4 * src = (const sycl::uint4 *) dhin;
+            sycl::uint4 * dst = (sycl::uint4 *) d.din;
+            int32_t * pidp = c.in + IL.pid;
+            const size_t pw = DL.pid;
+            c.q.parallel_for(sycl::range<1>(DL.words / 4), [=](sycl::id<1> i) {
+                const sycl::uint4 v = src[i];
+                dst[i] = v;
+                if (i[0] == pw / 4) pidp[0] = (int32_t) v[pw % 4];   // the sync words and waits read the pass id there
+            });
+        }
+        c.q.memset(c.err, 0, 16);
+        tpk::seq_init(c.q, inp<int32_t>(c, IL.pid), c.seq);
+        DST(c, d, 0);
+        {   // the feed rows: the host's (pinned) or the last verify pass's taps from row r0
+            float * fr = d.frows;
+            const size_t nf4 = (size_t) k * (size_t) D3 / 4;
+            if (host) {
+                const float * src = dhrows;
+                c.q.parallel_for(sycl::range<1>(nf4), [=](sycl::id<1> i) { ((sycl::float4 *) fr)[i] = ((const sycl::float4 *) src)[i]; });
+            } else {
+                const float * tap = d.tap;
+                const int32_t * r0p = dinp<int32_t>(d, DL.r0);
+                c.q.parallel_for(sycl::range<1>(nf4), [=](sycl::id<1> i) {
+                    ((sycl::float4 *) fr)[i] = ((const sycl::float4 *) (tap + (size_t) *r0p * (size_t) D3))[i];
+                });
+            }
+        }
+        // ---- the window feed, NMAX rows at a time: main_x = main_norm(main_proj(rows)) (the cards' column partials
+        // summed), then every block's ring rows = its kv_fin(wkv(main_x)) at the rows' slots.  The chunks' sums alternate
+        // ara / arb so that the last one is arb (the block's first sum is ara)
+        const int nch = (k + NMAX - 1) / NMAX;
+        for (int ch = 0; ch < nch; ++ch) {
+            const int r = ch * NMAX, m = std::min(NMAX, k - r);
+            float * buf = ((nch - 1 - ch) % 2 == 0) ? c.arb : c.ara;
+            tpfmv::quant_x(c.q, d.frows + (size_t) r * D3 + d.mc0, D3, 0, m, 1, d.mck, d.fxq, d.fxd);
+            mv_q6(c, d.mproj, d.fxq, d.fxd, m, buf + (size_t) c.rank * ar_slot, D);
+            exchange(c, buf, ar_slot, (size_t) m * D * 4, sync_idx++);
+            psum(c, buf, ar_slot, m, d.mx);
+            tpdec::RmsQ8Args a;
+            a.x = d.mx; a.x_cs = D; a.w = d.mnorm; a.eps = (float) G.rms_eps;
+            a.y = d.mxn; a.q = d.mxq; a.d = d.mxd; a.K = (int) D; a.n = m;
+            tpdec::rms_q8(c.q, a);
+            for (int b = 0; b < 3; ++b) {
+                const DLW & w = d.lw[(size_t) b];
+                mv_q6(c, w.kv, d.mxq, d.mxd, m, d.kvr, DH);
+                tpdec::KvFinArgs f;
+                f.x = d.kvr; f.x_cs = DH; f.w = w.kva_norm; f.pos = dinp<int32_t>(d, DL.fpos) + r; f.eps = (float) G.rms_eps;
+                f.rope = rope_p(0); f.fq = cfg.act_quant; f.y = d.kvy; f.y_cs = DH;
+                f.ring = d.ring[b]; f.ring_cs = DH; f.slot = dinp<int32_t>(d, DL.fslot) + r; f.slot_from = 0;
+                f.tab = d.kvt; f.D = (int) DH; f.n = m;
+                tpdec::kv_fin(c.q, f);
+            }
+        }
+        DST(c, d, 1);
+        if (draft) {
+            PassK P;
+            P.n = DBS;
+            P.cap[0] = P.cap[1] = P.cap[2] = 0;
+            // [bonus, noise x 4] at p+1 .. p+5: hc copies of the embeddings, the identity pre-mix
+            tpk::init_state(c.q, dinp<float>(d, DL.emb), DBS, (int) D, c.x, c.pre);
+            for (int b = 0; b < 3; ++b) { emit_dblock(c, d, b, P); DST(c, d, 2 + b); }
+            // forward_head: hc_pre -> norm -> the trunk's LM head (this card's vocab rows)
+            finish(c, P);
+            tpk::hc_pre(c.q, c.x, c.pre, DBS, (int) D, c.z);
+            tpdec::RmsQ8Args a;
+            a.x = c.z; a.x_cs = D; a.w = d.onorm; a.eps = (float) G.rms_eps;
+            a.y = c.zn; a.q = c.zq; a.d = c.zd; a.K = (int) D; a.n = DBS;
+            tpdec::rms_q8(c.q, a);
+            mv_q6(c, c.head, c.zq, c.zd, DBS, c.lgt, c.vk);
+            DST(c, d, 5);
+            for (int i = 0; i < DBS; ++i) emit_markov(c, d, i);
+            DST(c, d, 6);
+            if (c.rank == 0) {   // (stores into the pinned block: no copy engine, as the inputs)
+                const int32_t * tk = d.tok;
+                const float * cf = d.conf;
+                float * ho = dhout;
+                c.q.single_task([=] {
+                    for (int i = 0; i < DBS; ++i) { ho[i] = sycl::bit_cast<float>(tk[i]); ho[8 + i] = cf[i]; }
+                });
+            }
+        }
+        {
+            const int32_t * e = c.err;
+            int32_t * he = herr + c.rank * 4;
+            c.q.single_task([=] { for (int i = 0; i < 4; ++i) he[i] = e[i]; });
+        }
+    }
+
+    // one draft block (Block.forward: the trunk layer's program at ratio 0) over the DBS block rows
+    void emit_dblock(Card & c, DCard & d, int b, const PassK & P) {
+        const DLW & w = d.lw[(size_t) b];
+        const int n = P.n;
+        const size_t ar_slot = (size_t) NMAX * D;
+        // ---- the previous block's finish (blocks 1, 2), the attention hc
+        tpk::HcOut ha;
+        ha.sc = w.hca_sc; ha.bs = w.hca_bs; ha.pw = w.attn_norm; ha.eps = (float) G.rms_eps; ha.hc_eps = (float) G.hc_eps;
+        ha.n_iter = (int) G.hc_iters; ha.xn = c.xn; ha.pre = c.apre; ha.post = c.apost; ha.comb = c.acomb; ha.xq = c.xq; ha.xd = c.xd;
+        if (xmx(w.qkv, n)) { ha.xT = c.xT; ha.xdT = c.xdT; }
+        tpk::HcIn hi;
+        hi.fn = w.hca_fn; hi.fs1 = tpk::HC * D; hi.w16 = false;
+        hi.pre = c.pre; hi.ps1 = tpk::HC;
+        hi.out = c.hcs; hi.cnt = c.cnt; hi.D = D; hi.n = n;
+        const bool fin_in = b > 0;
+        if (fin_in) {
+            hi.x = c.hap; hi.xs1 = D; hi.xs2 = tpk::HC * D;
+            hi.y = tpk::PSum { c.arb, (int64_t) ar_slot, D, N };
+            hi.post = c.fpost; hi.pos1 = tpk::HC; hi.comb = c.fcomb; hi.cs1 = tpk::HC; hi.cs2 = tpk::HC * tpk::HC;
+            hi.hdst = c.x;
+        } else {
+            hi.x = c.x; hi.xs1 = D; hi.xs2 = tpk::HC * D;
+        }
+        tpk::hc_fab(c.q, hi, ha, fin_in);
+        // ---- kv + q_a (kv rows first), q_a's norm (+ q8), q_b (this card's heads), the block rows' kv (not into the
+        // ring: it holds accepted positions only) + the RoPE table of the block positions
+        mv_q6(c, w.qkv, c.xq, c.xd, n, c.qkv, DH + RQ, 0, c.xT, c.xdT);
+        {
+            tpdec::RmsQ8Args a;
+            a.x = c.qkv + DH; a.x_cs = DH + RQ; a.w = w.qa_norm; a.eps = (float) G.rms_eps;
+            a.y = c.qr; a.q = c.qrq; a.d = c.qrd; a.K = (int) RQ; a.n = n;
+            if (xmx(w.qb, n)) { a.xT = c.qrT; a.xdT = c.qrdT; }
+            tpdec::rms_q8(c.q, a);
+        }
+        mv_q6(c, w.qb, c.qrq, c.qrd, n, c.qh, c.nhk * DH, 0, c.qrT, c.qrdT);
+        {
+            tpdec::KvFinArgs a;
+            a.x = c.qkv; a.x_cs = DH + RQ; a.w = w.kva_norm; a.pos = dinp<int32_t>(d, DL.bpos); a.eps = (float) G.rms_eps;
+            a.rope = rope_p(0); a.fq = cfg.act_quant; a.y = c.kvn; a.y_cs = DH;
+            a.ring = nullptr; a.tab = c.rtab; a.D = (int) DH; a.n = n;
+            tpdec::kv_fin(c.q, a);
+        }
+        // ---- attention over this card's heads: every query sees the window's visible slots and all DBS block rows
+        {
+            tpdec::AttnArgs a;
+            a.q = c.qh; a.q_h = DH; a.q_b = (size_t) (c.nhk * DH); a.tab = c.rtab; a.n_dims = (int) ND;
+            a.ring = d.ring[b]; a.ring_cs = DH; a.RAW = DWIN; a.rows = c.kvn; a.rows_cs = DH;
+            a.widx = dinp<int32_t>(d, DL.widx); a.wi_b = DM; a.wmask = dinp<float>(d, DL.wmask); a.wm_b = DM;
+            a.swa = DM; a.sinks = w.sinks; a.o = c.o; a.o_h = DH; a.o_b = (size_t) (c.nhk * DH);
+            a.NH = (int) c.nhk; a.n = n; a.scale = 1.0f / std::sqrt((float) DH); a.part = c.apart;
+            a.hpg = (int) (OGD / DH); a.oq = c.oq; a.od = c.od;
+            if (xmx(w.woa, n)) { a.oT = c.oT; a.odT = c.odT; }
+            tpdec::attn_dec(c.q, a);
+        }
+        mv_q6(c, w.woa, c.oq, c.od, n, c.oa, c.grp.n() * OL, OL, c.oT, c.odT);
+        if (xmx(w.wob, n)) tpfmv::quant_xT(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aT, c.adT);
+        else tpfmv::quant_x(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aq, c.ad);
+        mv_q6(c, w.wob, c.aq, c.ad, n, c.ara + (size_t) c.rank * ar_slot, D, 0, c.aT, c.adT);
+        exchange(c, c.ara, ar_slot, (size_t) n * D * 4, sync_idx++);
+        // ---- the FFN hc (the attention output summed over the cards), the router, the shared expert, the routed experts
+        tpk::HcOut hf;
+        hf.sc = w.hcf_sc; hf.bs = w.hcf_bs; hf.pw = w.ffn_norm; hf.eps = (float) G.rms_eps; hf.hc_eps = (float) G.hc_eps;
+        hf.n_iter = (int) G.hc_iters; hf.xn = c.fn; hf.pre = c.pre; hf.post = c.fpost; hf.comb = c.fcomb; hf.xq = c.fq; hf.xd = c.fd;
+        if (xmx(w.sgu, n)) { hf.xT = c.fT; hf.xdT = c.fdT; }
+        tpk::HcIn fi;
+        fi.x = c.x; fi.xs1 = D; fi.xs2 = tpk::HC * D;
+        fi.fn = w.hcf_fn; fi.fs1 = tpk::HC * D; fi.w16 = false;
+        fi.pre = c.apre; fi.ps1 = tpk::HC;
+        fi.y = tpk::PSum { c.ara, (int64_t) ar_slot, D, N };
+        fi.post = c.apost; fi.pos1 = tpk::HC; fi.comb = c.acomb; fi.cs1 = tpk::HC; fi.cs2 = tpk::HC * tpk::HC;
+        fi.out = c.hcs; fi.hdst = c.hap; fi.cnt = c.cnt; fi.D = D; fi.n = n;
+        tpk::hc_fab(c.q, fi, hf, true);
+        mv_f16(c, w.router, c.fn, D, n, c.lg, DNE);
+        {
+            tpk::RouterArgs a;
+            a.lg = c.lg; a.bias = w.bias; a.rbias = w.rbias; a.ne = (int) DNE; a.k = DNU; a.n = n;
+            a.norm = G.norm_topk; a.scale = (float) G.weights_scale; a.ids = c.ids; a.wts = c.wts;
+            tpk::router(c.q, a);
+        }
+        float * pb = c.arb + (size_t) c.rank * ar_slot;
+        mv_q6(c, w.sgu, c.fq, c.fd, n, c.gu, 2 * c.fk, 0, c.fT, c.fdT);
+        tpk::swiglu_q8(c.q, c.gu, c.fk, n, (float) G.swiglu_limit, c.sh, c.shq, c.shd, xmx(w.sdn, n) ? c.shT : nullptr, c.shdT);
+        mv_q6(c, w.sdn, c.shq, c.shd, n, pb, D, 0, c.shT, c.shdT);
+        const int njm = n * DNU;
+        tpk::BalArgs nb = bal;
+        nb.on = false;   // no copies: every job its owner's
+        tpk::route_jobs(c.q, c.ids, c.wts, n, DNU, d.etab + (size_t) b * DNE, c.rank, c.jobs, njm, c.need_cpu, nb);
+        strata::v41::xe::xe_quant_rows(c.q, c.fn, n, (int) D, c.X);
+        strata::v41::xe::xe_experts_q8(c.q, c.jobs, njm, n, c.X, c.H, pb, (int) D, (int) NFF, (float) G.swiglu_limit, true, n,
+                                       c.need_cpu + 1, 8, false, true);   // (Q2_K: the draft's own kernels)
+        exchange(c, c.arb, ar_slot, (size_t) n * D * 4, sync_idx++);
+    }
+
+    // draft slot i of the Markov head (model.py: left to right, slot 0's token = the bonus): e = embed(the previous
+    // slot's token), the confidence logit proj . [hn_i ; e] (replicated); this rank's bias rows head . e added to the
+    // slot's logits, their best (value, token) to every card; every card keeps the best of the ranks' (the highest
+    // value, equal ones the lowest token: the first maximum, as ggml_argmax) -> tok[i].  Slot i's sum: ara (even) / arb.
+    void emit_markov(Card & c, DCard & d, int i) {
+        const size_t ar_slot = (size_t) NMAX * D;
+        {
+            const uint8_t * mke = d.mke;
+            float * me = d.me, * conf = d.conf;
+            const int32_t * tok = d.tok, * bonus = dinp<int32_t>(d, DL.bonus);
+            const float * cw = d.cw, * z = c.z + (size_t) i * D;
+            const int64_t Dd = D;
+            const int ii = i;
+            c.q.parallel_for(sycl::nd_range<1>(sycl::range<1>(MKE), sycl::range<1>(MKE)), [=](sycl::nd_item<1> it) {
+                const int j = (int) it.get_local_id(0);
+                const int t = ii == 0 ? *bonus : tok[ii - 1];
+                const uint8_t * blk = mke + ((size_t) t * (MKE / 32) + (size_t) (j / 32)) * 34;
+                const float v = (float) sycl::bit_cast<sycl::half>((uint16_t) (blk[0] | (blk[1] << 8))) * (float) (int8_t) blk[2 + j % 32];
+                me[j] = v;
+                float s = cw[Dd + j] * v;
+                for (int64_t q = j; q < Dd; q += MKE) s += cw[q] * z[q];
+                s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+                if (j == 0) conf[ii] = s;
+            });
+        }
+        tpfmv::quant_x(c.q, d.me, MKE, MKE, 1, 1, MKE, d.meq, d.med);
+        mv_q6(c, d.mkh, d.meq, d.med, 1, d.mb, c.vk);
+        float * buf = i % 2 == 0 ? c.ara : c.arb;
+        {
+            const float * lg = c.lgt + (size_t) i * c.vk, * mb = d.mb;
+            float * slot = buf + (size_t) c.rank * ar_slot;
+            const int64_t vk = c.vk, v0 = c.vrow.lo * 16;
+            c.q.parallel_for(sycl::nd_range<1>(sycl::range<1>(1024), sycl::range<1>(1024)), [=](sycl::nd_item<1> it) {
+                const int l = (int) it.get_local_id(0);
+                float bv = -INFINITY;
+                int bi = 0x7fffffff;
+                for (int64_t r = l; r < vk; r += 1024) {
+                    const float v = lg[r] + mb[r];
+                    if (v > bv) { bv = v; bi = (int) r; }
+                }
+                const float gv = sycl::reduce_over_group(it.get_group(), bv, sycl::maximum<float>());
+                const int gi = sycl::reduce_over_group(it.get_group(), bv == gv ? bi : 0x7fffffff, sycl::minimum<int>());
+                if (l == 0) {   // (16 bytes: the push form's unit)
+                    slot[0] = gv;
+                    slot[1] = sycl::bit_cast<float>((int32_t) (v0 + (gi == 0x7fffffff ? 0 : gi)));
+                    slot[2] = 0.0f;
+                    slot[3] = 0.0f;
+                }
+            });
+        }
+        exchange(c, buf, ar_slot, 16, sync_idx++);
+        {
+            const float * all = buf;
+            int32_t * tk = d.tok;
+            const int NN = N, ii = i;
+            c.q.single_task([=] {
+                float bv = -INFINITY;
+                int32_t bt = 0x7fffffff;
+                for (int k = 0; k < NN; ++k) {
+                    const float v = all[(size_t) k * ar_slot];
+                    const int32_t t = sycl::bit_cast<int32_t>(all[(size_t) k * ar_slot + 1]);
+                    if (v > bv || (v == bv && t < bt)) { bv = v; bt = t; }
+                }
+                tk[ii] = bt == 0x7fffffff ? 0 : bt;
+            });
+        }
     }
 
     // ------------------------------------------------------------------ the pass's host inputs (ds41_dense's
@@ -2128,6 +2607,198 @@ std::string Ds41Tp::report() const {
     char b[128];
     std::snprintf(b, sizeof b, "last pass %.1f us (%.1f us/layer)", p_->last_pass_us, p_->last_pass_us / std::max(1, p_->NL));
     return b;
+}
+
+// ---------------------------------------------------------------------------------------------------- the draft
+bool Ds41Tp::draft_init(const std::string & sidecar, int n_used, int noise_id, int block, std::string & err) {
+    Impl & im = *p_;
+    if (im.dmodel) { draft_reset(); return true; }   // (a second init: the weights stay)
+    if (block != Impl::DBS) { err = "tp draft: block size " + std::to_string(block) + " (the kernels take " + std::to_string(Impl::DBS) + ")"; return false; }
+    if (n_used < 1 || n_used > 8 || im.NMAX < Impl::DBS) { err = "tp draft: unsupported n_used / pass width"; return false; }
+    const double t0 = now_us();
+    try {
+        im.dmodel = std::make_unique<GgufModel>(GgufModel::open(sidecar));
+    } catch (const std::exception & e) {
+        err = std::string("tp draft: ") + e.what();
+        return false;
+    }
+    // the blocks must have the trunk layer's shapes (the kernels and the splits are the trunk's)
+    auto shape = [&](const std::string & n, std::vector<uint64_t> want) {
+        const TensorInfo * t = im.dmodel->find(n);
+        return t && t->shape == want;
+    };
+    const uint64_t D = (uint64_t) im.D, RQ = (uint64_t) im.RQ, DH = (uint64_t) im.DH, NHD = (uint64_t) (im.NH * im.DH);
+    const uint64_t OGL = (uint64_t) (im.OG * im.OL), OGD = (uint64_t) im.OGD, F = (uint64_t) im.NFF;
+    const TensorInfo * w1 = im.dmodel->find("mtp.0.ffn.experts.w1.weight");
+    if (!w1 || w1->shape.size() != 3 || w1->type != (uint32_t) GGML_TYPE_Q2_K) { err = "tp draft: mtp.0.ffn.experts.w1 is not a Q2_K [D, n_ff, n_expert] tensor"; im.dmodel.reset(); return false; }
+    im.DNE = (int64_t) w1->shape[2];
+    for (int b = 0; b < 3; ++b) {
+        const std::string p = "mtp." + std::to_string(b) + ".";
+        if (!shape(p + "attn.wq_a.weight", { D, RQ }) || !shape(p + "attn.wkv.weight", { D, DH }) || !shape(p + "attn.wq_b.weight", { RQ, NHD }) ||
+            !shape(p + "attn.wo_a.weight", { OGD, OGL }) || !shape(p + "attn.wo_b.weight", { OGL, D }) ||
+            !shape(p + "ffn.shared_experts.w1.weight", { D, F }) || !shape(p + "ffn.shared_experts.w2.weight", { F, D }) ||
+            !shape(p + "ffn.experts.w1.weight", { D, F, (uint64_t) im.DNE }) || !shape(p + "ffn.experts.w2.weight", { F, D, (uint64_t) im.DNE }) ||
+            !shape(p + "ffn.gate.weight", { D, (uint64_t) im.DNE })) {
+            err = "tp draft: block " + std::to_string(b) + "'s shapes are not the trunk layer's";
+            im.dmodel.reset();
+            return false;
+        }
+    }
+    if (!shape("mtp.0.main_proj.weight", { 3 * D, D }) || !shape("mtp.2.markov_head.head.weight", { (uint64_t) Impl::MKE, (uint64_t) im.V }) ||
+        !shape("mtp.2.markov_head.embed.weight", { (uint64_t) Impl::MKE, (uint64_t) im.V }) || im.DNE > 1024 || (3 * D / QK) < (uint64_t) im.N) {
+        err = "tp draft: the feed / head tensors are not the expected shapes";
+        im.dmodel.reset();
+        return false;
+    }
+    im.DNU = n_used;
+    {   // the ggml stack's card-0 bytes for the same sidecar: every mtp.* tensor, its Q8_0 projections requantised as
+        // STRATA_DSPARK_DENSE_TYPE (q6_K: 210 bytes a 256-block) - this draft leaves them to card 0's expert cache
+        const char * dt = std::getenv("STRATA_DSPARK_DENSE_TYPE");
+        const bool q6 = dt && std::strcmp(dt, "q6_K") == 0;
+        size_t b = 0;
+        for (size_t sh = 0; sh < im.dmodel->size(); ++sh)
+            for (const auto & t : im.dmodel->shard(sh).tensors()) {
+                if (t.name.rfind("mtp.", 0) != 0) continue;
+                const ggml_type tt = (ggml_type) t.type;
+                auto ends = [&](const char * x) { const size_t l = std::strlen(x); return t.name.size() > l && t.name.compare(t.name.size() - l, l, x) == 0; };
+                const bool rq = q6 && tt == GGML_TYPE_Q8_0 && t.name.find(".ffn.experts.") == std::string::npos && !ends(".ffn.gate.weight") &&
+                                !ends("markov_head.embed.weight") && !t.shape.empty() && t.shape[0] % 256 == 0;
+                b += rq ? (size_t) (t.elements() / 256) * 210 : (size_t) (t.elements() / ggml_blck_size(tt)) * ggml_type_size(tt);
+            }
+        im.d_ggml_bytes = b;
+    }
+    im.DL.make(im.D);
+    im.dhin = sycl::malloc_host<int32_t>(im.DL.words, im.ctx);
+    im.dhrows = sycl::malloc_host<float>((size_t) Impl::DKMAX * 3 * im.D, im.ctx);
+    im.dhout = sycl::malloc_host<float>(16, im.ctx);
+    if (!im.dhin || !im.dhrows || !im.dhout) { err = "tp draft: pinned allocation failed"; return false; }
+    std::memset(im.dhin, 0, im.DL.words * 4);
+    im.d_noise.assign((size_t) im.D, 0.0f);
+    if (noise_id < 0 || noise_id >= im.V) { err = "tp draft: noise token out of range"; return false; }
+    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(im.embd) + (size_t) noise_id * (size_t) im.D, im.d_noise.data(), im.D);
+    im.d_filled.assign(Impl::DWIN, -1);
+    im.d_stamp = std::getenv("STRATA_TP_DRAFT_STAMP") && std::atoi(std::getenv("STRATA_TP_DRAFT_STAMP")) != 0;
+    im.dc.assign(im.cards.size(), {});
+    im.wsrc = im.dmodel.get();
+    bool ok = true;
+    for (size_t k = 0; k < im.cards.size() && ok; ++k) ok = im.draft_load(*im.cards[k], im.dc[k]) && im.draft_buffers(*im.cards[k], im.dc[k]);
+    im.wsrc = nullptr;
+    im.q6_drop();
+    if (!ok) { err = im.err; return false; }
+    // the trunk's DSpark passes now also write main_hidden on every card (their graphs are recorded again)
+    im.d_tap = true;
+    for (auto & c : im.cards) c->graphs.clear();
+    std::fprintf(stderr, "tp draft: %s on %d cards, %.2f GiB a card (%lld experts a block, top-%d), %.1f s%s\n", sidecar.c_str(), im.N,
+                 im.d_bytes / 1073741824.0, (long long) im.DNE, im.DNU, (now_us() - t0) / 1e6, im.free_str().c_str());
+    return true;
+}
+
+void Ds41Tp::draft_reset() {
+    Impl & im = *p_;
+    im.d_filled.assign(Impl::DWIN, -1);
+}
+
+bool Ds41Tp::draft_ready() const { return p_->dmodel != nullptr; }
+size_t Ds41Tp::draft_bytes() const { return p_->d_bytes; }
+size_t Ds41Tp::draft_ggml_bytes() const { return p_->d_ggml_bytes; }
+double Ds41Tp::draft_last_ms() const { return p_->d_ms; }
+
+bool Ds41Tp::draft_step(const float * rows, int r0, const int * pos, int k, int bonus, int * ids, float * conf) {
+    Impl & im = *p_;
+    im.err.clear();
+    if (!im.dmodel) { im.err = "tp draft: not loaded"; return false; }
+    if (k < 1 || k > Impl::DKMAX) { im.err = "tp draft: feed rows " + std::to_string(k); return false; }
+    if (!rows && (r0 < 0 || r0 + k > im.NMAX)) { im.err = "tp draft: tap rows out of range"; return false; }
+    if (bonus >= im.V) { im.err = "tp draft: bonus token out of range"; return false; }
+    const double t0 = now_us();
+    const Impl::DIn & L = im.DL;
+    int32_t * h = im.dhin;
+    if (++im.pid >= (1u << 19)) im.pid = 1;
+    h[L.pid] = (int32_t) im.pid;
+    for (int i = 0; i < k; ++i) {
+        if (pos[i] < 0 || (i > 0 && pos[i] <= pos[i - 1])) { im.err = "tp draft: positions must increase"; return false; }
+        h[L.fpos + (size_t) i] = pos[i];
+        h[L.fslot + (size_t) i] = pos[i] % Impl::DWIN;
+        im.d_filled[(size_t) (pos[i] % Impl::DWIN)] = pos[i];
+    }
+    h[L.r0] = rows ? 0 : r0;
+    const bool draft = bonus >= 0;
+    if (draft) {   // keys: window slots holding a position in (p - WIN, p], and the DBS block rows (every query all of them)
+        const int p = pos[k - 1];
+        h[L.bonus] = bonus;
+        for (int t = 0; t < Impl::DBS; ++t) h[L.bpos + (size_t) t] = p + 1 + t;
+        int32_t * wi = h + L.widx;
+        float * wm = (float *) (h + L.wmask);
+        for (int t = 0; t < Impl::DBS; ++t) {
+            for (int s = 0; s < Impl::DWIN; ++s) {
+                const int q = im.d_filled[(size_t) s];
+                wi[t * Impl::DM + s] = s;
+                wm[t * Impl::DM + s] = (q >= 0 && q <= p && q > p - Impl::DWIN) ? 0.0f : -INFINITY;
+            }
+            for (int j = 0; j < Impl::DBS; ++j) {
+                wi[t * Impl::DM + Impl::DWIN + j] = Impl::DWIN + j;
+                wm[t * Impl::DM + Impl::DWIN + j] = 0.0f;
+            }
+        }
+        float * emb = (float *) (h + L.emb);
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(im.embd) + (size_t) bonus * (size_t) im.D, emb, im.D);
+        for (int t = 1; t < Impl::DBS; ++t) std::memcpy(emb + (size_t) t * im.D, im.d_noise.data(), (size_t) im.D * 4);
+    }
+    if (rows) std::memcpy(im.dhrows, rows, (size_t) k * 3 * im.D * 4);
+    const int key = (k * 2 + (draft ? 1 : 0)) * 2 + (rows ? 1 : 0);
+    for (size_t c = 0; c < im.cards.size(); ++c) {
+        Card & cd = *im.cards[c];
+        Impl::DCard & d = im.dc[c];
+        if (d.graphs.count(key)) continue;
+        sx::command_graph<sx::graph_state::modifiable> g(im.ctx, cd.dev);
+        g.begin_recording(cd.q);
+        im.sync_idx = 0;
+        im.emit_draft(cd, d, k, draft, rows != nullptr);
+        g.end_recording(cd.q);
+        if (!im.err.empty()) return false;
+        d.graphs.emplace(key, g.finalize());
+    }
+    for (size_t c = 0; c < im.cards.size(); ++c) im.cards[c]->q.ext_oneapi_graph(im.dc[c].graphs.at(key));
+    for (auto & cp : im.cards) cp->q.wait();
+    for (int c = 0; c < im.N; ++c)
+        if (im.herr[c * 4] || im.herr[c * 4 + 1]) {
+            im.err = "tp draft: rank " + std::to_string(c) + " gave up waiting (" + std::to_string(im.herr[c * 4]) + " peer)";
+            return false;
+        }
+    if (draft && im.d_stamp) {
+        static const char * nm[Impl::DNST] = {"", "feed", "block0", "block1", "block2", "head", "markov"};
+        im.d_st.resize((size_t) im.N * Impl::DNST, 0.0);
+        uint64_t h[Impl::DNST];
+        for (int c = 0; c < im.N; ++c) {
+            im.cards[(size_t) c]->q.memcpy(h, im.dc[(size_t) c].stamps, sizeof h).wait();
+            for (int i = 1; i < Impl::DNST; ++i) im.d_st[(size_t) c * Impl::DNST + i] += (double) (int64_t) (h[i] - h[i - 1]) / im.st_tpu;
+        }
+        if (++im.d_st_n % 64 == 0) {
+            for (int c = 0; c < im.N; ++c) {
+                std::string line;
+                double tot = 0;
+                char b[48];
+                for (int i = 1; i < Impl::DNST; ++i) {
+                    const double v = im.d_st[(size_t) c * Impl::DNST + i] / 64.0;
+                    tot += v;
+                    std::snprintf(b, sizeof b, " %s %.0f", nm[i], v);
+                    line += b;
+                }
+                std::fprintf(stderr, "tp draft stamps card %d (us, drafts %lld-%lld):%s = %.0f\n", c, (long long) im.d_st_n - 63, (long long) im.d_st_n, line.c_str(), tot);
+            }
+            std::fill(im.d_st.begin(), im.d_st.end(), 0.0);
+        }
+    }
+    if (draft) {
+        for (int i = 0; i < Impl::DBS; ++i) {
+            int32_t t;
+            std::memcpy(&t, im.dhout + i, 4);
+            ids[i] = t;
+            conf[i] = im.dhout[8 + i];
+        }
+    }
+    im.d_ms = (now_us() - t0) / 1000.0;
+    return true;
 }
 
 }  // namespace strata::v41

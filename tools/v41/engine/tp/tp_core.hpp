@@ -137,6 +137,22 @@ public:
     bool shard_desc(const std::string & name, int rank, Ds41TpShard & d) const;
     int n_cards() const;
 
+    /// larry, engine1: DSpark's draft stack (the sidecar's mtp.0-2: ds41_dspark.hpp's contract) on the same N cards - its
+    /// blocks split as the trunk's layers, its routed experts (Q2_K) e on rank e % N.  Loads the weights (VRAM on every
+    /// card: call before the expert tier sizes its cache); from then on the DSpark passes also keep main_hidden on the
+    /// cards for draft_step.  A second call only resets the window.
+    bool draft_init(const std::string & sidecar, int n_used, int noise_id, int block, std::string & err);
+    bool draft_ready() const;
+    /// Append k <= 16 main_hidden rows (positions pos[0..k), increasing) to every block's window - rows: host rows
+    /// (k * 3 * n_embd floats), or null: rows r0 .. r0 + k - 1 of the last DSpark pass's taps (on the cards) - then, when
+    /// bonus >= 0, draft the block after pos[k - 1]: ids[0..5) and the confidence logits conf[0..5)
+    bool draft_step(const float * rows, int r0, const int * pos, int k, int bonus, int * ids, float * conf);
+    /// forget the window (a new conversation / a rewind past it)
+    void draft_reset();
+    size_t draft_bytes() const;     ///< the draft's weights + state on one card (the largest)
+    size_t draft_ggml_bytes() const;   ///< what the ggml stack would hold on card 0 for the same sidecar (the VRAM it frees)
+    double draft_last_ms() const;   ///< the last draft_step's wall time
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

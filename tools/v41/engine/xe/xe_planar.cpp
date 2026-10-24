@@ -14,6 +14,7 @@
 //   Q2_0   (QK  64): qs'[16] x NB | d x NB, qs' re-encoded per 16 values: value 4k + i of a 16-group is byte i,
 //                    bits 2k, so (word >> 2k) & 0x03030303 is 4 consecutive codes
 //   PTQ1_0 (QK 128): trits[0..15] x NB | trits[16..23] x NB | (trits[24..25], d) x NB
+//   Q2_K   (QK 256): qs[64] x NB | scales[16] x NB | (d, dmin) x NB      (engine1's DSpark draft experts)
 #include "xe_kernels.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -159,6 +160,84 @@ inline void blk_q3k(const uint8_t* const* m, size_t NB, size_t blk, int ci, cons
     }
 }
 
+// Q2_K: Q3_K's lane split (its qs field has the same layout: chunk ci = 16 bytes, h = ci / 2, s = ci % 2, values
+// 128h + 32jj + 16s + 0..15 at bits 2jj), scale byte 8h + 2jj + s = the scale (low nibble) and the min (high nibble):
+// w = d sc q - dmin m, so a 16-value group gives d sc (q . x) - dmin m (sum x), the activations' sums per 16 (XSet.s).
+template <int NT, int NR>
+inline void blk_q2k(const uint8_t* const* m, size_t NB, size_t blk, int ci, const XSet& xs, const int* rows, int b, int nt,
+                    float (&acc)[NR][NT]) {
+    const int h = ci >> 1, s = ci & 1;
+    uint32_t qs[NR][4];
+    float fd[NR][4], fm[NR][4];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const sycl::uint4 v = *reinterpret_cast<const sycl::uint4*>(m[r] + blk * 64 + ci * 16);
+        qs[r][0] = v.x(); qs[r][1] = v.y(); qs[r][2] = v.z(); qs[r][3] = v.w();
+        // scale bytes 8h + 2jj + s, jj < 4: bytes s, 2 + s of the words 2h (jj < 2) and 2h + 1
+        const sycl::uint2 sw = *reinterpret_cast<const sycl::uint2*>(m[r] + 64 * NB + blk * 16 + 8 * h);
+        const uint32_t dmw = *reinterpret_cast<const uint32_t*>(m[r] + 80 * NB + blk * 4);
+        const float d = h2f((uint16_t) (dmw & 0xFFFFu)), dmin = h2f((uint16_t) (dmw >> 16));
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            const uint32_t sc = ((jj < 2 ? sw.x() : sw.y()) >> (8 * (2 * (jj & 1) + s))) & 0xFFu;
+            fd[r][jj] = d * (float) (sc & 0xFu);
+            fm[r][jj] = dmin * (float) (sc >> 4);
+        }
+    }
+    if constexpr (NT == 1) {
+        // one token: the masked (not shifted) fields straight into dp4a, the sum shifted back (exact)
+        const int8_t* xq = xs.qrow(rows[0]) + (size_t) b * 256 + 128 * h + 16 * s;
+        const sycl::float4 dx4 = *reinterpret_cast<const sycl::float4*>(xs.drow(rows[0]) + (size_t) b * 8 + 4 * h);
+        const float dxs[4] = {dx4.x(), dx4.y(), dx4.z(), dx4.w()};
+        const int32_t* sp = xs.srow(rows[0]) + (size_t) b * 16 + 8 * h + s;
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            const uint32_t Mq = 0x03030303u << (2 * jj);
+            const sycl::uint4 xv = *reinterpret_cast<const sycl::uint4*>(xq + 32 * jj);
+            const uint32_t xw[4] = {xv.x(), xv.y(), xv.z(), xv.w()};
+            const float sx = (float) sp[2 * jj];
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                int aq = 0;
+#pragma unroll
+                for (int w = 0; w < 4; ++w) aq = dp4a(qs[r][w] & Mq, xw[w], aq);
+                acc[r][0] += dxs[jj] * (fd[r][jj] * (float) (aq >> (2 * jj)) - fm[r][jj] * sx);
+            }
+        }
+    } else {
+        // several tokens: the codes (0..3) once, then one dp4a per 4 values per token
+        uint32_t qv[NR][4][4];
+#pragma unroll
+        for (int r = 0; r < NR; ++r)
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+                for (int w = 0; w < 4; ++w) qv[r][jj][w] = (qs[r][w] >> (2 * jj)) & 0x03030303u;
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t < nt) {
+                const int8_t* xq = xs.qrow(rows[t]) + (size_t) b * 256 + 128 * h + 16 * s;
+                const sycl::float4 dx4 = *reinterpret_cast<const sycl::float4*>(xs.drow(rows[t]) + (size_t) b * 8 + 4 * h);
+                const float dxs[4] = {dx4.x(), dx4.y(), dx4.z(), dx4.w()};
+                const int32_t* sp = xs.srow(rows[t]) + (size_t) b * 16 + 8 * h + s;
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    const sycl::uint4 xv = *reinterpret_cast<const sycl::uint4*>(xq + 32 * jj);
+                    const uint32_t xw[4] = {xv.x(), xv.y(), xv.z(), xv.w()};
+                    const float sx = (float) sp[2 * jj];
+#pragma unroll
+                    for (int r = 0; r < NR; ++r) {
+                        int a = 0;
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) a = dp4a(qv[r][jj][w], xw[w], a);
+                        acc[r][t] += dxs[jj] * (fd[r][jj] * (float) a - fm[r][jj] * sx);
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <int NT, int NR>
 inline void blk_q20(const uint8_t* const* m, size_t NB, size_t blk, const XSet& xs, const int* rows, int b, int nt, float (&acc)[NR][NT]) {
     uint32_t w[NR][4];
@@ -297,13 +376,17 @@ template <int TYPE, int NT, int NR>
 inline void blk_dot(const uint8_t* const* m, size_t NB, size_t blk, int ci, const XSet& xs, const int* rows, int b, int nt,
                     float (&acc)[NR][NT]) {
     if constexpr (TYPE == kQ3K) blk_q3k<NT, NR>(m, NB, blk, ci, xs, rows, b, nt, acc);
+    else if constexpr (TYPE == kQ2K) blk_q2k<NT, NR>(m, NB, blk, ci, xs, rows, b, nt, acc);
     else if constexpr (TYPE == kQ20) blk_q20<NT, NR>(m, NB, blk, xs, rows, b, nt, acc);
     else blk_ptq1<NT, NR>(m, NB, blk, xs, rows, b, nt, acc);
 }
 
-inline int qk_of(int type) { return type == kQ3K ? 256 : type == kQ20 ? 64 : 128; }
+inline int qk_of(int type) { return type == kQ3K || type == kQ2K ? 256 : type == kQ20 ? 64 : 128; }
 template <int TYPE>
-constexpr int qk_c() { return TYPE == kQ3K ? 256 : TYPE == kQ20 ? 64 : 128; }
+constexpr int qk_c() { return TYPE == kQ3K || TYPE == kQ2K ? 256 : TYPE == kQ20 ? 64 : 128; }
+// the types whose 256-blocks are split over 4 lanes (a lane a 16-byte chunk of qs) - the others: a block a lane
+template <int TYPE>
+constexpr bool split4() { return TYPE == kQ3K || TYPE == kQ2K; }
 
 // ---- gate/up + SwiGLU + int8 quantisation of H.  A work-group (8 sub-groups) owns 32 consecutive rows of one job;
 // a sub-group 4 rows, 4 lanes per row (every 4th block); each lane does the gate AND the up row (shared x loads).
@@ -312,7 +395,7 @@ inline void gu_rows(const XeJob& jb, const XSet& xs, const int* rows, int row, i
     const uint8_t* mats[2] = {jb.blob, jb.blob + jb.up_off};
     const int nbr = xs.n / qk_c<TYPE>();
     const size_t NB = (size_t) n_ff * nbr;
-    if constexpr (TYPE == kQ3K) {   // 4 lanes per block (chunk bl % 4): a row's lanes read whole cache lines
+    if constexpr (split4<TYPE>()) {   // 4 lanes per block (chunk bl % 4): a row's lanes read whole cache lines
 #pragma unroll 2
         for (int b = bl >> 2; b < nbr; b += LPR / 4) blk_dot<TYPE, NT, 2>(mats, NB, (size_t) row * nbr + b, bl & 3, xs, rows, b, nt, acc);
     } else {                        // a block per lane: LPR consecutive blocks per row per load
@@ -321,19 +404,23 @@ inline void gu_rows(const XeJob& jb, const XSet& xs, const int* rows, int row, i
     }
 }
 
-/// gu_rows for a job of any gate/up type
-template <int NT, int LPR>
+/// gu_rows for a job of any gate/up type (Q2: engine1's draft, Q2_K only - its own kernels: the trunk's keep their code)
+template <int NT, int LPR, bool Q2 = false>
 inline void gu_any(const XeJob& jb, const XSet& xs, const int* rows, int row, int bl, int n_ff, int nt, float (&acc)[2][NT]) {
-    const int type = jb.gu_type;
-    if (type == kQ3K) gu_rows<kQ3K, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
-    else if (type == kQ20) gu_rows<kQ20, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
-    else gu_rows<kPtq1, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+    if constexpr (Q2) {
+        gu_rows<kQ2K, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+    } else {
+        const int type = jb.gu_type;
+        if (type == kQ3K) gu_rows<kQ3K, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+        else if (type == kQ20) gu_rows<kQ20, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+        else gu_rows<kPtq1, NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+    }
 }
 
 // larry (STRATA_XE_JOBNT, see xe_experts_q8): only the jobs of lo..hi tokens run here (the others are another launch's),
 // and jn: a 1-token job runs the 1-token form.  nj_dev (engine1): the real job count on the device (the slots past it
 // are null); jst > 0: a launch of jst job slots, each work-group taking jobs j, j + jst, ... (0: one slot a job)
-template <int NT, int LPR = 4>   // LPR 16: one row per sub-group, 4x the sub-groups (decode: few jobs fill the card)
+template <int NT, int LPR = 4, bool Q2 = false>   // LPR 16: one row per sub-group, 4x the sub-groups (decode: few jobs fill the card)
 sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 Hq, int n_embd, int n_ff, float L,
                        int lo = 1, int hi = kMaxJobTok, bool jn = false, const int32_t* nj_dev = nullptr, int jst = 0) {
     const int rb = n_ff / 32;
@@ -367,14 +454,14 @@ sycl::event gate_up_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 X, XeQ8 H
                 if constexpr (NT > 1) {
                     if (jn && nt == 1) {
                         float a1[2][1] = {{0.f}, {0.f}};
-                        gu_any<1, LPR>(jb, xs, rows, row, bl, n_ff, 1, a1);
+                        gu_any<1, LPR, Q2>(jb, xs, rows, row, bl, n_ff, 1, a1);
                         acc[0][0] = a1[0][0];
                         acc[1][0] = a1[1][0];
                     } else {
-                        gu_any<NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+                        gu_any<NT, LPR, Q2>(jb, xs, rows, row, bl, n_ff, nt, acc);
                     }
                 } else {
-                    gu_any<NT, LPR>(jb, xs, rows, row, bl, n_ff, nt, acc);
+                    gu_any<NT, LPR, Q2>(jb, xs, rows, row, bl, n_ff, nt, acc);
                 }
 #pragma unroll
                 for (int i = 0; i < 2; ++i)
@@ -443,7 +530,7 @@ inline void down_job(const XeJob& jb, const XSet& hs, const int* rows, int row, 
     float a[1][NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) a[0][t] = 0.f;
-    if constexpr (TYPE == kQ3K) {
+    if constexpr (split4<TYPE>()) {
 #pragma unroll 3
         for (int b = bl >> 2; b < nbr; b += LPR / 4) blk_dot<TYPE, NT, 1>(mm, NB, (size_t) row * nbr + b, bl & 3, hs, rows, b, nt, a);
     } else {
@@ -464,22 +551,26 @@ inline void down_job(const XeJob& jb, const XSet& hs, const int* rows, int row, 
     }
 }
 
-/// down_job for a job of any down type (its H rows: j * kMaxJobTok + slot)
-template <int NT, int NTOK, int LPR>
+/// down_job for a job of any down type (its H rows: j * kMaxJobTok + slot); Q2: Q2_K only (as gu_any)
+template <int NT, int NTOK, int LPR, bool Q2 = false>
 inline void down_any(const XeJob& jb, const XSet& hs, int j, int row, int bl, int n_embd, int nt, const sycl::sub_group& sg,
                      float (&o)[NTOK]) {
     int rows[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) rows[t] = j * kMaxJobTok + (t < nt ? t : 0);
-    const int type = jb.d_type;
-    if (type == kQ3K) down_job<kQ3K, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
-    else if (type == kPtq1) down_job<kPtq1, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
-    else down_job<kQ20, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+    if constexpr (Q2) {
+        down_job<kQ2K, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+    } else {
+        const int type = jb.d_type;
+        if (type == kQ3K) down_job<kQ3K, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+        else if (type == kPtq1) down_job<kPtq1, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+        else down_job<kQ20, NT, NTOK, LPR>(jb, hs, rows, row, bl, n_embd, nt, sg, o);
+    }
 }
 
 // jn (larry, STRATA_XE_JOBNT): a 1- or 2-token job of a wider form runs the 1- / 2-token form; nj_dev (engine1): the
 // real job count on the device
-template <int NT, int NTOK, int LPR = 4>   // NT: tokens per job (bound), NTOK: tokens of the call (bound)
+template <int NT, int NTOK, int LPR = 4, bool Q2 = false>   // NT: tokens per job (bound), NTOK: tokens of the call (bound)
 sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq, float* OUT, int n_embd, int n_ff,
                     bool accumulate, bool jn = false, const int32_t* nj_dev = nullptr) {
     const int rows_wg = kDownSgPerWg * (SG / LPR);
@@ -499,12 +590,12 @@ sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq
             const int nt = jb.nt;
             if (nt == 0) continue;   // a null job (padding)
             if constexpr (NT > 1) {
-                if (jn && nt == 1) { down_any<1, NTOK, LPR>(jb, hs, j, row, bl, n_embd, 1, sg, o); continue; }
+                if (jn && nt == 1) { down_any<1, NTOK, LPR, Q2>(jb, hs, j, row, bl, n_embd, 1, sg, o); continue; }
                 if constexpr (NT > 2) {
-                    if (jn && nt == 2) { down_any<2, NTOK, LPR>(jb, hs, j, row, bl, n_embd, 2, sg, o); continue; }
+                    if (jn && nt == 2) { down_any<2, NTOK, LPR, Q2>(jb, hs, j, row, bl, n_embd, 2, sg, o); continue; }
                 }
             }
-            down_any<NT, NTOK, LPR>(jb, hs, j, row, bl, n_embd, nt, sg, o);
+            down_any<NT, NTOK, LPR, Q2>(jb, hs, j, row, bl, n_embd, nt, sg, o);
         }
         if (bl == 0) {
 #pragma unroll
@@ -520,7 +611,7 @@ sycl::event down_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq
 // larry, engine1 (STRATA_XE_DOWN_SPLIT): down with a work-group's sub-groups on the SAME 4 output rows, sub-group s
 // taking jobs s, s + 8, ...; their sums added in local memory in sub-group order (deterministic) - 8x the sub-groups
 // of down_q8, whose sub-groups each ran every job of the call in turn (latency-bound at a handful of jobs a card)
-template <int NT, int NTOK, int LPR = 4>
+template <int NT, int NTOK, int LPR = 4, bool Q2 = false>
 sycl::event down_q8s(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 Hq, float* OUT, int n_embd, int n_ff,
                      bool accumulate, bool jn, const int32_t* nj_dev) {
     constexpr int RPW = SG / LPR;   // rows a work-group (= a sub-group's)
@@ -542,12 +633,12 @@ sycl::event down_q8s(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 H
                 const int nt = jb.nt;
                 if (nt == 0) continue;
                 if constexpr (NT > 1) {
-                    if (jn && nt == 1) { down_any<1, NTOK, LPR>(jb, hs, j, row, bl, n_embd, 1, sg, o); continue; }
+                    if (jn && nt == 1) { down_any<1, NTOK, LPR, Q2>(jb, hs, j, row, bl, n_embd, 1, sg, o); continue; }
                     if constexpr (NT > 2) {
-                        if (jn && nt == 2) { down_any<2, NTOK, LPR>(jb, hs, j, row, bl, n_embd, 2, sg, o); continue; }
+                        if (jn && nt == 2) { down_any<2, NTOK, LPR, Q2>(jb, hs, j, row, bl, n_embd, 2, sg, o); continue; }
                     }
                 }
-                down_any<NT, NTOK, LPR>(jb, hs, j, row, bl, n_embd, nt, sg, o);
+                down_any<NT, NTOK, LPR, Q2>(jb, hs, j, row, bl, n_embd, nt, sg, o);
             }
             if (bl == 0) {
 #pragma unroll
@@ -569,8 +660,9 @@ sycl::event down_q8s(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 H
     });
 }
 
-// ---- repack: one work-item per block of a matrix
-sycl::event repack_mat(sycl::queue& q, int type, const uint8_t* src, uint8_t* dst, size_t NB) {
+// ---- repack: one work-item per block of a matrix (the first form: each work-item writes its block's fields to planes NB
+// apart - uncoalesced, ~740 us a Q3_K expert)
+sycl::event repack_mat_old(sycl::queue& q, int type, const uint8_t* src, uint8_t* dst, size_t NB) {
     return q.parallel_for(sycl::range<1>(NB), [=](sycl::id<1> id) {
         const size_t i = id[0];
         if (type == kQ3K) {
@@ -580,6 +672,11 @@ sycl::event repack_mat(sycl::queue& q, int type, const uint8_t* src, uint8_t* ds
             for (int k = 0; k < 12; ++k) dst[96 * NB + i * 12 + k] = s[96 + k];
             dst[108 * NB + i * 2] = s[108];
             dst[108 * NB + i * 2 + 1] = s[109];
+        } else if (type == kQ2K) {   // block_q2_K: scales[16] | qs[64] | d | dmin
+            const uint8_t* s = src + i * 84;
+            for (int k = 0; k < 64; ++k) dst[i * 64 + k] = s[16 + k];
+            for (int k = 0; k < 16; ++k) dst[64 * NB + i * 16 + k] = s[k];
+            for (int k = 0; k < 4; ++k) dst[80 * NB + i * 4 + k] = s[80 + k];
         } else if (type == kQ20) {
             const uint8_t* s = src + i * 18;
             for (int u = 0; u < 4; ++u) {   // 16-value unit u: file value j' at byte j'/4 bits 2(j'%4) -> byte j'%4 bits 2(j'/4)
@@ -598,6 +695,53 @@ sycl::event repack_mat(sycl::queue& q, int type, const uint8_t* src, uint8_t* ds
             for (int k = 0; k < 8; ++k) dst[16 * NB + i * 8 + k] = s[16 + k];
             for (int k = 0; k < 4; ++k) dst[24 * NB + i * 4 + k] = s[24 + k];
         }
+    });
+}
+
+// larry, engine1: the repack with coalesced stores (the promotions repack beside the passes): a work-group stages 64
+// blocks in local memory with word loads, then writes each plane's run of them byte-consecutively across its lanes.
+// Byte-identical to repack_mat_old (test_xe_q2k checks it).
+sycl::event repack_mat(sycl::queue& q, int type, const uint8_t* src, uint8_t* dst, size_t NB) {
+    constexpr int WB = 64, WG = 128;
+    const int BB = type == kQ3K ? 110 : type == kQ20 ? 18 : type == kQ2K ? 84 : 28;
+    const size_t nwg = (NB + WB - 1) / WB;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> sm(sycl::range<1>((size_t) WB * 112), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nwg * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int l = (int) it.get_local_id(0);
+            const size_t i0 = (size_t) it.get_group(0) * WB;
+            const int nb = (int) sycl::min((size_t) WB, NB - i0);
+            const uint8_t* s = src + i0 * (size_t) BB;   // (64-block runs start word-aligned for every type)
+            const int nbytes = nb * BB, nw = nbytes / 4;
+            for (int w = l; w < nw; w += WG) {
+                const uint32_t v = reinterpret_cast<const uint32_t*>(s)[w];
+                sm[4 * w] = (uint8_t) v; sm[4 * w + 1] = (uint8_t) (v >> 8); sm[4 * w + 2] = (uint8_t) (v >> 16); sm[4 * w + 3] = (uint8_t) (v >> 24);
+            }
+            for (int b = 4 * nw + l; b < nbytes; b += WG) sm[b] = s[b];   // a tail run's last bytes
+            sycl::group_barrier(it.get_group());
+            // plane at `base`: sz bytes a block from source offset so
+            auto plane = [&](size_t base, int so, int sz) {
+                for (int x = l; x < nb * sz; x += WG) {
+                    const int b = x / sz, o = x % sz;
+                    dst[base + (i0 + (size_t) b) * (size_t) sz + (size_t) o] = sm[b * BB + so + o];
+                }
+            };
+            if (type == kQ3K) {
+                plane(0, 32, 64); plane(64 * NB, 0, 32); plane(96 * NB, 96, 12); plane(108 * NB, 108, 2);
+            } else if (type == kQ2K) {
+                plane(0, 16, 64); plane(64 * NB, 0, 16); plane(80 * NB, 80, 4);
+            } else if (type == kQ20) {   // qs re-encoded per 16-value unit u: output byte 4u + k = sum_m (code 4m + k) << 2m
+                for (int x = l; x < nb * 16; x += WG) {
+                    const int b = x / 16, o = x % 16, u = o / 4, k = o % 4;
+                    uint32_t v = 0;
+                    for (int m = 0; m < 4; ++m) v |= (uint32_t) ((sm[b * 18 + 2 + 4 * u + m] >> (2 * k)) & 3) << (2 * m);
+                    dst[(i0 + (size_t) b) * 16 + (size_t) o] = (uint8_t) v;
+                }
+                plane(16 * NB, 0, 2);
+            } else {
+                plane(0, 0, 16); plane(16 * NB, 16, 8); plane(24 * NB, 24, 4);
+            }
+        });
     });
 }
 
@@ -647,12 +791,19 @@ sycl::event down_y_q8(sycl::queue& q, const XeJob* jobs, int nj, XeQ8 Hq, float*
 }  // namespace
 
 sycl::event xe_repack_blob(sycl::queue& q, const uint8_t* src, uint8_t* dst, int gu_type, int d_type, size_t up_off,
-                           size_t down_off, int n_embd, int n_ff) {
+                           size_t down_off, int n_embd, int n_ff, int form) {
     const size_t nbg = (size_t) n_ff * (n_embd / qk_of(gu_type));
     const size_t nbd = (size_t) n_embd * (n_ff / qk_of(d_type));
-    repack_mat(q, gu_type, src, dst, nbg);
-    repack_mat(q, gu_type, src + up_off, dst + up_off, nbg);
-    return repack_mat(q, d_type, src + down_off, dst + down_off, nbd);
+    // form 0: the first (uncoalesced) kernel; 1: coalesced; -1: STRATA_XE_REPACK_FAST (default 1)
+    static const int dflt = [] { const char* e = std::getenv("STRATA_XE_REPACK_FAST"); return e ? std::atoi(e) : 1; }();
+    // (by default the coalesced form for Q3_K / Q2_K only: measured 779 -> 212 / 478 -> 131 us an expert; Q2_0's
+    // re-encoding is faster in the first form (70 vs 112 us), PTQ1_0 the same; form 1: the coalesced one for every type)
+    const bool aligned = ((reinterpret_cast<uintptr_t>(src) | up_off | down_off) & 3) == 0;   // (the fast form's word loads)
+    const int fm = form < 0 ? dflt : form;
+    auto pick = [&](int t) { return fm != 0 && aligned && (form == 1 || t == kQ3K || t == kQ2K) ? repack_mat : repack_mat_old; };
+    pick(gu_type)(q, gu_type, src, dst, nbg);
+    pick(gu_type)(q, gu_type, src + up_off, dst + up_off, nbg);
+    return pick(d_type)(q, d_type, src + down_off, dst + down_off, nbd);
 }
 
 sycl::event xe_quant_rows(sycl::queue& q, const float* x, int nrows, int n, XeQ8 out) {
@@ -766,22 +917,24 @@ sycl::event xe_dequant_planar_f16(sycl::queue& q, int type, const uint8_t* mat, 
     });
 }
 
-sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
-                          int n_ff, float swiglu_limit, bool accumulate, int max_nt, const int32_t* nj_dev, int jst, bool split) {
+namespace {
+template <bool Q2>
+sycl::event experts_q8_t(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
+                         int n_ff, float swiglu_limit, bool accumulate, int max_nt, const int32_t* nj_dev, int jst, bool split) {
     if (max_nt <= 0) max_nt = ntok;   // the most tokens any job has: the kernels' register footprint follows it
     const float Lm = swiglu_limit;
     if (ntok <= 1) {   // STRATA_XE_LPR (default 4; 16 measured slower: cards busy 75 -> 82 us a layer)
         static const int lpr = [] { const char* e = std::getenv("STRATA_XE_LPR"); return e ? std::atoi(e) : 4; }();
         if (lpr == 16) {
-            gate_up_q8<1, 16>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
-            return down_q8<1, 1, 16>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+            gate_up_q8<1, 16, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+            return down_q8<1, 1, 16, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
         }
-        gate_up_q8<1>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
-        return down_q8<1, 1>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+        gate_up_q8<1, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+        return down_q8<1, 1, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
     }
     if (max_nt <= 1) {
-        gate_up_q8<1>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
-        return down_q8<1, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+        gate_up_q8<1, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+        return down_q8<1, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
     }
     // larry, STRATA_XE_JOBNT (default 0): a job's own token count picks its form (the widest job used to pick everyone's:
     // armed verify sequences use the pass width) - 1: per job inside the kernels, 2: gate/up in two launches as well
@@ -789,32 +942,39 @@ sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, X
     static const int jobnt = [] { const char* e = std::getenv("STRATA_XE_JOBNT"); return e ? std::atoi(e) : 0; }();
     if (jobnt > 0) {
         const bool two = jobnt >= 2;
-        if (two) gate_up_q8<1>(q, jobs, nj, X, H, n_embd, n_ff, Lm, 1, 1, false, nj_dev, jst);
+        if (two) gate_up_q8<1, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, 1, 1, false, nj_dev, jst);
         const int lo = two ? 2 : 1;
         if (max_nt <= 2) {
-            gate_up_q8<2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
-            if (split) return down_q8s<2, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
-            return down_q8<2, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+            gate_up_q8<2, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
+            if (split) return down_q8s<2, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+            return down_q8<2, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
         }
         if (max_nt <= 4) {
-            gate_up_q8<4>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
-            if (split) return down_q8s<4, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
-            return down_q8<4, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+            gate_up_q8<4, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
+            if (split) return down_q8s<4, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+            return down_q8<4, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
         }
-        gate_up_q8<kMaxJobTok>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
-        if (split) return down_q8s<kMaxJobTok, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
-        return down_q8<kMaxJobTok, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+        gate_up_q8<kMaxJobTok, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm, lo, kMaxJobTok, true, nj_dev, jst);
+        if (split) return down_q8s<kMaxJobTok, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
+        return down_q8<kMaxJobTok, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate, true, nj_dev);
     }
     if (max_nt <= 2) {
-        gate_up_q8<2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
-        return down_q8<2, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+        gate_up_q8<2, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+        return down_q8<2, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
     }
     if (max_nt <= 4) {
-        gate_up_q8<4>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
-        return down_q8<4, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+        gate_up_q8<4, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+        return down_q8<4, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
     }
-    gate_up_q8<kMaxJobTok>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
-    return down_q8<kMaxJobTok, kMaxJobTok>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+    gate_up_q8<kMaxJobTok, 4, Q2>(q, jobs, nj, X, H, n_embd, n_ff, Lm);
+    return down_q8<kMaxJobTok, kMaxJobTok, 4, Q2>(q, jobs, nj, ntok, H, OUT, n_embd, n_ff, accumulate);
+}
+}  // namespace
+
+sycl::event xe_experts_q8(sycl::queue& q, const XeJob* jobs, int nj, int ntok, XeQ8 X, XeQ8 H, float* OUT, int n_embd,
+                          int n_ff, float swiglu_limit, bool accumulate, int max_nt, const int32_t* nj_dev, int jst, bool split, bool q2k) {
+    return q2k ? experts_q8_t<true>(q, jobs, nj, ntok, X, H, OUT, n_embd, n_ff, swiglu_limit, accumulate, max_nt, nj_dev, jst, split)
+               : experts_q8_t<false>(q, jobs, nj, ntok, X, H, OUT, n_embd, n_ff, swiglu_limit, accumulate, max_nt, nj_dev, jst, split);
 }
 
 }  // namespace strata::v41::xe

@@ -368,10 +368,11 @@ struct Ds41XeImpl {
     std::map<int, size_t> tp_defer;    ///< larry, engine1: by GPU, the TP core's VRAM not mapped yet (the flex holds it)
     double dense_bonus_gib = 0;        ///< larry, engine1: card 0 VRAM the pager gave back (on top of STRATA_XE_DENSE_GIB)
     std::map<int, std::pair<uint8_t*, size_t>> dbg;   ///< debug captures (pinned), by slot
-    /// larry, engine1 (STRATA_TP, STRATA_TP_PC_DEVREPACK default 1): a promotion copies the expert's FILE layout into its
-    /// slot (pinned arena blobs straight from the arena, pageable ones through a bounce by a plain memcpy) and the card
-    /// repacks it there (slot -> pc_tmp -> slot) - the host's repack (10-20 ms an expert on a busy host) took the cores
-    /// the DSpark draft's submission and the CPU pool need
+    /// larry, engine1 (STRATA_TP, STRATA_TP_PC_DEVREPACK=1; default 0 since 2026-10-24): a promotion copies the expert's
+    /// FILE layout into its slot (pinned arena blobs straight from the arena, pageable ones through a bounce by a plain
+    /// memcpy) and the card repacks it there (slot -> pc_tmp -> slot).  The host's old repack (10-20 ms an expert) took
+    /// the cores the ggml draft's submission needed; the streaming 16-block one costs what the plain copy did, and the
+    /// card's repack kernels ran beside the TP core's draft on every card (its first cross-card sum up to 5.5 ms late)
     bool pc_devrepack = false;
     std::vector<int> pc_bfree;
     std::list<PcJob> pc_jobs;          ///< in flight (stable addresses: the helper holds pointers)
@@ -1562,8 +1563,73 @@ bool ev_done(const sycl::event& e) {
     return e.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete;
 }
 
+// larry, engine1: the host repack 32 blocks at a time - each plane's run of them (whole 64-byte lines: 64 | 2 x 32,
+// 12 x 32, ...) gathered in a small buffer with fixed-size copies, then streamed out (no read-for-ownership, nothing
+// left in the caches the CPU pool uses; half-line runs made the write-combining flush partial lines: 1.6 GB/s).  Under
+// STRATA_TP the promotions' fill writes the planes straight into the pinned bounce, so a card only copies them in: no
+// repack kernel beside the TP core's passes and its draft (those delayed the draft's first cross-card sum by up to
+// 5.5 ms a step).  The per-field memcpy form took 10-20 ms an expert on a busy host.
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+constexpr int kRpG = 32;
+template <int BB, int SO, int SZ>
+__attribute__((target("avx2"))) inline void plane32(uint8_t* run, const uint8_t* sb) {
+    alignas(64) uint8_t buf[kRpG * SZ];
+    for (int b = 0; b < kRpG; ++b) std::memcpy(buf + b * SZ, sb + b * BB + SO, SZ);
+    for (int k = 0; k < kRpG * SZ; k += 32) _mm256_stream_si256((__m256i*) (run + k), _mm256_load_si256((const __m256i*) (buf + k)));
+}
+__attribute__((target("avx2"))) bool cpu_repack_mat16(int type, const uint8_t* src, uint8_t* dst, size_t NB) {
+    if (NB % kRpG || ((uintptr_t) dst & 63)) return false;
+    if (type == xe::kQ3K) {
+        if ((64 * NB) % 64 || (96 * NB) % 64 || (108 * NB) % 64) return false;
+        for (size_t i = 0; i < NB; i += kRpG) {
+            const uint8_t* sb = src + i * 110;
+            plane32<110, 32, 64>(dst + i * 64, sb);
+            plane32<110, 0, 32>(dst + 64 * NB + i * 32, sb);
+            plane32<110, 96, 12>(dst + 96 * NB + i * 12, sb);
+            plane32<110, 108, 2>(dst + 108 * NB + i * 2, sb);
+        }
+    } else if (type == xe::kQ20) {
+        if ((16 * NB) % 64) return false;
+        for (size_t i = 0; i < NB; i += kRpG) {
+            const uint8_t* sb = src + i * 18;
+            alignas(64) uint8_t buf[kRpG * 16];
+            for (int b = 0; b < kRpG; ++b)
+                for (int u = 0; u < 4; ++u) {
+                    // a unit's 4 bytes as one word: code (byte m, field k) at bit 8m + 2k goes to bit 8k + 2m - a 4 x 4
+                    // transpose of 2-bit fields in two delta swaps (the anti-diagonals of the 2 x 2 quads, then the quads)
+                    uint32_t x;
+                    std::memcpy(&x, sb + b * 18 + 2 + 4 * u, 4);
+                    uint32_t t = (x ^ (x >> 6)) & 0x00CC00CCu;
+                    x ^= t ^ (t << 6);
+                    t = (x ^ (x >> 12)) & 0x0000F0F0u;
+                    x ^= t ^ (t << 12);
+                    std::memcpy(buf + b * 16 + 4 * u, &x, 4);
+                }
+            for (int k = 0; k < kRpG * 16; k += 32) _mm256_stream_si256((__m256i*) (dst + i * 16 + k), _mm256_load_si256((const __m256i*) (buf + k)));
+            plane32<18, 0, 2>(dst + 16 * NB + i * 2, sb);
+        }
+    } else if (type == xe::kPtq1) {
+        if ((16 * NB) % 64 || (24 * NB) % 64) return false;
+        for (size_t i = 0; i < NB; i += kRpG) {
+            const uint8_t* sb = src + i * 28;
+            plane32<28, 0, 16>(dst + i * 16, sb);
+            plane32<28, 16, 8>(dst + 16 * NB + i * 8, sb);
+            plane32<28, 24, 4>(dst + 24 * NB + i * 4, sb);
+        }
+    } else {
+        return false;
+    }
+    _mm_sfence();   // weakly ordered: visible before the fill is flagged done
+    return true;
+}
+#endif
+
 /// Host twin of xe_planar.cpp's repack_mat (the same bytes): an [nrows x n] matrix of NB blocks, file layout -> planes.
 void cpu_repack_mat(int type, const uint8_t* src, uint8_t* dst, size_t NB) {
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+    static const bool fast = env_i("STRATA_XE_CPU_REPACK16", 1) != 0;
+    if (fast && cpu_repack_mat16(type, src, dst, NB)) return;
+#endif
     if (type == xe::kQ3K) {
         for (size_t i = 0; i < NB; ++i) {
             const uint8_t* sb = src + i * 110;
@@ -1784,7 +1850,9 @@ void stream_copy(uint8_t* dst, const uint8_t* src, size_t n) {
 /// The promotion cache's slots (each expert card's flex region, STRATA_XE_FLEX_GIB), the bounces and the helper thread.
 void pc_setup(Ds41XeImpl& im) {
     im.pc_slot = ((size_t) im.blob_max + 255) & ~(size_t) 255;
-    im.pc_devrepack = env_i("STRATA_TP", 0) > 0 && env_i("STRATA_TP_PC_DEVREPACK", 1) != 0;
+    // (larry, engine1: default 0 since the host repack streams the planes into the bounce - a card repack ran
+    // kernels beside the TP core's passes and its draft; STRATA_TP_PC_DEVREPACK=1: the card repacks)
+    im.pc_devrepack = env_i("STRATA_TP", 0) > 0 && env_i("STRATA_TP_PC_DEVREPACK", 0) != 0;
     int total = 0;
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
@@ -1857,7 +1925,7 @@ void pc_setup(Ds41XeImpl& im) {
         im.pc_thr = std::thread(helper);
         // larry, engine1: under STRATA_TP the repacks (~10-20 ms an expert on a busy host) were the promotions' limit
         // (with the card's repack (pc_devrepack) a helper only copies pageable blobs: 2)
-        const int more = env_i("STRATA_TP", 0) > 0 ? std::max(0, env_i("STRATA_TP_PC_THREADS", im.pc_devrepack ? 2 : 4) - 1) : 0;
+        const int more = env_i("STRATA_TP", 0) > 0 ? std::max(0, env_i("STRATA_TP_PC_THREADS", 2) - 1) : 0;
         for (int k = 0; k < more; ++k) im.pc_thr_more.emplace_back(helper);
     }
     im.pc_ready = im.pc_bounce && total > 0;
@@ -1909,7 +1977,13 @@ void pc_poll(Ds41XeImpl& im, bool push) {
             u4v* dv = reinterpret_cast<u4v*>(slot + j.sent);
             if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 12);
             sycl::queue& pq = (size_t) c.idx < im.pc_q.size() && im.pc_q[(size_t) c.idx] ? *im.pc_q[(size_t) c.idx] : c.q;
-            const sycl::event kev = pq.parallel_for(sycl::range<1>(n / 16), [=](sycl::id<1> i) { dv[i] = sv[i]; });
+            // larry, engine1 (STRATA_TP_PC_DMA, default 1 under STRATA_TP): the copy engine instead - the copy kernels
+            // (~270 us a 4 MB chunk of PCIe reads) held the compute units the TP core's draft runs on, every card at
+            // once (card 0's first draft phase 0.1 -> 3.5 ms); the kernel after the memcpy on this (promotion-only)
+            // queue starting late does not matter
+            static const bool dma = env_i("STRATA_TP", 0) > 0 && env_i("STRATA_TP_PC_DMA", 1) != 0;
+            const sycl::event kev = dma ? pq.memcpy(slot + j.sent, j.src + j.sent, n)
+                                        : pq.parallel_for(sycl::range<1>(n / 16), [=](sycl::id<1> i) { dv[i] = sv[i]; });
             if (Ds41XeTier::tl_on()) tl_stamp(im, 1 + (size_t) c.idx, c.q, 13);
             j.sent += n;
             ++im.pc_chunks;
@@ -4040,7 +4114,7 @@ std::vector<uint8_t> Ds41XeTier::dbg_take(int slot) {
 
 void Ds41XeTier::tp_dense_bonus(size_t bytes) {
     im_->dense_bonus_gib = bytes / kGiB;
-    std::fprintf(stderr, "xe tier: dense card's expert cap +%.2f GiB (the dense weights the TP cards hold, paged)\n", bytes / kGiB);
+    std::fprintf(stderr, "xe tier: dense card's expert cap +%.2f GiB (the dense weights the TP cards hold, paged; engine1's draft)\n", bytes / kGiB);
 }
 
 void Ds41XeTier::tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p) {

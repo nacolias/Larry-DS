@@ -21,8 +21,13 @@
 #include <string>
 #include <vector>
 
+namespace strata::v41 { class Ds41Tp; }
+
 struct Ds41DSparkConfig {
-    ggml_backend_t backend = nullptr;   ///< the backend to run on (the engine's); required
+    ggml_backend_t backend = nullptr;   ///< the backend to run on (the engine's); required (unless `tp`)
+    /// larry, engine1 (STRATA_TP_DRAFT): run the stack on the TP core's cards instead (Ds41Tp::draft_*: no ggml weights).
+    /// STRATA_TP_DRAFT_CHECK=1 loads the ggml stack too and compares every draft (the TP core's are the ones returned).
+    strata::v41::Ds41Tp * tp = nullptr;
     std::string sidecar;                ///< V41-MTP-Vision.gguf (mtp.0-2.*)
     std::string main_gguf;              ///< the trunk GGUF (geometry, output.weight, token_embd)
     int n_used = 3;                     ///< DSpark experts per token (config dspark_n_activated_experts)
@@ -45,7 +50,9 @@ public:
     /// `bonus` >= 0 - draft the block after the LAST appended position: ids[0..block) = tokens for pos+2.., conf
     /// likewise.  `bonus` < 0: append only (seeding the window from a prompt).  Positions must be increasing and each
     /// appended position is "accepted" (it stays in the window until 128 later positions push it out).
-    bool step(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf);
+    /// tap_r0 >= 0 (the TP core's stack): the rows are rows tap_r0.. of the last TP DSpark pass's taps, read on the cards
+    /// (main_hidden then only serves the check mode's ggml stack)
+    bool step(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf, int tap_r0 = -1);
     /// Forget the window (a new conversation / a rewind past it).
     void reset();
     double last_ms() const;             ///< wall time of the last step's graph
