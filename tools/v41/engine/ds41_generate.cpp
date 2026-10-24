@@ -1669,9 +1669,10 @@ int main(int argc, char ** argv) {
                 // at the longest common prefix even when it is below the snapshot").
                 static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
                 const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
+                const double tup = now_ms();
                 if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
-                                 park_hist.size(), lp);
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there; %.2f s)\n",
+                                 park_hist.size(), lp, (now_ms() - tup) / 1000.0);
                     hist = park_hist;
                     snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
                     reuse_override = (int) lp;
@@ -1681,7 +1682,7 @@ int main(int argc, char ** argv) {
                     dsp_next = -1;        // DSpark's window holds the side request's states
 #endif
                 } else if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation\n", park_hist.size());
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation (%.2f s)\n", park_hist.size(), (now_ms() - tup) / 1000.0);
                     hist = park_hist;
                     snap_len = (int) park_hist.size();
                     snap_logits = park_logits;
@@ -1711,12 +1712,17 @@ int main(int argc, char ** argv) {
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
-                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
-                    && dense.park(rows)) {
+                // larry: the conversation's own rows only - it re-writes everything past its snapshot when it goes on
+                // (an agent's side call asks for 32000 tokens: a 12.6K conversation was saved as 47K positions)
+                const int64_t save = std::min<int64_t>(rows, (int64_t) snap_len + 1);
+                const double tpk = now_ms();
+                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && save <= park_max
+                    && dense.park(save)) {
                     park_hist.assign(hist.begin(), hist.begin() + snap_len);
                     park_logits = snap_logits;
                     park_rows = rows;
-                    std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
+                    std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved, valid to %lld; %.2f s)\n",
+                                 snap_len, (long long) save, (long long) rows, (now_ms() - tpk) / 1000.0);
                 }
                 hist.clear();
                 snap_len = -1;
