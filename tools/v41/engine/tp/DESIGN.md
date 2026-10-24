@@ -2,8 +2,8 @@
 
 Status: phases A-D done; in the engine behind STRATA_TP=N (default 0), in the service since 2026-10-23 02:35
 (STRATA_TP=4), the pager (STRATA_TP_PAGE=1) since 06:02, promotions in time for the next pass since 17:31, the verify
-pass's kernel round since 20:35, card 0's expert replicas since 22:20, DSpark's draft on the cards since 2026-10-24 01:55
-- see the status sections at the end.  User go-ahead
+pass's kernel round since 20:35, card 0's expert replicas since 22:20, DSpark's draft on the cards since 2026-10-24 01:55,
+the host CPUs placed and the draft's Markov chain fused since 03:10 - see the status sections at the end.  User go-ahead
 2026-10-22 ("option 3": the four-card engine, TP degree a setting, any card count).  Mirror of
 larry:/opt/ai/dsv41/xolotl/tools/v41/engine/tp/ (this file is DESIGN.md there).
 
@@ -449,3 +449,49 @@ Service (tpg.sh x2 with STRATA_TP_DRAFT=1, then ds41-xe-engine.sh STRATA_TP_DRAF
 
 Next: the CPU pool (math: ~8 ms of a 33 ms cycle) and what the fills cost it; a low-priority queue for the promotions'
 remaining GPU work; the draft's Markov chain (5 sequential cross-card sums, 0.2-0.5 ms).
+
+## Status 2026-10-24 ~03:10 (the CPU pool's place on the host; the draft's Markov chain fused)
+
+The CPU pool's time is the experts' bytes: a CPU layer costs ~5 us plus its experts' bytes at the pool's rate, two thirds
+gate / up and one third down (STRATA_XE_CPU_LOG's L lines).  75-87 % of its experts serve one token; by bytes 39-50 %
+are all-Q3_K (15.2 MB), 22-31 % all-Q2_0 (9.95 MB).  Math runs ~14 CPU layers a pass (~15 ms of pool time), layers
+with four or more CPU experts (3.2 ms each) 40 % of it.  The rate in the engine was 21-25 GB/s (math) / 24-28 (essay).
+`bench_cpu_pool` (xe/, CPU only: the pool's call on cold random experts against a streaming read of the same bytes on
+the same pinned threads): Q3_K 32-37 GB/s, Q2_0 34-37, at the streaming read's ceiling (31-35) for 5 to 7 workers;
+PTQ1_0 20-25, compute-bound (its share is small).  So the kernels are not the limit - the engine's other traffic is.
+
+**Placement.**  The pool pins its 7 workers to CPUs 1-7 (cores 1-7, larry's CPU n and n + 8 being one core); the rest
+floated - the TP pass's host loop (its mailbox spin and the pool's host share), the promotion fill helpers, the Engram
+reader - and with the workers spinning on their CPUs they landed on the workers' SMT siblings (Strata's pool.hpp: 36.3
+GB/s alone, 26.9 inside a floating host loop).  Now (xe_cpus.hpp): STRATA_HOST_CPUS pins the pass thread while a pass
+runs, STRATA_XE_HELPER_CPUS places the fill / Engram helpers (else they keep the process's original mask: a thread
+started by the pinned pass thread would inherit its CPU), STRATA_XE_POOL_WORKERS sets the pool's workers apart from
+--threads.  Math / essay, one run each (cycle at the common width mix):
+
+| placement | one-expert CPU layer, pool rate | cycle |
+| --- | --- | --- |
+| all floating (7 workers) | math 543 us, 21.7 GB/s / essay 523 us, 23.8 GB/s | math 36.25 ms / essay 27.77 |
+| host on CPU 0 | math 515 us, 22.9 | 35.91 |
+| + helpers on CPU 8 | math 488 us, 24.1 (fills slower: more CPU experts) | 36.19 |
+| host 0, 6 workers, helpers on core 7 (7, 15) - the service's | math 481 us, 24.5 / essay 452 us, 27.4 | 35.66 / 27.04 |
+| host 0 + the card repack (STRATA_TP_PC_DEVREPACK=1) | math 432 us, 27.5 | 37.47 (the draft +3.5 ms) |
+
+The card repack frees the host's DRAM but its kernels run beside the draft (the draft step 6.7 ms); the host repack
+stays.  STRATA_TP_PROMOTE_PAR=16 (42 % of math's promotions were skipped at the cap of 8): more copies and fills in flight,
+the pool slower and more CPU experts - math 38.6 ms, worse.  What remains of the gap to the pool's ceiling is the
+promotions' DRAM traffic beside it (a promotion writes 15 MB into the bounce and the card reads 15 MB over PCIe; math
+promotes ~13 a pass) - the next lever, together with the CPU experts' count.
+
+**The draft's Markov chain** (STRATA_TP_DRAFT_MK, default 1): per slot one kernel for the previous slot's merge, the
+embedding, the confidence logit and the embedding's q8 (quant_x's rounding) and this slot's key reset; the bias rows'
+mat-vec; one argmax over the card's rows whose work-groups raise the slot's key by a 64-bit atomic max (the value's order
+bits | the token complemented: equal values keep the lowest token, as before); the cross-card sum.  6 commands a slot
+instead of 12.  The draft's sums go by P2P store kernels (STRATA_TP_DRAFT_PUSH, default 1; peer access enabled at draft
+init): a card's copy engine runs its copies in order across its queues, and the promotions' copies queue there.
+STRATA_TP_DRAFT_MK_CHECK=1 runs the old chain and the fused one in the same graph on the same inputs: 0 tokens and 0
+confidence bits differ.  (Token streams of two runs are no test: with promotions and replicas off, two runs of the
+same configuration already part at token 46.)  The draft on the cards (essay): 2.36 -> 2.12 ms (Markov chain 292 -> 222
+us, each block ~10 % faster from the pushed sums); the essay's cycle 26.85 -> 26.36 ms (-1.8 %), math within its noise.
+
+Service (tpg.sh with the placement, then ds41-xe-engine.sh STRATA_HOST_CPUS=0 STRATA_XE_POOL_WORKERS=6
+STRATA_XE_HELPER_CPUS=7,15 + tsvc2 at 03:10): see the README's measured section.

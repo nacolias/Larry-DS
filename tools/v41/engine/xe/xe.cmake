@@ -42,5 +42,8 @@ if(TARGET ggml-sycl AND TARGET ds41_dense AND TARGET ds41_moe_cpu)
     target_compile_options(test_xe_q2k PRIVATE -fsycl)
     target_link_options(test_xe_q2k PRIVATE ${_xe_sycl})
     set_target_properties(test_xe_q2k PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+    # larry: the CPU expert pool on cold experts against a streaming read (CPU only)
+    add_executable(bench_cpu_pool ${_xe_dir}/bench_cpu_pool.cpp)
+    target_link_libraries(bench_cpu_pool PRIVATE strata_kernels_cpu ggml-cpu ggml-base pthread)
     include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/tp/tp.cmake OPTIONAL)   # larry: engine1, the TP decode core
 endif()

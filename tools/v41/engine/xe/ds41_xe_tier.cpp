@@ -1,6 +1,7 @@
 // tools/v41/engine/xe/ds41_xe_tier.cpp - see ds41_xe_tier.hpp.
 #include "ds41_xe_tier.hpp"
 #include "xe_kernels.hpp"
+#include "xe_cpus.hpp"
 #include "../../../../third_party/llama.cpp/ggml/src/ggml-sycl/fastmv.hpp"   // the head split's mat-vec
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -703,7 +704,11 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
     im.dptr.assign(NK, nullptr);
     im.aptr.assign(NK, nullptr);
     im.slot_gib = cfg.slot_gib;
-    im.pool.reset(new cpu::ExpertPool(cfg.threads > 0 ? cfg.threads : 0));
+    // larry: STRATA_XE_POOL_WORKERS = the CPU pool's workers (cores 1..n; default --threads, else every core but
+    // core 0) - with fewer, the last cores take the helpers (STRATA_XE_HELPER_CPUS, xe_cpus.hpp)
+    (void) xe::process_cpus();   // the mask helpers inherit, saved before any thread pins itself
+    const int pw = env_i("STRATA_XE_POOL_WORKERS", cfg.threads > 0 ? cfg.threads : 0);
+    im.pool.reset(new cpu::ExpertPool(pw > 0 ? pw : 0));
     im.cjobs.resize(cpu::ExpertPool::kMaxSplitMulti);
     im.actq.resize(kMaxJobTok);
     for (const cpu::NativeFmt& f : im.fl)
@@ -1923,10 +1928,14 @@ void pc_setup(Ds41XeImpl& im) {
             }
         };
         im.pc_thr = std::thread(helper);
+        xe::place_helper(im.pc_thr.native_handle());   // (STRATA_XE_HELPER_CPUS; else off the pass thread's pin)
         // larry, engine1: under STRATA_TP the repacks (~10-20 ms an expert on a busy host) were the promotions' limit
         // (with the card's repack (pc_devrepack) a helper only copies pageable blobs: 2)
         const int more = env_i("STRATA_TP", 0) > 0 ? std::max(0, env_i("STRATA_TP_PC_THREADS", 2) - 1) : 0;
-        for (int k = 0; k < more; ++k) im.pc_thr_more.emplace_back(helper);
+        for (int k = 0; k < more; ++k) {
+            im.pc_thr_more.emplace_back(helper);
+            xe::place_helper(im.pc_thr_more.back().native_handle());
+        }
     }
     im.pc_ready = im.pc_bounce && total > 0;
     static bool logged = false;

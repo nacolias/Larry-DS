@@ -1,6 +1,7 @@
 // tools/v41/engine/tp/tp_core.cpp - larry: engine1's tensor-parallel decode core (see tp_core.hpp, engine1/DESIGN.md).
 #include "tp_core.hpp"
 #include "tp_kern.hpp"
+#include "xe_cpus.hpp"
 
 #include "ds41_geometry.hpp"
 #include "ggml.h"
@@ -322,7 +323,7 @@ struct Ds41Tp::Impl {
     std::function<void()> eng_job;
     std::atomic<int> eng_state{0};   // 0 idle, 1 posted, 2 done, 3 stop
     void eng_post(std::function<void()> job) {
-        if (!eng_thr.joinable())
+        if (!eng_thr.joinable()) {
             eng_thr = std::thread([this] {
                 for (;;) {
                     std::function<void()> j;
@@ -336,6 +337,8 @@ struct Ds41Tp::Impl {
                     eng_state.store(2, std::memory_order_release);
                 }
             });
+            strata::v41::xe::place_helper(eng_thr.native_handle());   // (STRATA_XE_HELPER_CPUS; off the pass thread's pin)
+        }
         {
             std::lock_guard<std::mutex> lk(eng_mu);
             eng_job = std::move(job);
@@ -1037,10 +1040,10 @@ struct Ds41Tp::Impl {
     template <class T> T * inp(Card & c, size_t off) const { return (T *) (c.in + off); }
 
     // card c sends its partial (slot c.rank of `buf` on every peer) and waits for the peers' (sync point s)
-    void exchange(Card & c, float * buf, size_t slot_floats, size_t bytes, int s, int sl = -1, int si = -1) {
+    void exchange(Card & c, float * buf, size_t slot_floats, size_t bytes, int s, int sl = -1, int si = -1, bool force_push = false) {
         if (N == 1) return;
         const size_t off = (size_t) c.rank * slot_floats;
-        if (push && bytes % 16 == 0) {   // STRATA_TP_PUSH: P2P stores by two kernels
+        if ((push || force_push) && bytes % 16 == 0) {   // STRATA_TP_PUSH (engine1's draft: always): P2P stores by two kernels
             tpk::Peers P;
             for (int j = 0; j < N; ++j) {
                 if (j == c.rank) continue;
@@ -1431,6 +1434,7 @@ struct Ds41Tp::Impl {
         float * mb = nullptr;                              // [vk] a slot's markov bias rows
         int32_t * tok = nullptr;                           // [8] the chain's tokens (replicated)
         float * conf = nullptr;                            // [8] the confidence logits
+        int32_t * tok2 = nullptr; float * conf2 = nullptr; // [8] STRATA_TP_DRAFT_MK_CHECK: the old chain's
         uint64_t * stamps = nullptr;                       // STRATA_TP_DRAFT_STAMP: the clock after each phase
         std::map<int, sx::command_graph<sx::graph_state::executable>> graphs;
     };
@@ -1466,6 +1470,14 @@ struct Ds41Tp::Impl {
     float * dhrows = nullptr;       // pinned: [DKMAX][3D] feed rows from the host
     float * dhout = nullptr;        // pinned: [16] ids (int bits) | confidences
     bool d_tap = false;             // the trunk's DSpark passes write main_hidden into every card's dc[k].tap
+    // STRATA_TP_DRAFT_PUSH (default 1): the draft's cross-card sums by P2P store kernels - the copy engine runs a
+    // card's copies in order across its queues, and the promotions' copies queue there (math: the Markov chain's five
+    // 16-byte sums 0.21 -> 0.48 ms beside them; pushed 0.32)
+    bool d_push = false;
+    bool d_mk = true;               // STRATA_TP_DRAFT_MK (default 1): the fused Markov chain (emit_markov2)
+    bool d_mk_check = false;        // STRATA_TP_DRAFT_MK_CHECK=1: the old chain first, its tokens kept, then the fused one
+    long d_ck_n = 0, d_ck_bad = 0;
+    double d_ck_conf = 0;
     double d_ms = 0;
     size_t d_bytes = 0;
     size_t d_ggml_bytes = 0;        // what the ggml stack (ds41_dspark.cpp) would hold on card 0 for this sidecar
@@ -1570,6 +1582,7 @@ struct Ds41Tp::Impl {
         d.me = dalloc<float>(c, MKE); d.meq = dalloc<int8_t>(c, MKE); d.med = dalloc<float>(c, MKE / 32);
         d.mb = dalloc<float>(c, (size_t) c.vk);
         d.tok = dalloc<int32_t>(c, 8); d.conf = dalloc<float>(c, 8);
+        d.tok2 = dalloc<int32_t>(c, 8); d.conf2 = dalloc<float>(c, 8);
         if (d_stamp) d.stamps = dalloc<uint64_t>(c, DNST);
         c.q.wait();
         return err.empty();
@@ -1629,7 +1642,7 @@ struct Ds41Tp::Impl {
             float * buf = ((nch - 1 - ch) % 2 == 0) ? c.arb : c.ara;
             tpfmv::quant_x(c.q, d.frows + (size_t) r * D3 + d.mc0, D3, 0, m, 1, d.mck, d.fxq, d.fxd);
             mv_q6(c, d.mproj, d.fxq, d.fxd, m, buf + (size_t) c.rank * ar_slot, D);
-            exchange(c, buf, ar_slot, (size_t) m * D * 4, sync_idx++);
+            exchange(c, buf, ar_slot, (size_t) m * D * 4, sync_idx++, -1, -1, d_push);
             psum(c, buf, ar_slot, m, d.mx);
             tpdec::RmsQ8Args a;
             a.x = d.mx; a.x_cs = D; a.w = d.mnorm; a.eps = (float) G.rms_eps;
@@ -1663,14 +1676,37 @@ struct Ds41Tp::Impl {
             tpdec::rms_q8(c.q, a);
             mv_q6(c, c.head, c.zq, c.zd, DBS, c.lgt, c.vk);
             DST(c, d, 5);
-            for (int i = 0; i < DBS; ++i) emit_markov(c, d, i);
+            if (d_mk && d_mk_check) {   // the old chain on the same inputs, its results kept for the host
+                for (int i = 0; i < DBS; ++i) emit_markov(c, d, i);
+                c.q.memcpy(d.tok2, d.tok, 8 * 4);
+                c.q.memcpy(d.conf2, d.conf, 8 * 4);
+            }
+            if (d_mk) {
+                const int par = d_mk_check ? 1 : 0;   // (consecutive sums alternate the slot buffers)
+                for (int i = 0; i < DBS; ++i) emit_markov2(c, d, i, par);
+                // the last slot's merge (the others': in the next slot's first kernel)
+                const float * last = (DBS - 1 + par) % 2 == 0 ? c.ara : c.arb;
+                int32_t * tk = d.tok;
+                const int NN = N;
+                const size_t sl = (size_t) NMAX * D;
+                c.q.single_task([=] {
+                    uint64_t best = 0;
+                    for (int k = 0; k < NN; ++k) { const uint64_t v = *(const uint64_t *) (last + (size_t) k * sl); best = v > best ? v : best; }
+                    tk[DBS - 1] = (int32_t) (0xFFFFFFFFu - (uint32_t) best);
+                });
+            } else {
+                for (int i = 0; i < DBS; ++i) emit_markov(c, d, i);
+            }
             DST(c, d, 6);
             if (c.rank == 0) {   // (stores into the pinned block: no copy engine, as the inputs)
-                const int32_t * tk = d.tok;
-                const float * cf = d.conf;
+                const int32_t * tk = d.tok, * tk2 = d.tok2;
+                const float * cf = d.conf, * cf2 = d.conf2;
                 float * ho = dhout;
                 c.q.single_task([=] {
-                    for (int i = 0; i < DBS; ++i) { ho[i] = sycl::bit_cast<float>(tk[i]); ho[8 + i] = cf[i]; }
+                    for (int i = 0; i < DBS; ++i) {
+                        ho[i] = sycl::bit_cast<float>(tk[i]); ho[8 + i] = cf[i];
+                        ho[16 + i] = sycl::bit_cast<float>(tk2[i]); ho[24 + i] = cf2[i];
+                    }
                 });
             }
         }
@@ -1739,7 +1775,7 @@ struct Ds41Tp::Impl {
         if (xmx(w.wob, n)) tpfmv::quant_xT(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aT, c.adT);
         else tpfmv::quant_x(c.q, c.oa, c.grp.n() * OL, c.grp.n() * OL, n, 1, c.grp.n() * OL, c.aq, c.ad);
         mv_q6(c, w.wob, c.aq, c.ad, n, c.ara + (size_t) c.rank * ar_slot, D, 0, c.aT, c.adT);
-        exchange(c, c.ara, ar_slot, (size_t) n * D * 4, sync_idx++);
+        exchange(c, c.ara, ar_slot, (size_t) n * D * 4, sync_idx++, -1, -1, d_push);
         // ---- the FFN hc (the attention output summed over the cards), the router, the shared expert, the routed experts
         tpk::HcOut hf;
         hf.sc = w.hcf_sc; hf.bs = w.hcf_bs; hf.pw = w.ffn_norm; hf.eps = (float) G.rms_eps; hf.hc_eps = (float) G.hc_eps;
@@ -1771,7 +1807,92 @@ struct Ds41Tp::Impl {
         strata::v41::xe::xe_quant_rows(c.q, c.fn, n, (int) D, c.X);
         strata::v41::xe::xe_experts_q8(c.q, c.jobs, njm, n, c.X, c.H, pb, (int) D, (int) NFF, (float) G.swiglu_limit, true, n,
                                        c.need_cpu + 1, 8, false, true);   // (Q2_K: the draft's own kernels)
-        exchange(c, c.arb, ar_slot, (size_t) n * D * 4, sync_idx++);
+        exchange(c, c.arb, ar_slot, (size_t) n * D * 4, sync_idx++, -1, -1, d_push);
+    }
+
+    // the same slot fused (STRATA_TP_DRAFT_MK): one kernel - the previous slot's merge (the highest of the ranks' keys),
+    // the embedding of its token, the confidence logit, the embedding's q8 (quant_x's rounding) and this slot's key
+    // reset; the bias rows' mat-vec; one argmax over this card's rows whose work-groups raise the slot's key by a 64-bit
+    // atomic max (a value's order bits | the token complemented: equal values keep the lowest token, as ggml_argmax);
+    // the cross-card sum.  6 commands a slot instead of 12.
+    void emit_markov2(Card & c, DCard & d, int i, int par = 0) {   // par 1: after the old chain (it ended on ara)
+        const size_t ar_slot = (size_t) NMAX * D;
+        float * buf = (i + par) % 2 == 0 ? c.ara : c.arb;          // this slot's sum
+        const float * prev = (i + par) % 2 == 0 ? c.arb : c.ara;   // the previous slot's (its ranks' keys)
+        uint64_t * mine = (uint64_t *) (buf + (size_t) c.rank * ar_slot);
+        {
+            const uint8_t * mke = d.mke;
+            float * conf = d.conf, * med = d.med;
+            int8_t * meq = d.meq;
+            int32_t * tok = d.tok;
+            const int32_t * bonus = dinp<int32_t>(d, DL.bonus);
+            const float * cw = d.cw, * z = c.z + (size_t) i * D;
+            const int64_t Dd = D;
+            const int ii = i, NN = N;
+            c.q.submit([&](sycl::handler & h) {
+                sycl::local_accessor<float, 1> ev(sycl::range<1>(MKE), h);
+                sycl::local_accessor<int32_t, 1> tsh(sycl::range<1>(1), h);
+                h.parallel_for(sycl::nd_range<1>(sycl::range<1>(MKE), sycl::range<1>(MKE)), [=](sycl::nd_item<1> it) {
+                    const int j = (int) it.get_local_id(0);
+                    if (j == 0) {
+                        int32_t t;
+                        if (ii == 0) {
+                            t = *bonus;
+                        } else {
+                            uint64_t best = 0;
+                            for (int k = 0; k < NN; ++k) {
+                                const uint64_t v = *(const uint64_t *) (prev + (size_t) k * ar_slot);
+                                best = v > best ? v : best;
+                            }
+                            t = (int32_t) (0xFFFFFFFFu - (uint32_t) best);
+                            tok[ii - 1] = t;
+                        }
+                        tsh[0] = t;
+                        *mine = 0;
+                    }
+                    sycl::group_barrier(it.get_group());
+                    const int t = tsh[0];
+                    const uint8_t * blk = mke + ((size_t) t * (MKE / 32) + (size_t) (j / 32)) * 34;
+                    const float v = (float) sycl::bit_cast<sycl::half>((uint16_t) (blk[0] | (blk[1] << 8))) * (float) (int8_t) blk[2 + j % 32];
+                    ev[j] = v;
+                    float s = cw[Dd + j] * v;
+                    for (int64_t q = j; q < Dd; q += MKE) s += cw[q] * z[q];
+                    s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+                    if (j == 0) conf[ii] = s;
+                    sycl::group_barrier(it.get_group());
+                    const int g0 = (j / 32) * 32;
+                    float am = 0.0f;
+                    for (int q = 0; q < 32; ++q) am = sycl::fmax(am, sycl::fabs(ev[g0 + q]));
+                    const float id = am > 0.0f ? 127.0f / am : 0.0f;
+                    meq[j] = (int8_t) ((int) sycl::rint(v * id) & 0xFF);
+                    if (j % 32 == 0) med[j / 32] = am / 127.0f;
+                });
+            });
+        }
+        mv_q6(c, d.mkh, d.meq, d.med, 1, d.mb, c.vk);
+        {
+            const float * lg = c.lgt + (size_t) i * c.vk, * mb = d.mb;
+            const int64_t vk = c.vk, v0 = c.vrow.lo * 16;
+            constexpr int WG = 256, NWG = 32;
+            c.q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) WG * NWG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+                const int64_t g = (int64_t) it.get_global_id(0);
+                float bv = -INFINITY;
+                int64_t bi = INT64_MAX;
+                for (int64_t r = g; r < vk; r += (int64_t) WG * NWG) {
+                    const float v = lg[r] + mb[r];
+                    if (v > bv) { bv = v; bi = r; }
+                }
+                const float gv = sycl::reduce_over_group(it.get_group(), bv, sycl::maximum<float>());
+                const int64_t gi = sycl::reduce_over_group(it.get_group(), bv == gv ? bi : INT64_MAX, sycl::minimum<int64_t>());
+                if (it.get_local_id(0) == 0 && gi != INT64_MAX) {
+                    const uint32_t u = sycl::bit_cast<uint32_t>(gv);
+                    const uint32_t ok = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+                    const uint64_t key = ((uint64_t) ok << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) (v0 + gi));
+                    sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*mine).fetch_max(key);
+                }
+            });
+        }
+        exchange(c, buf, ar_slot, 16, sync_idx++, -1, -1, d_push);
     }
 
     // draft slot i of the Markov head (model.py: left to right, slot 0's token = the bonus): e = embed(the previous
@@ -1824,7 +1945,7 @@ struct Ds41Tp::Impl {
                 }
             });
         }
-        exchange(c, buf, ar_slot, 16, sync_idx++);
+        exchange(c, buf, ar_slot, 16, sync_idx++, -1, -1, d_push);
         {
             const float * all = buf;
             int32_t * tk = d.tok;
@@ -2091,6 +2212,7 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
     if (!(err = ds41_read_geometry(*im.model, im.G)).empty()) return false;
     if (!(err = ds41_check_tensors(*im.model, im.G, ds41_file_layers(*im.model, im.G))).empty()) return false;
     const Ds41Geometry & G = im.G;
+    (void) strata::v41::xe::process_cpus();   // the mask the helpers take, saved before the pass thread pins itself
     im.N = cfg.n_cards;
     im.NMAX = cfg.max_n;
     im.NL = cfg.n_layer > 0 ? std::min<int>(cfg.n_layer, (int) G.n_layer) : (int) G.n_layer;
@@ -2289,6 +2411,9 @@ void Ds41Tp::fill_state(int64_t pos, uint32_t seed) {
 bool Ds41Tp::pass(const int * tids, int n, int pos0, float * logits, float * main_hidden, bool graph) {
     Impl & im = *p_;
     im.err.clear();
+    // larry (STRATA_HOST_CPUS, xe_cpus.hpp): the pass's host loop - the mailbox spin and its share of the CPU pool's
+    // work - on those CPUs while the pass runs (the pool's workers own CPUs 1-7; floating, it landed on their siblings)
+    const strata::v41::xe::HostPin host_pin;
     if (n < 1 || n > im.NMAX) { im.err = "tp: pass width"; return false; }
     if (pos0 < 0 || (int64_t) pos0 + n > im.cfg.ctx_max) { im.err = "tp: pass past the context"; return false; }
     for (int t = 0; t < n; ++t) if (tids[t] < 0 || tids[t] >= im.V) { im.err = "tp: token id out of range"; return false; }
@@ -2670,7 +2795,7 @@ bool Ds41Tp::draft_init(const std::string & sidecar, int n_used, int noise_id, i
     im.DL.make(im.D);
     im.dhin = sycl::malloc_host<int32_t>(im.DL.words, im.ctx);
     im.dhrows = sycl::malloc_host<float>((size_t) Impl::DKMAX * 3 * im.D, im.ctx);
-    im.dhout = sycl::malloc_host<float>(16, im.ctx);
+    im.dhout = sycl::malloc_host<float>(32, im.ctx);
     if (!im.dhin || !im.dhrows || !im.dhout) { err = "tp draft: pinned allocation failed"; return false; }
     std::memset(im.dhin, 0, im.DL.words * 4);
     im.d_noise.assign((size_t) im.D, 0.0f);
@@ -2685,11 +2810,24 @@ bool Ds41Tp::draft_init(const std::string & sidecar, int n_used, int noise_id, i
     im.wsrc = nullptr;
     im.q6_drop();
     if (!ok) { err = im.err; return false; }
+    im.d_mk = env_on("STRATA_TP_DRAFT_MK", true);
+    im.d_mk_check = im.d_mk && env_on("STRATA_TP_DRAFT_MK_CHECK", false);
+    if (im.N > 1 && env_on("STRATA_TP_DRAFT_PUSH", true)) {   // the draft's sums by P2P stores: every pair must map
+        bool ok = true;
+        for (auto & a : im.cards)
+            for (auto & b : im.cards)
+                if (a != b && !a->dev.ext_oneapi_can_access_peer(b->dev)) ok = false;
+        if (ok)
+            for (auto & a : im.cards)
+                for (auto & b : im.cards)
+                    if (a != b) { try { a->dev.ext_oneapi_enable_peer_access(b->dev); } catch (const std::exception &) {} }
+        im.d_push = ok;
+    }
     // the trunk's DSpark passes now also write main_hidden on every card (their graphs are recorded again)
     im.d_tap = true;
     for (auto & c : im.cards) c->graphs.clear();
-    std::fprintf(stderr, "tp draft: %s on %d cards, %.2f GiB a card (%lld experts a block, top-%d), %.1f s%s\n", sidecar.c_str(), im.N,
-                 im.d_bytes / 1073741824.0, (long long) im.DNE, im.DNU, (now_us() - t0) / 1e6, im.free_str().c_str());
+    std::fprintf(stderr, "tp draft: %s on %d cards, %.2f GiB a card (%lld experts a block, top-%d), sums by %s, %.1f s%s\n", sidecar.c_str(), im.N,
+                 im.d_bytes / 1073741824.0, (long long) im.DNE, im.DNU, im.d_push ? "P2P stores" : "copies", (now_us() - t0) / 1e6, im.free_str().c_str());
     return true;
 }
 
@@ -2795,6 +2933,19 @@ bool Ds41Tp::draft_step(const float * rows, int r0, const int * pos, int k, int 
             std::memcpy(&t, im.dhout + i, 4);
             ids[i] = t;
             conf[i] = im.dhout[8 + i];
+        }
+        if (im.d_mk_check) {   // the fused chain against the old one, the same inputs
+            bool same = true;
+            for (int i = 0; i < Impl::DBS; ++i) {
+                int32_t t2;
+                std::memcpy(&t2, im.dhout + 16 + i, 4);
+                same = same && t2 == ids[i];
+                im.d_ck_conf = std::max(im.d_ck_conf, (double) std::fabs(im.dhout[24 + i] - conf[i]));
+            }
+            ++im.d_ck_n;
+            im.d_ck_bad += !same;
+            if (im.d_ck_n % 64 == 0)
+                std::fprintf(stderr, "tp draft mk check (%ld drafts): %ld with a different token, max |conf diff| %.3g\n", im.d_ck_n, im.d_ck_bad, im.d_ck_conf);
         }
     }
     im.d_ms = (now_us() - t0) / 1000.0;
