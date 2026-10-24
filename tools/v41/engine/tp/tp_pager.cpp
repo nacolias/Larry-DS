@@ -444,6 +444,111 @@ void Ds41Pager::touch(int layer) {
     if (!im.keep && U.slot >= 0 && U.filled) im.slots[(size_t) U.slot].used = im.q0->ext_oneapi_submit_barrier();
 }
 
+// ---------------------------------------------------------------- Ds41KvMap
+struct Ds41KvMap::Impl {
+    sycl::queue * q0 = nullptr;
+    ze_context_handle_t zc = nullptr;
+    ze_device_handle_t zd = nullptr;
+    size_t page = 0;
+    uint8_t * va = nullptr;
+    size_t va_bytes = 0;
+    struct Unit { size_t off = 0, bytes = 0, tail = 0, done = 0; };   // tail: the spare row's page (mapped to the end)
+    std::vector<Unit> units;
+    std::vector<std::pair<void *, size_t>> maps;
+    std::vector<ze_physical_mem_handle_t> phys;
+    bool map(size_t off, size_t bytes, std::string & err) {
+        ze_physical_mem_desc_t d = { ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC, nullptr, 0, bytes };
+        ze_physical_mem_handle_t h = nullptr;
+        if (zePhysicalMemCreate(zc, zd, &d, &h) != ZE_RESULT_SUCCESS || !h) { err = "kv map: zePhysicalMemCreate failed"; return false; }
+        if (zeVirtualMemMap(zc, va + off, bytes, h, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE) != ZE_RESULT_SUCCESS) {
+            zePhysicalMemDestroy(zc, h);
+            err = "kv map: zeVirtualMemMap failed";
+            return false;
+        }
+        phys.push_back(h);
+        maps.emplace_back(va + off, bytes);
+        q0->memset(va + off, 0, bytes).wait();   // fresh pages: the indexer scores every row up to its cap before masking
+        return true;
+    }
+    ~Impl() {
+        for (auto & m : maps) zeVirtualMemUnmap(zc, m.first, m.second);
+        for (auto h : phys) zePhysicalMemDestroy(zc, h);
+        if (va) zeVirtualMemFree(zc, va, va_bytes);
+    }
+};
+
+Ds41KvMap::Ds41KvMap() : p_(std::make_unique<Impl>()) {}
+Ds41KvMap::~Ds41KvMap() = default;
+
+bool Ds41KvMap::init(void * queue, std::string & err) {
+    Impl & im = *p_;
+    im.q0 = static_cast<sycl::queue *>(queue);
+    if (!im.q0) { err = "kv map: no queue"; return false; }
+    im.zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(im.q0->get_context());
+    im.zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(im.q0->get_device());
+    size_t pg = 0;
+    if (zeVirtualMemQueryPageSize(im.zc, im.zd, (size_t) 1 << 30, &pg) != ZE_RESULT_SUCCESS || !pg) { err = "kv map: page size query failed"; return false; }
+    im.page = std::max<size_t>(pg, (size_t) 2 << 20);
+    return true;
+}
+
+void * Ds41KvMap::alloc(const std::vector<size_t> & unit_bytes, const std::vector<size_t> & spare_off, std::vector<size_t> & unit_off,
+                        size_t & total) {
+    Impl & im = *p_;
+    total = 0;
+    im.units.assign(unit_bytes.size(), {});
+    unit_off.assign(unit_bytes.size(), 0);
+    size_t off = 0;
+    for (size_t i = 0; i < unit_bytes.size(); ++i) {
+        Impl::Unit & U = im.units[i];
+        U.off = off;
+        U.bytes = up_to(unit_bytes[i], im.page);
+        U.tail = std::min(U.bytes - im.page, (i < spare_off.size() ? spare_off[i] : unit_bytes[i] - 1) / im.page * im.page);
+        unit_off[i] = off;
+        off += U.bytes;
+    }
+    if (!off) return nullptr;
+    void * p = nullptr;
+    if (zeVirtualMemReserve(im.zc, nullptr, off, &p) != ZE_RESULT_SUCCESS || !p) return nullptr;
+    im.va = (uint8_t *) p;
+    im.va_bytes = off;
+    std::string err;
+    for (auto & U : im.units)
+        if (!im.map(U.off + U.tail, U.bytes - U.tail, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return nullptr; }
+    total = off;
+    return im.va;
+}
+
+size_t Ds41KvMap::grow_bytes(const std::vector<size_t> & bytes) const {
+    const Impl & im = *p_;
+    size_t b = 0;
+    for (size_t i = 0; i < im.units.size() && i < bytes.size(); ++i) {
+        const size_t w = std::min(im.units[i].tail, up_to(bytes[i], im.page));
+        if (w > im.units[i].done) b += w - im.units[i].done;
+    }
+    return b;
+}
+
+bool Ds41KvMap::grow(const std::vector<size_t> & bytes, std::string & err) {
+    Impl & im = *p_;
+    for (size_t i = 0; i < im.units.size() && i < bytes.size(); ++i) {
+        Impl::Unit & U = im.units[i];
+        const size_t w = std::min(U.tail, up_to(bytes[i], im.page));
+        if (w <= U.done) continue;
+        if (!im.map(U.off + U.done, w - U.done, err)) return false;
+        U.done = w;
+    }
+    return true;
+}
+
+size_t Ds41KvMap::mapped() const {
+    size_t b = 0;
+    for (const auto & U : p_->units) b += U.done + (U.bytes - U.tail);
+    return b;
+}
+
+size_t Ds41KvMap::reserved() const { return p_->va_bytes; }
+
 std::string Ds41Pager::report() const {
     const Impl & im = *p_;
     char b[256];

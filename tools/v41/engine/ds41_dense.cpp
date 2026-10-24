@@ -167,6 +167,8 @@ struct Ds41Dense::Impl {
     // ---- persistent state (sctx / sbuf)
     ggml_context * sctx = nullptr;
     ggml_backend_buffer_t sbuf = nullptr;
+    ggml_backend_buffer_t kv_buf = nullptr;   ///< larry (cfg.kv_alloc): over the caller's KV units
+    std::vector<std::pair<ggml_tensor *, int>> kv_units;   ///< larry: (comp / idxk tensor, its ratio) in kv_alloc's order
     ggml_tensor * x_state = nullptr;      // [D, HC, NC]
     ggml_tensor * pre_state = nullptr;    // [HC, NC]   the next attention's pre-mix
     ggml_tensor * hap = nullptr;          // [D, HC, NC] the FFN residual (hc_post of the attention)
@@ -290,6 +292,7 @@ struct Ds41Dense::Impl {
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
+        if (kv_buf) ggml_backend_buffer_free(kv_buf);
         if (ibuf) ggml_backend_buffer_free(ibuf);
         if (sctx) ggml_free(sctx);
         if (ictx) ggml_free(ictx);
@@ -1759,6 +1762,31 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
             }
         }
     }
+    // larry (cfg.kv_alloc, STRATA_DENSE_LAZY_KV): the compressed KV and indexer keys in the caller's virtual memory,
+    // mapped as the context grows - a 1M context's rows stay out of card 0's VRAM until a conversation reaches them
+    if (im.sycl && im.cfg.kv_alloc) {
+        const ggml_backend_buffer_type_t bt = ggml_backend_get_default_buffer_type(im.backend);
+        std::vector<size_t> ub, spare, uo;
+        for (auto & L : im.ly)
+            for (ggml_tensor * t : { L.comp, L.idxk })
+                if (t) {
+                    im.kv_units.push_back({ t, (int) L.ratio });
+                    ub.push_back(ggml_backend_buft_get_alloc_size(bt, t));
+                    spare.push_back((size_t) (t->ne[1] - 1) * t->nb[1]);   // the spare row (open compressor groups)
+                }
+        if (!im.kv_units.empty())
+            if (ggml_backend_buffer_t kb = im.cfg.kv_alloc(ub, spare, uo)) {
+                uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(kb);
+                for (size_t i = 0; i < im.kv_units.size(); ++i)
+                    if (ggml_backend_tensor_alloc(kb, im.kv_units[i].first, base + uo[i]) != GGML_STATUS_SUCCESS) {
+                        err = "cannot bind the KV state in the lazy map";
+                        ggml_backend_buffer_free(kb);
+                        return false;
+                    }
+                im.kv_buf = kb;
+            }
+        if (!im.kv_buf) im.kv_units.clear();
+    }
     im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
     if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
     ggml_backend_buffer_clear(im.sbuf, 0);
@@ -2733,6 +2761,18 @@ bool Ds41Dense::restore() {
 }
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
+
+void Ds41Dense::kv_bytes_for(int64_t positions, std::vector<size_t> & bytes) const {
+    const Impl & im = *p_;
+    bytes.clear();
+    for (const auto & u : im.kv_units) {   // row r of a ratio-k source holds a position >= r * k: rows [0, p / k] + a margin
+        const int64_t k = u.second == 2 ? 2 : 1;
+        const int64_t rows = std::min<int64_t>(u.first->ne[1] - 1, positions / k + 2);
+        bytes.push_back((size_t) rows * u.first->nb[1]);
+    }
+}
+
+bool Ds41Dense::kv_lazy() const { return p_->kv_buf != nullptr; }
 
 bool Ds41Dense::park(int64_t positions) {
     Impl & im = *p_;

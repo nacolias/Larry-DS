@@ -4563,10 +4563,11 @@ bool Ds41XeTier::tp_make_room(int gpu, size_t bytes) {
     if (tdl != im.tp_defer.end()) tdl->second = tdl->second > bytes ? tdl->second - bytes : 0;
     if (fr < 0) return true;
     int64_t give = (int64_t) bytes + keep - fr;
-    // larry, STRATA_XE_TP_EVICT: the free VRAM down to STRATA_XE_TP_EVICT_KEEP_GIB (most of the prompt reserve), then
+    // larry, STRATA_XE_TP_EVICT: the free VRAM down to STRATA_XE_TP_EVICT_KEEP_GIB (as the flex logic: 0.25 - the
+    // run_big buffers kept after a prompt already hold its reserve; 1.5 evicted 570 experts for 36 MiB of rows), then
     // the card's evictable slabs, the flex region last
     if (tp_evict_on() && !c.pbuf_cap) {
-        const int64_t ekeep = (int64_t) (env_d("STRATA_XE_TP_EVICT_KEEP_GIB", 1.5) * kGiB);
+        const int64_t ekeep = (int64_t) (env_d("STRATA_XE_TP_EVICT_KEEP_GIB", 0.25) * kGiB);
         if ((int64_t) bytes + ekeep > fr && evict_slabs(im, c, (int64_t) bytes + ekeep) > 0) give = (int64_t) bytes + keep - c.free_vram();
     }
     if (give <= 0) return true;

@@ -62,4 +62,29 @@ private:
     std::unique_ptr<Impl> p_;
 };
 
+/// larry (STRATA_DENSE_LAZY_KV): card 0's KV state in Level Zero virtual memory, mapped as the context grows.  alloc()
+/// reserves the units (one a tensor, each page-aligned) and maps the page holding each unit's spare byte (its last
+/// row) up front; grow() maps each unit's pages up to bytes[i] from its start (never past that page), zeroing them.
+class Ds41KvMap {
+public:
+    Ds41KvMap();
+    ~Ds41KvMap();
+    Ds41KvMap(const Ds41KvMap &) = delete;
+    Ds41KvMap & operator=(const Ds41KvMap &) = delete;
+
+    /// queue: the dense backend's sycl::queue * (card 0)
+    bool init(void * queue, std::string & err);
+    void * alloc(const std::vector<size_t> & unit_bytes, const std::vector<size_t> & spare_off, std::vector<size_t> & unit_off,
+                 size_t & total);
+    /// the VRAM a grow to bytes[] would map
+    size_t grow_bytes(const std::vector<size_t> & bytes) const;
+    bool grow(const std::vector<size_t> & bytes, std::string & err);
+    size_t mapped() const;         ///< bytes mapped (all units)
+    size_t reserved() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> p_;
+};
+
 }  // namespace strata::v41

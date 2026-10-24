@@ -391,6 +391,10 @@ int main(int argc, char ** argv) {
     // path's layers - the TP core runs decode / verify from its own shards; card 0 takes experts in that VRAM instead.
     // Declared before the dense half: its memory outlives the dense half's buffer over it.
     std::unique_ptr<Ds41Pager> pager;
+    // larry (STRATA_DENSE_LAZY_KV=1, --serve): card 0's KV state mapped as the context grows (Ds41KvMap); declared
+    // before the dense half too
+    std::unique_ptr<Ds41KvMap> kvmap;
+    int64_t kv_pos = 0;   // positions the map covers
     // (opt-in: STRATA_TP_PAGE=1, the service's setting.  The p2k prompt row it first seemed to break goes wrong without
     // it too - a chaotic row, not a race: engine1/DESIGN.md)
     if (const char * tpv = std::getenv("STRATA_TP"); tpv && std::atoi(tpv) >= 2 && !ggml_backend_is_cpu(be) &&
@@ -409,10 +413,39 @@ int main(int argc, char ** argv) {
         }
     }
 #endif
+#if defined(DS41_TP)
+    if (a.serve && !ggml_backend_is_cpu(be) && std::getenv("STRATA_DENSE_LAZY_KV") && std::getenv("STRATA_DENSE_LAZY_KV")[0] == '1') {
+        kvmap = std::make_unique<Ds41KvMap>();
+        std::string kerr;
+        if (!kvmap->init(ggml_backend_sycl_get_queue(be), kerr)) {
+            std::fprintf(stderr, "ds41_generate: STRATA_DENSE_LAZY_KV: %s - off\n", kerr.c_str());
+            kvmap.reset();
+        } else {
+            dc.kv_alloc = [&kvmap](const std::vector<size_t> & ub, const std::vector<size_t> & sp, std::vector<size_t> & uo) -> ggml_backend_buffer_t {
+                size_t tot = 0;
+                void * va = kvmap->alloc(ub, sp, uo, tot);
+                return va ? ggml_backend_sycl_buffer_from_ptr(0, va, tot) : nullptr;
+            };
+        }
+    }
+#endif
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
+#if defined(DS41_TP)
+    if (kvmap && dense.kv_lazy()) {   // the first STRATA_DENSE_KV_INIT positions now (the VRAM the tier sees as taken)
+        const int64_t init = std::min<int64_t>(ctx, std::getenv("STRATA_DENSE_KV_INIT") ? std::atoll(std::getenv("STRATA_DENSE_KV_INIT")) : 262144);
+        std::vector<size_t> kb;
+        dense.kv_bytes_for(init, kb);
+        if (!kvmap->grow(kb, err)) { std::fprintf(stderr, "ds41_generate: KV map: %s\n", err.c_str()); return 1; }
+        kv_pos = init;
+        std::fprintf(stderr, "kv map: card 0's KV state in virtual memory - %lld of %lld positions mapped (%.2f of %.2f GiB)\n",
+                     (long long) init, (long long) ctx, kvmap->mapped() / 1073741824.0, kvmap->reserved() / 1073741824.0);
+    } else if (kvmap) {
+        kvmap.reset();
+    }
+#endif
 #if defined(DS41_XE)
     // larry: the dense weights' planar reorder now, not inside the first decode token (STRATA_PREREORDER, default 1)
     std::set<const void *> planar_w, planar_slices;   // larry, engine1: what the TP core's rank 0 may read in place
@@ -1596,6 +1629,33 @@ int main(int argc, char ** argv) {
         // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
         // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
         const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
+        // larry (STRATA_DENSE_LAZY_KV): before a prompt or a pass reaches past the mapped positions, 32K more (at least
+        // what it needs) - card 0's expert cache gives the VRAM back first (between passes: nothing reads its slabs)
+        auto ensure_kv = [&](int64_t p) -> bool {
+#if defined(DS41_TP)
+            if (!kvmap || p <= kv_pos) return true;
+            const int64_t want = std::min<int64_t>(ctx, std::max<int64_t>(p, kv_pos + 32768));
+            std::vector<size_t> kb;
+            dense.kv_bytes_for(want, kb);
+            const size_t need = kvmap->grow_bytes(kb);
+            const double t0 = now_ms();
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
+            const size_t margin = (size_t) 512 << 20;
+            if (need + margin > fr) {
+                std::string kerr;
+                if (tier.shrink_cache_for((int64_t) (need + margin), kerr) < 0 && !kerr.empty())
+                    std::fprintf(stderr, "kv map: card 0's cache: %s\n", kerr.c_str());
+            }
+            if (!kvmap->grow(kb, err)) return false;
+            std::fprintf(stderr, "kv map: %lld -> %lld positions (+%.2f GiB, %.2f GiB mapped; %.0f ms)\n", (long long) kv_pos,
+                         (long long) want, need / 1073741824.0, kvmap->mapped() / 1073741824.0, now_ms() - t0);
+            kv_pos = want;
+#else
+            (void) p;
+#endif
+            return true;
+        };
         const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
@@ -1885,6 +1945,7 @@ int main(int argc, char ** argv) {
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
+            if (!ensure_kv(total + 64)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
@@ -2126,6 +2187,7 @@ int main(int argc, char ** argv) {
                     vt.push_back(t);
                     for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
+                    if (!ensure_kv(p0 + (int64_t) vt.size() + 64)) { ferr = err; finish = "error"; break; }
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     int acc = 0, tn = -1;
                     for (; acc < k; ++acc) {
@@ -2171,6 +2233,7 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
+                if (!ensure_kv(pos + 64)) { ferr = err; finish = "error"; break; }
                 if (!step(tok, pos) || !logits_rows(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;

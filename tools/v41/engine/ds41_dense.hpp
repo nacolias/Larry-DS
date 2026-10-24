@@ -64,6 +64,11 @@ struct Ds41DenseConfig {
     /// units' region (unit_off[l] filled in) or null (the normal buffer).  Q6_K tensors only; the work on a layer's unit
     /// is bracketed by the page hooks (set_page_hooks).
     std::function<ggml_backend_buffer_t(const std::vector<size_t> & unit_bytes, std::vector<size_t> & unit_off)> paged_alloc;
+    /// larry (STRATA_DENSE_LAZY_KV): the KV-source layers' compressed KV and indexer keys in memory the caller provides
+    /// and maps as the context grows (kv_bytes_for).  Called once at init with each tensor's bytes and its spare row's
+    /// offset; returns a backend buffer over the units (unit_off filled in) or null (the state buffer holds them).
+    std::function<ggml_backend_buffer_t(const std::vector<size_t> & unit_bytes, const std::vector<size_t> & spare_off,
+                                        std::vector<size_t> & unit_off)> kv_alloc;
 };
 
 /// larry, engine1: a weight in the paged units (cfg.paged_alloc): its layer, address, Q6_K shape
@@ -200,6 +205,9 @@ public:
     /// memory; unpark() writes them back and re-arms the snapshot, so restore() resumes the parked conversation.  Valid
     /// only while no request has written past position n since park (the caller checks).
     bool park(int64_t positions);
+    /// larry (cfg.kv_alloc): per KV unit (kv_alloc's order) the bytes from its start that `positions` positions use
+    void kv_bytes_for(int64_t positions, std::vector<size_t> & bytes) const;
+    bool kv_lazy() const;
     bool unpark();
     void drop_park();
     bool parked() const;
