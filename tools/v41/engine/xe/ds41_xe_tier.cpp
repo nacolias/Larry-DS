@@ -35,6 +35,11 @@
 
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <drm/drm.h>
+#include <drm/xe_drm.h>
 #include <cerrno>
 #include <sched.h>
 #if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
@@ -91,6 +96,146 @@ inline void addr_log(const char* what, sycl::queue& q, const void* p, size_t byt
     try { pci = q.get_device().get_info<sycl::ext::intel::info::device::pci_address>(); } catch (...) {}
     std::fprintf(stderr, "addr: %s %s %p +0x%zx\n", what, pci.c_str(), p, bytes);
 }
+// larry, STRATA_XE_BAR_STAGE (patch-barstage.py): card memory the CPU writes through the card's BAR - a buffer object
+// in the card's VRAM made through the xe uAPI (VRAM only, NEEDS_VISIBLE_VRAM, WC), mmap'd, and imported into Level Zero
+// as a device allocation of its card (made resident there).  g_bar: by device address; g_bar_dev: per PCI address the
+// card's render node and its full-BAR VRAM region (-1: not possible there).
+struct BarBuf { int fd; uint32_t handle; uint8_t* cpu; size_t bytes; };
+std::mutex g_bar_mu;
+std::map<uintptr_t, BarBuf> g_bar;
+std::map<std::string, std::pair<int, int>> g_bar_dev;
+std::atomic<int64_t> g_bar_put{0};   ///< bytes written through BARs (the prefetch summary)
+inline bool bar_stage_on() { static const bool on = env_i("STRATA_XE_BAR_STAGE", 0) != 0; return on; }
+/// a BAR-mapped buffer of `bytes` on q's card; nullptr: not possible (the caller allocates as before)
+inline uint8_t* bar_alloc(sycl::queue& q, size_t bytes) {
+    std::string pci;
+    try { pci = q.get_device().get_info<sycl::ext::intel::info::device::pci_address>(); } catch (...) { return nullptr; }
+    std::lock_guard<std::mutex> lk(g_bar_mu);
+    auto it = g_bar_dev.find(pci);
+    if (it == g_bar_dev.end()) {
+        int fd = -1, inst = -1;
+        const std::string dir = "/sys/bus/pci/devices/" + pci + "/drm";
+        if (DIR* d = opendir(dir.c_str())) {
+            while (dirent* de = readdir(d))
+                if (fd < 0 && !std::strncmp(de->d_name, "renderD", 7))
+                    fd = open(("/dev/dri/" + std::string(de->d_name)).c_str(), O_RDWR | O_CLOEXEC);
+            closedir(d);
+        }
+        drm_xe_device_query dq = {};
+        dq.query = DRM_XE_DEVICE_QUERY_MEM_REGIONS;
+        if (fd >= 0 && ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &dq) == 0 && dq.size) {
+            std::vector<uint8_t> qb(dq.size);
+            dq.data = (uintptr_t) qb.data();
+            if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &dq) == 0) {
+                const auto* mr = (const drm_xe_query_mem_regions*) qb.data();
+                for (uint32_t i = 0; i < mr->num_mem_regions && inst < 0; ++i) {
+                    const drm_xe_mem_region& r = mr->mem_regions[i];
+                    if (r.mem_class == DRM_XE_MEM_REGION_CLASS_VRAM && r.cpu_visible_size >= r.total_size) inst = r.instance;
+                }
+            }
+        }
+        it = g_bar_dev.emplace(pci, std::make_pair(fd, inst)).first;
+        std::fprintf(stderr, "xe tier: BAR staging on %s: %s\n", pci.c_str(),
+                     fd >= 0 && inst >= 0 ? "VRAM fully CPU-visible" : "not possible (card memory as before)");
+    }
+    const int fd = it->second.first, inst = it->second.second;
+    if (fd < 0 || inst < 0) return nullptr;
+    const size_t sz = (bytes + 65535) & ~(size_t) 65535;
+    drm_xe_gem_create gc = {};
+    gc.size = sz;
+    gc.placement = 1u << inst;
+    gc.flags = DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM;
+    gc.cpu_caching = DRM_XE_GEM_CPU_CACHING_WC;
+    if (ioctl(fd, DRM_IOCTL_XE_GEM_CREATE, &gc)) return nullptr;
+    auto close_bo = [&] { drm_gem_close cl = {}; cl.handle = gc.handle; ioctl(fd, DRM_IOCTL_GEM_CLOSE, &cl); };
+    drm_xe_gem_mmap_offset mo = {};
+    mo.handle = gc.handle;
+    void* cpu = MAP_FAILED;
+    if (ioctl(fd, DRM_IOCTL_XE_GEM_MMAP_OFFSET, &mo) == 0) cpu = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mo.offset);
+    if (cpu == MAP_FAILED) { close_bo(); return nullptr; }
+    drm_prime_handle ph = {};
+    ph.handle = gc.handle;
+    ph.flags = DRM_CLOEXEC | DRM_RDWR;
+    if (ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph)) { munmap(cpu, sz); close_bo(); return nullptr; }
+    ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+    ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+    ze_external_memory_import_fd_t imp = {ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD, nullptr, ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF, ph.fd};
+    ze_device_mem_alloc_desc_t dd = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, &imp, 0, 0};
+    void* p = nullptr;
+    const bool ok = zeMemAllocDevice(zc, &dd, sz, 4096, zd, &p) == ZE_RESULT_SUCCESS && p &&
+                    zeContextMakeMemoryResident(zc, zd, p, sz) == ZE_RESULT_SUCCESS;
+    close(ph.fd);
+    if (!ok) {
+        if (p) zeMemFree(zc, p);
+        munmap(cpu, sz);
+        close_bo();
+        return nullptr;
+    }
+    g_bar[(uintptr_t) p] = BarBuf{fd, gc.handle, (uint8_t*) cpu, sz};
+    return (uint8_t*) p;   // (its CPU pages fault in at first touch: bar_touch, patch-barstage2)
+}
+/// device address `p` inside a BAR buffer -> the CPU's address of it (nullptr: not in one)
+inline uint8_t* bar_cpu(const void* p) {
+    std::lock_guard<std::mutex> lk(g_bar_mu);
+    if (g_bar.empty()) return nullptr;
+    auto it = g_bar.upper_bound((uintptr_t) p);
+    if (it == g_bar.begin()) return nullptr;
+    --it;
+    const uintptr_t off = (uintptr_t) p - it->first;
+    return off < it->second.bytes ? it->second.cpu + off : nullptr;
+}
+/// larry, patch-barstage2: fault a BAR buffer's CPU pages in (TTM maps a 64 KiB run a fault); ms taken
+inline double bar_touch(const void* p, size_t bytes) {
+    uint8_t* c = bar_cpu(p);
+    if (!c) return 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t o = 0; o < bytes; o += 65536) (void) *(volatile const uint8_t*) (c + o);
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+inline bool bar_free(sycl::queue& q, void* p) {
+    BarBuf b;
+    {
+        std::lock_guard<std::mutex> lk(g_bar_mu);
+        auto it = g_bar.find((uintptr_t) p);
+        if (it == g_bar.end()) return false;
+        b = it->second;
+        g_bar.erase(it);
+    }
+    zeMemFree(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context()), p);
+    munmap(b.cpu, b.bytes);
+    drm_gem_close cl = {};
+    cl.handle = b.handle;
+    ioctl(b.fd, DRM_IOCTL_GEM_CLOSE, &cl);
+    return true;
+}
+/// `n` bytes into a BAR mapping (streaming stores), then out to the card: a read through the BAR completes only
+/// after the posted writes before it
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+__attribute__((target("avx2")))
+#endif
+inline void bar_put(uint8_t* dst, const uint8_t* src, size_t n) {
+    if (!n) return;
+    size_t i = 0;
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+    if (((uintptr_t) dst & 31) == 0)
+        for (; i + 128 <= n; i += 128) {
+            const __m256i a = _mm256_loadu_si256((const __m256i*) (src + i));
+            const __m256i b = _mm256_loadu_si256((const __m256i*) (src + i + 32));
+            const __m256i c = _mm256_loadu_si256((const __m256i*) (src + i + 64));
+            const __m256i d = _mm256_loadu_si256((const __m256i*) (src + i + 96));
+            _mm256_stream_si256((__m256i*) (dst + i), a);
+            _mm256_stream_si256((__m256i*) (dst + i + 32), b);
+            _mm256_stream_si256((__m256i*) (dst + i + 64), c);
+            _mm256_stream_si256((__m256i*) (dst + i + 96), d);
+        }
+    if (i < n) std::memcpy(dst + i, src + i, n - i);
+    _mm_sfence();
+#else
+    std::memcpy(dst, src, n);
+#endif
+    (void) *(volatile const uint8_t*) (dst + n - 1);
+    g_bar_put += (int64_t) n;
+}
 inline bool local_alloc_on() { static const bool on = std::getenv("STRATA_XE_LOCAL_ALLOC") == nullptr || std::atoi(std::getenv("STRATA_XE_LOCAL_ALLOC")) != 0; return on; }
 inline uint8_t* local_alloc(sycl::queue& q, size_t bytes) {
     if (!local_alloc_on()) return sycl::malloc_device<uint8_t>(bytes, q);
@@ -105,8 +250,15 @@ inline uint8_t* local_alloc(sycl::queue& q, size_t bytes) {
     addr_log("tier local alloc", q, p, bytes);
     return (uint8_t*) p;
 }
+/// larry, patch-barstage: a card's flex region / stream buffer - BAR-mapped with STRATA_XE_BAR_STAGE=1 when possible
+inline uint8_t* card_alloc(sycl::queue& q, size_t bytes) {
+    if (bar_stage_on())
+        if (uint8_t* p = bar_alloc(q, bytes)) { addr_log("tier BAR alloc", q, p, bytes); return p; }
+    return local_alloc(q, bytes);
+}
 inline void local_free(sycl::queue& q, void* p) {
     if (!p) return;
+    if (bar_free(q, p)) return;   // larry, patch-barstage
     addr_log("tier local free", q, p, 0);
     if (!local_alloc_on()) { sycl::free(p, q); return; }
     zeMemFree(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context()), p);
@@ -1132,7 +1284,7 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         // stage - its pinned budget goes to the arena; `want` stays the planner's cap on a slot's pageable bytes.  The
         // rings now, all or none (none: no prefetch at all - nothing could stage it)
         if (hot_on() && env_i("STRATA_XE_HOTRING_NOSTAGE", 1) && want) {
-            const int ns = std::max(1, env_i("STRATA_XE_STAGERS", 4));
+            const int ns = std::max(1, env_i("STRATA_XE_STAGERS", bar_stage_on() ? 1 : 4));   // larry, patch-barstage2: 1 with BAR
             bool all = true;
             for (int i = 0; i < ns; ++i) {
                 im.pf_rings.push_back(sycl::malloc_host<uint8_t>((size_t) hot_slots() * hot_chunk(), im.ctx));
@@ -1284,7 +1436,7 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
             if (tp_evict_on()) extra = std::min<int64_t>(extra, tp_defer_flex());   // STRATA_XE_TP_EVICT: the rest holds experts
             const int64_t want = std::min<int64_t>((int64_t) (fg * kGiB) + extra, fr > 0 ? fr - (int64_t) (fm * kGiB) : 0) & ~(int64_t) 255;
             if (want < 8 * im.blob_max) continue;
-            c.flex = local_alloc(c.q, (size_t) want);
+            c.flex = card_alloc(c.q, (size_t) want);   // larry, patch-barstage
             c.flex_cap = c.flex ? (size_t) want : 0;
         }
         if (env_i("STRATA_XE_PROMOTE", 1) && !im.pc_bounce) {   // the promotions' pinned bounces, now too
@@ -3319,7 +3471,7 @@ bool grow_stream(XeCard& c, size_t need, size_t cap) {
     if (c.stream) c.q.wait();
     const double t1 = now_ms();
     if (c.stream) { local_free(c.q, c.stream); c.stream = nullptr; c.stream_bytes = 0; }
-    c.stream = local_alloc(c.q, want);
+    c.stream = card_alloc(c.q, want);   // larry, patch-barstage
     c.stream_bytes = c.stream ? want : 0;
     alloc_note("stream", want, t0, t1);
     return c.stream != nullptr;
@@ -3540,7 +3692,11 @@ void pf_stager(Ds41XeImpl& im, int idx) {
         Ds41XeImpl::PfSlot& ps = im.pf[s];
         const int64_t l = ps.layer;
         const double ts = xe_prof() ? now_ms() : 0;
-        if (hot) {
+        uint8_t* bc = nullptr;   // larry, STRATA_XE_BAR_STAGE: a pageable expert straight into the slot through the BAR
+        if (hot && ps.soff[(size_t) e] != SIZE_MAX) bc = bar_cpu(im.cards[(size_t) ps.card[(size_t) e]]->pbuf[s] + ps.off[(size_t) e]);
+        if (bc) {
+            bar_put(bc, im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e));
+        } else if (hot) {
             XeCard& cd = *im.cards[(size_t) ps.card[(size_t) e]];
             hot_put(cd.pq, cd.pbuf[s] + ps.off[(size_t) e], im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e),
                     ps.soff[(size_t) e] == SIZE_MAX, im.pf_rings[(size_t) idx], hev, hnext);
@@ -4039,6 +4195,14 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     const size_t key = (size_t) im.key(l, e);
                     const size_t bytes = im.bbytes(l, e);
                     const uint8_t* src = im.aptr[key];
+                    if (!im.apin[key]) {   // larry, STRATA_XE_BAR_STAGE: through the stream buffer's BAR mapping
+                        if (uint8_t* bc = bar_cpu(c.stream + soff[(size_t) e])) {
+                            bar_put(bc, src, bytes);
+                            ++pcie;
+                            ++g_bp.streamed;
+                            continue;
+                        }
+                    }
                     if (!im.apin[key] && ring_ovl) {   // larry, patch-ovlring
                         oev = hot_put(c.oq, c.stream + soff[(size_t) e], src, bytes, false, c.hring, c.hring_ev, c.hring_next);
                         ++pcie;
@@ -4092,9 +4256,14 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     const uint8_t* hb = host_blob(im, l, e, ftmp);
                     const bool pinned = hb != ftmp.data() && sycl::get_pointer_type(hb, im.ctx) == sycl::usm::alloc::host;
                     if (call_tl) { ++tl.nst; tl.stb += (int64_t) bytes; tl.npin += pinned ? 1 : 0; }
+                    uint8_t* bc = pinned ? nullptr : bar_cpu(c.stream + soff[(size_t) e]);   // larry, STRATA_XE_BAR_STAGE
                     if (pinned) {
                         std::lock_guard<PrioMutex> lk(g_submit);
                         c.q.memcpy(c.stream + soff[(size_t) e], hb, bytes);
+                    } else if (bc) {
+                        bar_put(bc, hb, bytes);
+                        if (hot_check_on())
+                            hot_check(im, c, c.q, c.stream + soff[(size_t) e], hb, bytes, l, e, "stream (BAR)");
                     } else if (hot_on() && (c.hring || (c.hring = sycl::malloc_host<uint8_t>((size_t) hot_slots() * hot_chunk(), im.ctx)))) {
                         // STRATA_XE_HOTRING: through the card thread's ring, a DMA a chunk as it is copied
                         hot_put(c.q, c.stream + soff[(size_t) e], hb, bytes, false, c.hring, c.hring_ev, c.hring_next);
@@ -5459,7 +5628,7 @@ bool Ds41XeTier::tp_make_room(int gpu, size_t bytes) {
     const size_t was = c.flex_cap;
     local_free(c.q, c.flex);
     const int64_t left = ((int64_t) was - give) & ~(int64_t) 255;
-    c.flex = left >= 8 * (int64_t) im.blob_max ? local_alloc(c.q, (size_t) left) : nullptr;
+    c.flex = left >= 8 * (int64_t) im.blob_max ? card_alloc(c.q, (size_t) left) : nullptr;   // larry, patch-barstage
     c.flex_cap = c.flex ? (size_t) left : 0;
     std::fprintf(stderr, "xe tier: card %d's flex region %.2f -> %.2f GiB (the TP core's KV rows)\n", c.idx, was / kGiB,
                  c.flex_cap / kGiB);
@@ -5625,15 +5794,19 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
                        gm * H * 2 + 3 * F * H * 2 + gm * 2 * F * 4 + gm * F * 2 + gp * H * 4 + gp * 4;
     const double margin = env_d("STRATA_XE_PREFETCH_MARGIN_GIB", 0.5) + env_d("STRATA_XE_PREFETCH_STREAM_GIB", 0.25);
     const size_t per = (size_t) (need / ncards + 2 * (int64_t) im.blob_max);
+    std::vector<XeCard*> touch;   // larry, patch-barstage2: new BAR flex regions, faulted in below (a thread a card)
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
         if (c.dense) continue;
-        if (c.stream) { c.q.wait(); local_free(c.q, c.stream); c.stream = nullptr; c.stream_bytes = 0; }   // regrown on demand
+        // larry, patch-barstage2: a BAR stream buffer of the planned size stays (a new one costs its CPU pages)
+        const size_t sb0 = (size_t) (env_d("STRATA_XE_PREFETCH_STREAM_GIB", 0.25) * kGiB) & ~(size_t) 255;
+        const bool keep_st = c.stream && c.stream_bytes == sb0 && bar_cpu(c.stream);
+        if (c.stream && !keep_st) { c.q.wait(); local_free(c.q, c.stream); c.stream = nullptr; c.stream_bytes = 0; }   // regrown on demand
         c.st_layer = -1;
         const int64_t have = (int64_t) (c.cX_cap + c.cOUT_cap) * 4 + (int64_t) c.cS_cap * 8 + (int64_t) c.gscratch_cap +
                              (c.cjobs_cap ? BJ * kMaxJobTok * (F + H) * 4 : 0) + (int64_t) c.cxq_rows * H * 2;
         const int64_t reserve = std::max<int64_t>(0, rb - have) + (int64_t) (margin * kGiB);
-        const int64_t fr = c.free_vram() + (int64_t) c.flex_cap;   // the flex region becomes the buffers
+        const int64_t fr = c.free_vram() + (int64_t) c.flex_cap + (keep_st ? (int64_t) sb0 : 0);   // the flex region becomes the buffers
         int64_t room = fr > 0 ? (fr - reserve) / 2 : 0;
         const size_t cap = (size_t) std::max<int64_t>(0, std::min<int64_t>((int64_t) per, room)) & ~(size_t) 255;
         if (cap < (size_t) im.blob_max) { c.pbuf_cap = 0; continue; }
@@ -5641,13 +5814,25 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         // into host RAM: a 16K prompt after an 8K one pushed larry past the watchdog, 2026-10-21 04:30)
         if (!c.flex || c.flex_cap < 2 * cap || c.flex_cap > 2 * cap + ((size_t) 64 << 20)) {
             if (c.flex) { c.q.wait(); local_free(c.q, c.flex); }
-            c.flex = local_alloc(c.q, 2 * cap);
+            c.flex = card_alloc(c.q, 2 * cap);   // larry, patch-barstage
             c.flex_cap = c.flex ? 2 * cap : 0;
             if (!c.flex) { c.pbuf_cap = 0; continue; }
+            if (bar_cpu(c.flex)) touch.push_back(&c);
         }
         c.pbuf[0] = c.flex;
         c.pbuf[1] = c.flex + cap;
         c.pbuf_cap = cap;
+    }
+    if (!touch.empty()) {   // larry, patch-barstage2: the new BAR regions' CPU pages, the cards side by side
+        std::vector<double> ms(touch.size(), 0.0);
+        std::vector<std::thread> th;
+        for (size_t i = 0; i < touch.size(); ++i) th.emplace_back([&, i] { ms[i] = bar_touch(touch[i]->flex, touch[i]->flex_cap); });
+        for (auto& t : th) t.join();
+        static const bool all = env_i("STRATA_XE_ALLOC_LOG", 0) != 0;
+        if (all)
+            for (size_t i = 0; i < touch.size(); ++i)
+                std::fprintf(stderr, "xe prefetch: card %d's BAR flex region (%.2f GiB) faulted in: %.0f ms\n", touch[i]->idx,
+                             touch[i]->flex_cap / kGiB, ms[i]);
     }
     // the calls' buffers now, once (they are in the reserve above): the overflow stream buffer at its planned size, X /
     // OUT / the slot maps for n_call tokens
@@ -5687,7 +5872,7 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
     }
     if (im.pf_thr.empty()) {
         im.pf_stop = false;
-        const int ns = std::max(1, env_i("STRATA_XE_STAGERS", 4));
+        const int ns = std::max(1, env_i("STRATA_XE_STAGERS", bar_stage_on() ? 1 : 4));   // larry, patch-barstage2: 1 with BAR
         if (hot_on() && im.pf_rings.empty()) {   // STRATA_XE_HOTRING: a ring per stager (all or none: pf_enqueue counts on the stagers' copies)
             std::lock_guard<PrioMutex> lk(g_submit);
             for (int i = 0; i < ns; ++i) im.pf_rings.push_back(sycl::malloc_host<uint8_t>((size_t) hot_slots() * hot_chunk(), im.ctx));
@@ -5771,8 +5956,8 @@ void Ds41XeTier::prefetch_end() {
         c.pbuf_cap = 0;
     }
     if (xe_prof())
-        std::fprintf(stderr, "xe prefetch: %lld experts (%.2f GB) planned, %lld used\n", (long long) im.pf_planned,
-                     im.pf_bytes / 1e9, (long long) im.pf_used);
+        std::fprintf(stderr, "xe prefetch: %lld experts (%.2f GB) planned, %lld used; %.2f GB through BARs so far\n",
+                     (long long) im.pf_planned, im.pf_bytes / 1e9, (long long) im.pf_used, g_bar_put.load() / 1e9);
     im.pf[0].layer = im.pf[1].layer = -1;
     im.pf_on = false;
 }
