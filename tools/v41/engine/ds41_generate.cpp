@@ -183,6 +183,16 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// larry, STRATA_BATCH_TRACE=1: a served prompt's steps, ms since its keep-cache step (btr_reset)
+static double g_btr0 = 0;
+static bool btr_on() { static const bool on = std::getenv("STRATA_BATCH_TRACE") != nullptr; return on; }
+static void btr_reset() { g_btr0 = now_ms(); }
+static void btr(const char * what, int a = -1) {
+    if (!btr_on()) return;
+    if (a >= 0) std::fprintf(stderr, "batch trace: %9.1f  %s %d\n", now_ms() - g_btr0, what, a);
+    else std::fprintf(stderr, "batch trace: %9.1f  %s\n", now_ms() - g_btr0, what);
+}
+
 // the K largest logits, largest first (equal ones: the lower token first) - exactly std::partial_sort's candidates
 // over the whole vocabulary, ~3.7x faster (0.31 -> 0.08 ms a 129K row; --serve's speculative sampling takes one a
 // verified row): the K-th largest of 2K block maxima bounds the K-th largest logit from below, so only the logits at
@@ -1215,6 +1225,7 @@ int main(int argc, char ** argv) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
+                btr("batch start", B);
                 // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
                 // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
                 // desktop's STT server, DSpark's 2.9 GB, the dense half).  A batch that does not fit is retried at
@@ -1242,6 +1253,7 @@ int main(int argc, char ** argv) {
                     ferr = dense.last_error();
                     return false;
                 }
+                btr("columns + begin_batch");
                 // larry: the next batch's Engram rows go into the row cache while this one computes
                 if (c0 + B < n) dense.engram_prefetch(ids + c0 + B, std::min(pb_cap, n - c0 - B), pos0 + c0 + B);
                 // enc-skip: columns whose global position is before `pos0 + n - ER` are phase A (layers past layer 20
@@ -1298,6 +1310,7 @@ int main(int argc, char ** argv) {
                     static const int64_t pf_depth = std::getenv("STRATA_XE_PREFETCH_DEPTH") ? std::atoll(std::getenv("STRATA_XE_PREFETCH_DEPTH")) : 0;
                     const bool pf_shallow = (int64_t) pos0 + c0 + B < pf_depth;
                     if (pf_last >= 0 && !pf_shallow && !mc.cpu_only) tier.prefetch_begin(pf_first, pf_last, pipe ? part_max : B);
+                    btr("prefetch begin");
                 }
                 if (pipe) {
                     // STRATA_SUBMIT_PRIO (default 1): the dense half's lock waits hold the tier's threads off
@@ -1418,6 +1431,7 @@ int main(int argc, char ** argv) {
                     }
                     okp = okp && PJ();
                     if (!okp) tier.run_chunk_wait();   // never leave the tier thread running
+                    btr("pipeline");
                     if (okp && dump_col >= 0 && dump_col < B) {
                         const std::string dn = "logs/dump_col." + std::to_string((long) getpid()) + ".bin";
                         if (std::FILE * df = std::fopen(dn.c_str(), "wb")) {
@@ -1503,6 +1517,7 @@ int main(int argc, char ** argv) {
                 }
                 tier.prefetch_end();
                 fd_dense += now_ms() - t0;
+                btr("layers / prefetch end");
                 const double tl = now_ms();
                 if (all_logits) {   // every row, one sub-batch at a time (a B-wide head would need a ~2 GiB buffer)
                     all_logits->resize((size_t) (c0 + B) * (size_t) nv);
@@ -1515,6 +1530,7 @@ int main(int argc, char ** argv) {
                 for (int s = 0; tail_keep > 0 && s < B; s += SB)   // one sub-batch at a time, as above
                     if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
+                btr("logits");
                 c0 += B;
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
@@ -1900,6 +1916,7 @@ int main(int argc, char ** argv) {
             // s6 A/B: it never engages with the default --vram-lru (the LRU reorders slots, so "the tail" is not the
             // coldest experts and a batch-time admission could duplicate a saved one) - it needs --no-vram-lru for now.
             bool kept = false;
+            btr_reset();   // larry, STRATA_BATCH_TRACE
             if (Ds41Tier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
                 std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
                              (int) cache_open);
@@ -1940,6 +1957,7 @@ int main(int argc, char ** argv) {
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
+            btr("keep-cache / release", kept ? 1 : 0);
             tier.rebalance_begin_prompt();
             tier.reset_stats();
             if (const char* rl = std::getenv("STRATA_ROUTE_LOG")) {   // a turn marker for the route log (see ds41_moe.cpp)
@@ -2003,12 +2021,14 @@ int main(int argc, char ** argv) {
                                               frb / 1073741824.0, pb_cap, PB);
             }
             const double tph0 = now_ms();
+            btr("feed start (batch width)", pb_cap);
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             if (!ensure_kv(total + 64)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
+            btr("feed end");
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
                 dense.release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)
@@ -2021,6 +2041,7 @@ int main(int argc, char ** argv) {
                     apply_bias();
                 }
             }
+            btr("regrow");
             double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
             int sp_t = -1;   // DSpark: the first decode token (sampled from the last prompt row), its drafts in sp_ids
             int sp_ids[5] = {0}, sp_tmp[5];
