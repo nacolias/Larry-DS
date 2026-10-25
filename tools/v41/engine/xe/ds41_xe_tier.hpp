@@ -76,6 +76,13 @@ public:
                            int64_t dst_col_stride, void* user);
     void tl_tag(int id);
     void tl_flush();
+    /// larry, STRATA_GPU_PTL=1 (diagnostic): a prompt batch's GPU timeline - ptl() stamps the dense queue after a step
+    /// (`th`: when the host began it; the caller holds the submit lock), ptl_host() a host-only step, ptl_dump() appends
+    /// the batch's records to logs/ptl.<pid>.tsv (bench/speed/ptlsum.py)
+    static bool ptl_on();
+    void ptl(int tag, int l, int a, double th);
+    void ptl_host(int tag, int l, int a);
+    void ptl_dump(const char* label);
     void set_cache_enabled(bool on);
     void release_cache();
     int64_t shrink_cache_for(int64_t need_bytes, std::string& err);

@@ -22,6 +22,11 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <sstream>
+#include <fstream>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <condition_variable>
 
 #include <strings.h>
 
@@ -319,6 +324,7 @@ struct Ds41Dense::Impl {
         return it != w.t.end() ? it->second : BL(il, "ffn_gate_inp.weight");
     }
     bool compute(ggml_cgraph * gf, bool cached, bool async = false, bool nosync = false);
+    double last_alloc_ms = 0;   // larry, patch-logitsdiag: the last compute()'s graph allocation
     std::mutex * sub_mu = nullptr;            // larry: set_submit_lock
     bool fn_host = true;                      // larry: set_fn_host
     std::function<void(int, int)> pre_wait;   // larry: set_pre_wait_hook
@@ -756,6 +762,7 @@ static void decprof_report() {
 // queues ahead; it waits only for the router readbacks.  A graph whose allocation is not the kept fast path syncs
 // first (gallocr may free a buffer that queued kernels still use).
 void (*ds41_dense_tl_hook)(int id) = nullptr;
+void (*ds41_dense_ptl_hook)(int tag, int il, int col0, double t0) = nullptr;   // larry, STRATA_GPU_PTL
 
 static bool dense_async_on() { static const bool on = env_on("STRATA_DENSE_ASYNC", true); return on; }
 
@@ -765,7 +772,9 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async, bool no
     const bool reuse = cached && env_on("DS41_GRAPH_REUSE", true);
     async = async && cached && dense_async_on();
     if (async && !a.kept(gf, reuse)) ggml_backend_synchronize(backend);
+    const double tqa = dprof_now();   // larry, patch-logitsdiag
     bool ok_alloc = a.alloc(gf, reuse);
+    last_alloc_ms = dprof_now() - tqa;
     const double tq1 = g_dprof_on ? dprof_now() : 0;
     if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
         std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
@@ -2486,6 +2495,7 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
 
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
+    const double tptl = ds41_dense_ptl_hook ? dprof_now() : 0;   // larry, STRATA_GPU_PTL
     PageScope ps(im, il);
     if (im.sub_mu && im.ly[(size_t) il].eslot >= 0 && !engram_wait_host(im, (int) im.ly[(size_t) il].eslot)) return false;
     ring_take(im);
@@ -2518,6 +2528,7 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     ring_mark(im);
+    if (ds41_dense_ptl_hook) ds41_dense_ptl_hook(1, il, col0, tptl);   // larry, STRATA_GPU_PTL
     if (sl.owns_lock()) sl.unlock();
     if (!im.pass_ring) ggml_backend_synchronize(im.backend);
     lap(4);
@@ -2544,6 +2555,7 @@ bool Ds41Dense::finish_span(int il, int col0, int n) {
     Impl & im = *p_;
     (void) il;
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
+    const double tptl = ds41_dense_ptl_hook ? dprof_now() : 0;   // larry, STRATA_GPU_PTL
     ring_take(im);
     const double tf0 = g_dprof_on ? dprof_now() : 0;
     std::unique_lock<std::mutex> sl;
@@ -2561,6 +2573,7 @@ bool Ds41Dense::finish_span(int il, int col0, int n) {
     g_dprof_slot = -1;
     ggml_free(gc);
     ring_mark(im);
+    if (ds41_dense_ptl_hook) ds41_dense_ptl_hook(2, il, col0, tptl);   // larry, STRATA_GPU_PTL
     if (sl.owns_lock()) { sl.unlock(); if (!im.pass_ring) ggml_backend_synchronize(im.backend); }
     if (g_dprof_on) g_dfin += dprof_now() - tf0;
     return ok;
@@ -2838,18 +2851,84 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
     return true;
 }
 
+// larry, STRATA_STALL_WATCH (patch-stallwatch.py, diagnostic, default on): while a watched call runs past 300 ms, the
+// calling thread's kernel stack is sampled every 100 ms (/proc/self/task/TID/stack: root only) and printed at the end
+struct StallWatch {
+    const char * what;
+    pid_t tid = 0;
+    std::thread th;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    std::map<std::string, int> stacks;
+    explicit StallWatch(const char * w) : what(w) {
+        static const bool on = !(std::getenv("STRATA_STALL_WATCH") && std::getenv("STRATA_STALL_WATCH")[0] == '0');
+        if (!on) return;
+        tid = (pid_t) syscall(SYS_gettid);
+        th = std::thread([this] {
+            std::unique_lock<std::mutex> lk(mu);
+            if (cv.wait_for(lk, std::chrono::milliseconds(300), [this] { return done; })) return;
+            while (!done) {
+                char path[64];
+                std::snprintf(path, sizeof path, "/proc/self/task/%d/stack", (int) tid);
+                std::ifstream f(path);
+                std::stringstream ss;
+                ss << f.rdbuf();
+                std::snprintf(path, sizeof path, "/proc/self/task/%d/wchan", (int) tid);
+                std::ifstream g(path);
+                std::string wc;
+                std::getline(g, wc);
+                ++stacks["wchan " + wc + "\n" + ss.str()];
+                cv.wait_for(lk, std::chrono::milliseconds(100), [this] { return done; });
+            }
+        });
+    }
+    ~StallWatch() {
+        if (!th.joinable()) return;
+        { std::lock_guard<std::mutex> lk(mu); done = true; }
+        cv.notify_all();
+        th.join();
+        for (const auto & kv : stacks)
+            std::fprintf(stderr, "stall watch (%s): %d samples of 100 ms:\n%s", what, kv.second, kv.first.c_str());
+    }
+};
+
 bool Ds41Dense::logits(int row0, int nrows, float * out) {
     Impl & im = *p_;
+    StallWatch sw("batch head");   // larry, STRATA_STALL_WATCH
+    const double tl0 = dprof_now();   // larry: a head taking > 300 ms is reported (one 16K prompt's took 7.7 s, abwT60)
     if (!fin_flush(im)) return false;
+    const double tl1 = dprof_now();
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);
     ggml_tensor * lg = nullptr;
     ggml_cgraph * gf = build_head(im, gc, row0, nrows, &lg);
-    const bool ok = im.compute(gf, false);
+    // larry, patch-logitsdiag: queued (allocation inside), stamped, then waited for - the same work as compute(gf, false)
+    const double tlb = dprof_now();
+    auto stamp = [&](int tag, double t) {
+        if (!ds41_dense_ptl_hook) return;
+        std::unique_lock<std::mutex> sl;
+        if (im.sub_mu) sl = std::unique_lock<std::mutex>(*im.sub_mu);
+        ds41_dense_ptl_hook(tag, -1, nrows, t);
+    };
+    stamp(50, tlb);
+    const bool ok = im.compute(gf, false, false, true);
+    const double tlq = dprof_now();
+    stamp(51, tlq);
+    if (ok) ggml_backend_synchronize(im.backend);
+    const double tl2 = dprof_now();
     if (ok) ggml_backend_tensor_get(lg, out, 0, (size_t) nrows * (size_t) im.g.vocab * 4);
     ggml_free(gc);
+    const double tl3 = dprof_now();
+    if (tl3 - tl0 > 300) {
+        size_t fr = 0, tot = 0;
+        if (im.backend) ggml_backend_dev_memory(ggml_backend_get_device(im.backend), &fr, &tot);
+        std::fprintf(stderr, "ds41_dense: slow logits (%d rows): flush %.0f ms, build %.0f, alloc %.0f, queue %.0f, wait %.0f, read %.0f ms; "
+                     "%.2f GiB free\n", nrows, tl1 - tl0, tlb - tl1, im.last_alloc_ms, tlq - tlb - im.last_alloc_ms, tl2 - tlq, tl3 - tl2,
+                     fr / 1073741824.0);
+    }
     return ok;
 }
 

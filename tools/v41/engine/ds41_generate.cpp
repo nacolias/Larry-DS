@@ -183,6 +183,9 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// larry, STRATA_SERVE_KEEP_LEARN (patch-keeplearn2): a kept batch's lowest free VRAM on the dense card (bytes; < 0 = not
+// tracking), sampled at every layer by the batch loops
+static double g_kl_min_free = -1;
 // larry, STRATA_BATCH_TRACE=1: a served prompt's steps, ms since its keep-cache step (btr_reset)
 static double g_btr0 = 0;
 static bool btr_on() { static const bool on = std::getenv("STRATA_BATCH_TRACE") != nullptr; return on; }
@@ -640,6 +643,7 @@ int main(int argc, char ** argv) {
         });
     }
     if (Ds41XeTier::tl_on()) ds41_dense_tl_hook = [](int id) { tl_tier->tl_tag(id); };
+    if (Ds41XeTier::ptl_on()) ds41_dense_ptl_hook = [](int tag, int il, int c0, double t0) { tl_tier->ptl(tag, il, c0, t0); };   // larry, STRATA_GPU_PTL
 #else
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
 #endif
@@ -1213,6 +1217,12 @@ int main(int argc, char ** argv) {
     int pb_cap = PB;
     // STRATA_VRAM_TRACE=1: every allocation-relevant step prints the free VRAM (debugging a shared card)
     const bool vram_trace = std::getenv("STRATA_VRAM_TRACE") != nullptr;
+    auto kl_sample = [&]() {   // larry, patch-keeplearn2: the kept batch's low point
+        if (g_kl_min_free < 0) return;
+        size_t tf = 0, tt = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+        if ((double) tf < g_kl_min_free) g_kl_min_free = (double) tf;
+    };
     auto vram_log = [&](const char * where, int a) {
         if (!vram_trace) return;
         size_t tf = 0, tt = 0;
@@ -1382,7 +1392,13 @@ int main(int argc, char ** argv) {
                         if (!inflight) return true;
                         inflight = false;
                         const double t = now_ms();
+#if defined(DS41_XE)
+                        tier.ptl_host(41, fl, fa);   // larry, STRATA_GPU_PTL: the join's start / end
+#endif
                         const bool ok = tier.run_chunk_wait();
+#if defined(DS41_XE)
+                        tier.ptl_host(42, fl, fa);
+#endif
                         fd_tier += now_ms() - t;
                         ptr("J", fl, fa, fb, t);
                         if (!ok) { ferr = "tier run refused"; return false; }
@@ -1392,7 +1408,13 @@ int main(int argc, char ** argv) {
                     };
                     auto PT = [&](int l, int a0, int a1, bool last) -> bool {
                         const double tt = now_ms();
+#if defined(DS41_XE)
+                        tier.ptl_host(43, l, a0);   // larry, STRATA_GPU_PTL: pass_sync's start / end, the launch (40)
+#endif
                         dense.pass_sync();   // the part's ids / weights / fn are final (the pass ring does not wait)
+#if defined(DS41_XE)
+                        tier.ptl_host(44, l, a0);
+#endif
                         if (dump_col >= a0 && dump_col < a1) {
                             dc_ids[(size_t) l].assign(dense.batch_ids() + (size_t) dump_col * top_k, dense.batch_ids() + (size_t) (dump_col + 1) * top_k);
                             dc_wts[(size_t) l].assign(dense.batch_wts() + (size_t) dump_col * top_k, dense.batch_wts() + (size_t) (dump_col + 1) * top_k);
@@ -1404,6 +1426,9 @@ int main(int argc, char ** argv) {
                                                             fn_dev ? fn_dev + (size_t) a0 * n_embd : nullptr);
                         if (!inflight) { ferr = "tier run refused"; return false; }
                         fl = l; fa = a0; fb = a1;
+#if defined(DS41_XE)
+                        tier.ptl_host(40, l, a0);
+#endif
                         ptr("T", l, a0, a1, tt);
                         return true;
                     };
@@ -1413,6 +1438,7 @@ int main(int argc, char ** argv) {
                     int plo = -1, pmid = -2;
                     for (int l = 0; okp && l < n_layer; ++l) {
                         if (l < 4 || l == n_layer - 1) vram_log("pipelined batch layer", l);
+                        if ((l & 3) == 3 || l == n_layer - 1) kl_sample();   // larry, patch-keeplearn2 (every 4th layer)
                         int lo, mid;
                         split_of(l, lo, mid);
                         if (mid < 0 || lo != plo || mid != pmid || (cut > 0 && l == CL)) okp = PJ();
@@ -1457,6 +1483,7 @@ int main(int argc, char ** argv) {
                 double t0 = now_ms();
                 for (int l = 0; !pipe && l < n_layer; ++l) {
                     if (l < 4) vram_log("batch layer", l);
+                    if ((l & 3) == 3) kl_sample();   // larry, patch-keeplearn2 (every 4th layer)
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state
                     // a phase-A position would leave past layer 20)
@@ -1515,6 +1542,7 @@ int main(int argc, char ** argv) {
                         }
                     }
                 }
+                kl_sample();   // larry, patch-keeplearn2: after the last layer (before the batch's buffers go)
                 tier.prefetch_end();
                 fd_dense += now_ms() - t0;
                 btr("layers / prefetch end");
@@ -1531,6 +1559,10 @@ int main(int argc, char ** argv) {
                     if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
                 btr("logits");
+                if (now_ms() - tl > 300) std::fprintf(stderr, "ds41_generate: the batch's logits took %.0f ms (B %d)\n", now_ms() - tl, B);
+#if defined(DS41_XE)
+                if (Ds41XeTier::ptl_on()) tier.ptl_dump("batch");   // larry, STRATA_GPU_PTL
+#endif
                 c0 += B;
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
@@ -1920,6 +1952,15 @@ int main(int argc, char ** argv) {
             if (Ds41Tier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
                 std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
                              (int) cache_open);
+            // larry, STRATA_SERVE_KEEP_LEARN (patch-keeplearn.py): the last kept batch's dense-card VRAM (bytes) and width
+            static const bool keep_learn = std::getenv("STRATA_SERVE_KEEP_LEARN") && std::atoi(std::getenv("STRATA_SERVE_KEEP_LEARN")) != 0;
+            static double kl_used = 0, kl_free0 = 0;
+            static int kl_B = 0;
+            static int kl_end = 0;   // patch-keeplearn2: the learned turn's end position
+            static const double kl_col = std::getenv("STRATA_SERVE_KEEP_LEARN_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_LEARN_COL_MIB")) : 0.6;
+            static const double kl_margin = std::getenv("STRATA_SERVE_KEEP_LEARN_MARGIN_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_LEARN_MARGIN_GIB")) : 1.5;
+            static bool kl_now = false;
+            kl_now = false;
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41Tier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
@@ -1927,8 +1968,21 @@ int main(int argc, char ** argv) {
                     // (STRATA_SERVE_BATCH_FIXED_GIB / _COL_MIB; the CUDA engine's 4.3 / 0.95 released the whole cache)
                     static const double kfix = std::getenv("STRATA_SERVE_BATCH_FIXED_GIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_FIXED_GIB")) : 4.3;
                     static const double kcol = std::getenv("STRATA_SERVE_BATCH_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_COL_MIB")) : 0.95;
-                    const double need = (kfix * 1073741824.0 + kcol * 1048576.0 * (double) std::min(dh, PB)) +
-                                        a.vram_margin_gib * 1073741824.0;
+                    double need = (kfix * 1073741824.0 + kcol * 1048576.0 * (double) std::min(dh, PB)) +
+                                  a.vram_margin_gib * 1073741824.0;
+                    // larry, STRATA_SERVE_KEEP_LEARN: the last kept batch's own VRAM, plus the columns it did not have
+                    kl_now = false;
+                    if (keep_learn && kl_B > 0 && total <= std::max(kl_end, 16384)) {   // patch-keeplearn2: no deeper
+                        const double nl = kl_used + kl_col * 1048576.0 * (double) std::max(0, std::min(dh, PB) - kl_B) +
+                                          kl_margin * 1073741824.0;
+                        if (nl < need) {
+                            std::fprintf(stderr, "serve: keep-cache learned: the last batch (%d tokens) took %.2f GiB -> %.2f GiB "
+                                         "for this one (calibrated %.2f)\n", kl_B, kl_used / 1073741824.0, nl / 1073741824.0,
+                                         need / 1073741824.0);
+                            need = nl;
+                            kl_now = true;
+                        }
+                    }
                     std::string kerr;
                     const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);
                     if (g >= 0) {
@@ -2013,8 +2067,13 @@ int main(int argc, char ** argv) {
                 static const double fit_fixed = std::getenv("STRATA_SERVE_BATCH_FIXED_GIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_FIXED_GIB")) : 4.3;
                 static const double fit_col = std::getenv("STRATA_SERVE_BATCH_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_COL_MIB")) : 0.95;
                 const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - fit_fixed * 1073741824.0;
-                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (fit_col * 1048576.0)));
+                int fit = (int) std::max<int64_t>(2, (int64_t) (room / (fit_col * 1048576.0)));
+                if (kept && kl_now) {   // larry, STRATA_SERVE_KEEP_LEARN: the width from the same model as the shrink
+                    const double lr = (double) frb - kl_margin * 1073741824.0 - kl_used;   // patch-keeplearn2
+                    fit = (int) std::max<int64_t>(2, (int64_t) kl_B + (int64_t) (lr / (kl_col * 1048576.0)));
+                }
                 pb_cap = std::min(PB, std::max(SB, fit));
+                kl_free0 = (double) frb;
                 if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
                                              frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
                 if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
@@ -2026,9 +2085,25 @@ int main(int argc, char ** argv) {
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             if (!ensure_kv(total + 64)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
+            g_kl_min_free = kept && keep_learn && kl_free0 > 0 ? 1e30 : -1;   // larry, patch-keeplearn2
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
             btr("feed end");
+            if (kept && keep_learn && !mc.cpu_only && kl_free0 > 0) {   // larry, STRATA_SERVE_KEEP_LEARN: what it took
+                size_t fre = 0, tote = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &fre, &tote);
+                const double lo = std::min((double) fre, g_kl_min_free > 0 ? g_kl_min_free : (double) fre);   // patch-keeplearn2
+                const double used = std::max(0.0, kl_free0 - lo);
+                const bool tight = lo < 1.0 * 1073741824.0;
+                std::fprintf(stderr, "serve: keep-cache: the %d-token batch took %.2f GiB (%.2f GiB free at its low point, %.2f at "
+                             "its end%s)\n", std::min(dh, pb_cap), used / 1073741824.0, lo / 1073741824.0, fre / 1073741824.0,
+                             tight ? ": tight - calibrated next" : "");
+                kl_used = used;
+                kl_B = tight ? 0 : std::min(dh, pb_cap);
+                kl_end = total;   // patch-keeplearn2
+            }
+            kl_free0 = 0;
+            g_kl_min_free = -1;   // larry, patch-keeplearn2
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
                 dense.release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)

@@ -83,6 +83,7 @@ struct Ds41DensePaged {
 // larry, STRATA_GPU_TL: called at a decode layer's stage boundaries (0 attention queued, 1 readbacks done, 2 shared
 // expert done, 4 finish done) - the generator points it at the Xe tier's profiling tags
 extern void (*ds41_dense_tl_hook)(int id);
+extern void (*ds41_dense_ptl_hook)(int tag, int il, int col0, double t0);   // larry, STRATA_GPU_PTL: a prompt span queued
 
 class Ds41Dense {
 public:

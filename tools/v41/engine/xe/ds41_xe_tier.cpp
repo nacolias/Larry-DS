@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -367,6 +368,13 @@ struct Ds41XeImpl {
     size_t lt_dev_cap = 0;
     float* lt_x = nullptr;                 ///< pinned: a pipelined call's X read back off the dense card
     size_t lt_x_cap = 0;
+    // larry, STRATA_XE_LT_COMPACT (patch-ltcompact.py): the call's light rows only
+    std::vector<int32_t> lt_slot;          ///< [token]: its compact row, -1
+    int32_t* lt_rows = nullptr;            ///< pinned: compact row -> token (read by card 0's gather / scatter kernels)
+    size_t lt_rows_cap = 0;
+    float* lt_xg = nullptr;                ///< the dense card: the gathered X rows (read back into lt_x)
+    size_t lt_xg_cap = 0;
+    int lt_nrows = -1;                     ///< this call's compact rows (-1: lt_hs is full width)
     int64_t lt_calls = 0, lt_experts = 0, lt_streamed = 0;
     double lt_bytes = 0, lt_q_ms = 0, lt_run_ms = 0, lt_sum_ms = 0, lt_wait_ms = 0;
     float* hsum = nullptr;                 ///< [8][n_embd] host-side sum (pinned: its copy to the dense card is async)
@@ -493,6 +501,7 @@ struct Ds41XeImpl {
         double t_enq = 0;              ///< when its copies went on the queues (STRATA_XE_PROF)
         bool timed = false;
         double t_plan = 0, t_staged = 0;   ///< larry, STRATA_XE_PF_TRACE: planned / last copy submitted (now_ms)
+        bool rec = false;              ///< larry, STRATA_XE_PF_NOBLOCK: its last stager recorded the cards' barriers
         bool traced = false;
     };
     PfSlot pf[2];
@@ -1540,6 +1549,138 @@ bool Ds41XeTier::mv_hook(void* queue, const void* w, int64_t K, int64_t N, int n
 }
 
 bool Ds41XeTier::tl_on() { static const bool on = env_i("STRATA_GPU_TL", 0) != 0; return on; }
+
+// larry, STRATA_GPU_PTL=1 (diagnostic, patch-ptl.py): a prompt batch's GPU timeline.  Ring 0 = the dense queue,
+// 1 + k = card k's tier queue, 9 + k = card k's prefetch copy queue (in-order queues: a ring's flags flip in order),
+// 17 = host-only steps.  A stamp is a one-lane kernel writing its flag; the monitor thread stamps what it sees.
+bool Ds41XeTier::ptl_on() { static const bool on = env_i("STRATA_GPU_PTL", 0) != 0; return on; }
+
+namespace {
+struct PtlRing {   // larry, patch-ptl2: a flag a 64-byte line, written only by the card (the record's sequence number)
+    static constexpr uint32_t kCap = 1u << 14, kStride = 16;
+    uint32_t* flag = nullptr;   // pinned host memory, kCap * kStride; nullptr: the host ring
+    struct Rec { int tag, l, a; double th, td; };
+    std::vector<Rec> rec = std::vector<Rec>(kCap);
+    std::atomic<uint32_t> issued{0}, seen{0};
+    uint32_t done = 0;          // dumped so far
+};
+constexpr int kPtlRings = 18, kPtlHost = 17;
+std::array<std::atomic<PtlRing*>, kPtlRings> g_ptl{};
+std::mutex g_ptl_mu;
+std::thread g_ptl_mon;
+
+void ptl_monitor() {
+    for (;;) {
+        bool any = false;
+        for (auto& ap : g_ptl) {
+            PtlRing* r = ap.load(std::memory_order_acquire);
+            if (!r || !r->flag) continue;
+            volatile const uint32_t* f = r->flag;
+            uint32_t sn = r->seen.load(std::memory_order_relaxed);
+            const uint32_t is = r->issued.load(std::memory_order_acquire);
+            auto got = [&](uint32_t i) { return f[(size_t) (i % PtlRing::kCap) * PtlRing::kStride] == i + 1; };
+            while (sn < is) {
+                if (got(sn)) {
+                    r->rec[sn % PtlRing::kCap].td = now_ms();
+                } else {   // a later record of this in-order queue seen: this one ran before it (time inferred)
+                    uint32_t j = sn + 1;
+                    while (j < is && j < sn + 256 && !got(j)) ++j;
+                    if (j >= is || j >= sn + 256) break;
+                    r->rec[sn % PtlRing::kCap].td = -now_ms();
+                }
+                ++sn;
+                any = true;
+            }
+            r->seen.store(sn, std::memory_order_release);
+        }
+        if (!any) std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
+PtlRing* ptl_ring(int ring, const sycl::context& ctx) {
+    if (ring < 0 || ring >= kPtlRings) return nullptr;
+    PtlRing* r = g_ptl[(size_t) ring].load(std::memory_order_acquire);
+    if (r) return r;
+    std::lock_guard<std::mutex> lk(g_ptl_mu);
+    r = g_ptl[(size_t) ring].load(std::memory_order_acquire);
+    if (r) return r;
+    r = new PtlRing();
+    if (ring != kPtlHost) {
+        r->flag = sycl::malloc_host<uint32_t>((size_t) PtlRing::kCap * PtlRing::kStride, ctx);
+        if (!r->flag) { delete r; return nullptr; }
+        std::memset(r->flag, 0, (size_t) PtlRing::kCap * PtlRing::kStride * sizeof(uint32_t));
+    }
+    g_ptl[(size_t) ring].store(r, std::memory_order_release);
+    if (!g_ptl_mon.joinable()) { g_ptl_mon = std::thread(ptl_monitor); g_ptl_mon.detach(); }
+    return r;
+}
+
+/// a stamp on `q` (the caller holds the submit lock like every enqueue), `th` = when the host began the step
+void ptl_stamp(const sycl::context& ctx, int ring, sycl::queue& q, int tag, int l, int a, double th) {
+    if (!Ds41XeTier::ptl_on()) return;
+    PtlRing* r = ptl_ring(ring, ctx);
+    if (!r) return;
+    const uint32_t i = r->issued.load(std::memory_order_relaxed);
+    if (i - r->done >= PtlRing::kCap) return;   // full until the next dump
+    const uint32_t k = i % PtlRing::kCap;
+    r->rec[k] = {tag, l, a, th, 0.0};
+    if (r->flag) {
+        volatile uint32_t* f = r->flag + (size_t) k * PtlRing::kStride;
+        const uint32_t seq = i + 1;
+        q.single_task([=] { *f = seq; });
+    } else {
+        r->rec[k].td = th;
+    }
+    r->issued.store(i + 1, std::memory_order_release);
+    if (!r->flag) r->seen.store(i + 1, std::memory_order_release);
+}
+}  // namespace
+
+void Ds41XeTier::ptl(int tag, int l, int a, double th) {
+    Ds41XeImpl& im = *im_;
+    if (!ptl_on() || !im.dense_q) return;
+    ptl_stamp(im.ctx, 0, *im.dense_q, tag, l, a, th);
+}
+
+void Ds41XeTier::ptl_host(int tag, int l, int a) {
+    if (!ptl_on()) return;
+    PtlRing* r = ptl_ring(kPtlHost, im_->ctx);
+    if (!r) return;
+    const uint32_t i = r->issued.load(std::memory_order_relaxed);
+    if (i - r->done >= PtlRing::kCap) return;
+    const double t = now_ms();
+    r->rec[i % PtlRing::kCap] = {tag, l, a, t, t};
+    r->issued.store(i + 1, std::memory_order_release);
+    r->seen.store(i + 1, std::memory_order_release);
+}
+
+void Ds41XeTier::ptl_dump(const char* label) {
+    if (!ptl_on()) return;
+    const double t0 = now_ms();
+    for (auto& ap : g_ptl) {   // everything stamped has run or will in a moment (the batch's logits were read)
+        PtlRing* r = ap.load(std::memory_order_acquire);
+        while (r && r->seen.load(std::memory_order_acquire) < r->issued.load(std::memory_order_acquire) && now_ms() - t0 < 200)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const char* dir = std::getenv("STRATA_GPU_PTL_DIR");
+    char path[512];
+    std::snprintf(path, sizeof path, "%s/ptl.%d.tsv", dir ? dir : "/opt/ai/dsv41/logs", (int) getpid());
+    std::FILE* f = std::fopen(path, "a");
+    if (f) std::fprintf(f, "# %s %.3f\n", label ? label : "batch", t0);
+    for (int ring = 0; ring < kPtlRings; ++ring) {
+        PtlRing* r = g_ptl[(size_t) ring].load(std::memory_order_acquire);
+        if (!r) continue;
+        const uint32_t sn = r->seen.load(std::memory_order_acquire);
+        for (uint32_t k = r->done; f && k < sn; ++k) {
+            const PtlRing::Rec& e = r->rec[k % PtlRing::kCap];
+            std::fprintf(f, "%d\t%d\t%d\t%d\t%.3f\t%.3f\n", ring, e.tag, e.l, e.a, e.th, e.td);
+        }
+        r->done = sn;
+        const uint32_t is = r->issued.load(std::memory_order_acquire);
+        if (f && is > sn) std::fprintf(f, "# ring %d: %u records not seen\n", ring, is - sn);
+    }
+    if (f) std::fclose(f);
+}
 
 namespace {
 double tl_now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -3225,6 +3366,7 @@ void pf_plan(Ds41XeImpl& im, int s, int64_t l) {
     const int64_t E = im.g.n_experts;
     ps.layer = l;
     ps.enqueued = false;
+    ps.rec = false;   // larry, STRATA_XE_PF_NOBLOCK
     ps.timed = false;
     ps.t_plan = now_ms();   // larry, STRATA_XE_PF_TRACE
     ps.t_staged = 0;
@@ -3302,9 +3444,31 @@ void pf_stager(Ds41XeImpl& im, int idx) {
             std::memcpy(ps.stage + ps.soff[(size_t) e], im.aptr[(size_t) im.key(l, e)], im.bbytes(l, e));
         }
         if (xe_prof()) { g_bp.st_us += (int64_t) ((now_ms() - ts) * 1000.0); g_bp.st_bytes += (int64_t) im.bbytes(l, e); }
-        std::lock_guard<std::mutex> lk(im.pf_mu);
-        --ps.active;
-        if (ps.active == 0 && ps.next >= E) { ps.staged = 0; ps.t_staged = now_ms(); im.pf_cv.notify_all(); }
+        // larry, STRATA_XE_PF_NOBLOCK (patch-pfnb.py): the stager that queued the slot's last copy records its barriers
+        static const int pf_nb = env_i("STRATA_XE_PF_NOBLOCK", 0);
+        bool last = false;
+        {
+            std::lock_guard<std::mutex> lk(im.pf_mu);
+            --ps.active;
+            last = ps.active == 0 && ps.next >= E;
+            if (last && !(hot && pf_nb)) { ps.staged = 0; ps.t_staged = now_ms(); im.pf_cv.notify_all(); }
+        }
+        if (last && hot && pf_nb) {
+            const double tr = now_ms();
+            {
+                std::lock_guard<PrioMutex> lk(g_submit);
+                for (auto& cp : im.cards)
+                    if (cp->pbuf_cap && cp->pbuf[s]) {
+                        cp->pev[s] = cp->pq.ext_oneapi_submit_barrier();
+                        ptl_stamp(im.ctx, 9 + cp->idx, cp->pq, 30, (int) l, cp->idx, tr);   // larry, STRATA_GPU_PTL
+                    }
+            }
+            std::lock_guard<std::mutex> lk(im.pf_mu);
+            ps.rec = true;
+            ps.staged = 0;
+            ps.t_staged = now_ms();
+            im.pf_cv.notify_all();
+        }
     }
 }
 
@@ -3325,7 +3489,10 @@ void pf_enqueue(Ds41XeImpl& im, int s, bool block) {
     if (hot_on() && !im.pf_rings.empty()) {   // STRATA_XE_HOTRING: the stagers put every copy on the queues already
         std::lock_guard<PrioMutex> lk(g_submit);
         for (auto& cp : im.cards)
-            if (cp->pbuf_cap && cp->pbuf[s]) cp->pev[s] = cp->pq.ext_oneapi_submit_barrier();
+            if (!ps.rec && cp->pbuf_cap && cp->pbuf[s]) {   // larry, PF_NOBLOCK: rec = its last stager recorded them
+                cp->pev[s] = cp->pq.ext_oneapi_submit_barrier();
+                ptl_stamp(im.ctx, 9 + cp->idx, cp->pq, 30, (int) l, cp->idx, ps.t_enq);   // larry, STRATA_GPU_PTL
+            }
         ps.enqueued = true;
         return;
     }
@@ -3607,6 +3774,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             });
         } else if (!(lite && c.dense)) {   // larry, STRATA_XE_DENSE_LITE: the dense card reads x_dev where it is
             c.q.memcpy(c.cX, x_dev ? x_dev : x, (size_t) n * H * 4);   // x_dev: card-to-card from the dense card
+            if (!c.dense) ptl_stamp(im.ctx, 1 + c.idx, c.q, 10, (int) l, n, tq0 > 0 ? tq0 : now_ms());   // larry, STRATA_GPU_PTL
         }
         const double tq1 = prof ? now_ms() : 0;
         c.q.memcpy(c.cW, w, (size_t) n * K * 4);
@@ -3697,9 +3865,14 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         std::vector<int32_t> round_of((size_t) E, 0);
         std::vector<int32_t> ptok;
         std::vector<uint8_t> ftmp;
+        // larry, STRATA_GPU_PTL: this card's ring (card 0's part on the dense queue: ring 0)
+        const int ptl_r = im.dense_q && c.q == *im.dense_q ? 0 : 1 + c.idx;
+        const double ptl_t0 = Ds41XeTier::ptl_on() ? now_ms() : 0;
+        if (c.dense && Ds41XeTier::ptl_on()) { std::lock_guard<PrioMutex> lk(g_submit); ptl_stamp(im.ctx, ptl_r, c.q, 20, (int) l, n, ptl_t0); }
         if (ps && ps->enqueued) {   // the prefetched experts' copies land before any kernel of this call
             std::lock_guard<PrioMutex> lk(g_submit);
             c.q.ext_oneapi_submit_barrier({c.pev[pslot]});
+            ptl_stamp(im.ctx, ptl_r, c.q, 11, (int) l, n, ptl_t0);
         }
         if (ps && ps->enqueued && hot_check_on() && last_call)   // STRATA_XE_HOTRING_CHECK: this card's prefetched experts
             for (int64_t e = 0; e < E; ++e)
@@ -3998,6 +4171,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     std::lock_guard<PrioMutex> lk(g_submit);
                     xe::xe_gather(c.q, Yg, c.cS, c.cW, n, K, (int) H, c.cOUT, out_init);
                     out_init = true;
+                    ptl_stamp(im.ctx, ptl_r, c.q, 12, (int) l, r, now_ms());   // larry, STRATA_GPU_PTL
                 }
                 g_bp.gemm_e += (int64_t) ge.size();
                 if (call_tl) { tl.g = now_ms() - t0; tl.ng += (int64_t) ge.size(); tl.rows += gp; }
@@ -4075,6 +4249,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     std::lock_guard<PrioMutex> lk(g_submit);
                     xe::xe_gather(c.q, Yg, c.cS, c.cW, n, K, (int) H, c.cOUT, out_init);
                     out_init = true;
+                    ptl_stamp(im.ctx, ptl_r, c.q, 12, (int) l, r, now_ms());   // larry, STRATA_GPU_PTL
                 }
                 g_bp.gemm_e += (int64_t) ge.size();
                 if (call_tl) { tl.g = now_ms() - t0; tl.ng += (int64_t) ge.size(); tl.rows += gp; }
@@ -4164,6 +4339,10 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 return true;
             };
             if (!run_jobs(jobs, jslots, true) || !run_jobs(jobs_raw, jslots_raw, false)) return false;
+            if (Ds41XeTier::ptl_on() && !(jobs.empty() && jobs_raw.empty())) {   // larry, STRATA_GPU_PTL
+                std::lock_guard<PrioMutex> lk(g_submit);
+                ptl_stamp(im.ctx, ptl_r, c.q, 13, (int) l, r, now_ms());
+            }
             jobs.insert(jobs.end(), jobs_raw.begin(), jobs_raw.end());
             g_bp.small_j += (int64_t) jobs.size();
             if (!jobs.empty()) lap(g_bp.small_us);
@@ -4201,6 +4380,10 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             } else {
                 c.q.memcpy(cdc->cX2 + (size_t) c.idx * ne, c.cOUT, ne * 4);
             }
+        }
+        if (Ds41XeTier::ptl_on()) {   // larry, STRATA_GPU_PTL
+            std::lock_guard<PrioMutex> lk(g_submit);
+            ptl_stamp(im.ctx, ptl_r, c.q, c.dense ? 21 : 14, (int) l, n, now_ms());
         }
         if (!nowait) c.q.wait();   // larry, STRATA_XE_DENSE_LITE: the combine on this queue waits for the part
         if (call_tl) tl.e = now_ms() - t0;
@@ -4245,24 +4428,70 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 im.lt_hs_cap = im.lt_hs ? NE : 0;
             }
             if (!im.lt_hs) { std::fprintf(stderr, "xe tier: CPU-light sum buffer allocation failed\n"); light_ok = false; }
+            // larry, STRATA_XE_LT_COMPACT: the tokens the light experts serve, a compact row each (first-seen order)
+            static const int lt_compact = env_i("STRATA_XE_LT_COMPACT", 1);
+            int nrows = 0;
+            im.lt_nrows = -1;
+            if (light_ok && lt_compact) {
+                im.lt_slot.assign((size_t) n, -1);
+                for (int32_t e : light)
+                    for (int32_t sk : by_e[(size_t) e]) {
+                        const int t = sk / K;
+                        if (im.lt_slot[(size_t) t] < 0) im.lt_slot[(size_t) t] = nrows++;
+                    }
+                if (im.lt_rows_cap < (size_t) nrows) {
+                    if (im.lt_rows) sycl::free(im.lt_rows, im.ctx);
+                    const size_t cap = std::max<size_t>((size_t) nrows, 1024);
+                    im.lt_rows = sycl::malloc_host<int32_t>(cap, im.ctx);
+                    im.lt_rows_cap = im.lt_rows ? cap : 0;
+                }
+                if (!im.lt_rows) { std::fprintf(stderr, "xe tier: CPU-light row list allocation failed\n"); light_ok = false; }
+                else for (int t = 0; t < n; ++t) if (im.lt_slot[(size_t) t] >= 0) im.lt_rows[im.lt_slot[(size_t) t]] = t;
+            }
+            const bool xl_compact = light_ok && lt_compact && x_dev;
             const float* xl = x;
             if (light_ok && x_dev) {   // a pipelined call: X off the dense card (its host copy is stale)
-                if (im.lt_x_cap < NE) {
+                const size_t xn = xl_compact ? (size_t) nrows * H : NE;
+                if (im.lt_x_cap < xn) {
                     if (im.lt_x) sycl::free(im.lt_x, im.ctx);
-                    im.lt_x = sycl::malloc_host<float>(NE, im.ctx);
-                    im.lt_x_cap = im.lt_x ? NE : 0;
+                    im.lt_x = sycl::malloc_host<float>(xn, im.ctx);
+                    im.lt_x_cap = im.lt_x ? xn : 0;
                 }
-                if (!im.lt_x) { std::fprintf(stderr, "xe tier: CPU-light X buffer allocation failed\n"); light_ok = false; }
+                XeCard& dcx = *im.cards[(size_t) im.dense];
+                if (xl_compact && im.lt_xg_cap < xn) {   // the dense card's gather buffer (grown, never on the decode path)
+                    std::lock_guard<PrioMutex> lk(g_submit);
+                    if (im.lt_xg) { dcx.pq.wait(); sycl::free(im.lt_xg, dcx.pq); }
+                    const size_t cap = std::max<size_t>(xn, (size_t) 256 * H);
+                    im.lt_xg = sycl::malloc_device<float>(cap, dcx.pq);
+                    im.lt_xg_cap = im.lt_xg ? cap : 0;
+                }
+                if (!im.lt_x || (xl_compact && !im.lt_xg)) { std::fprintf(stderr, "xe tier: CPU-light X buffer allocation failed\n"); light_ok = false; }
                 else {
                     sycl::event xev;
                     {
                         std::lock_guard<PrioMutex> lk(g_submit);
-                        xev = im.cards[(size_t) im.dense]->pq.memcpy(im.lt_x, x_dev, NE * 4);
+                        if (xl_compact) {   // larry, STRATA_XE_LT_COMPACT: just the light rows, gathered on the dense card
+                            const int32_t* rr = im.lt_rows;
+                            float* xg = im.lt_xg;
+                            const float* xs = x_dev;
+                            const size_t h4 = (size_t) H / 4;
+                            dcx.pq.parallel_for(sycl::range<1>((size_t) nrows * h4), [=](sycl::id<1> i) {
+                                const size_t j = i[0] / h4, c = i[0] % h4;
+                                reinterpret_cast<sycl::float4*>(xg + j * h4 * 4)[c] =
+                                    reinterpret_cast<const sycl::float4*>(xs + (size_t) rr[j] * h4 * 4)[c];
+                            });
+                            xev = dcx.pq.memcpy(im.lt_x, xg, xn * 4);
+                        } else {
+                            xev = dcx.pq.memcpy(im.lt_x, x_dev, NE * 4);
+                        }
                     }
                     xev.wait();
                     xl = im.lt_x;
                 }
             }
+            auto xrow = [&](int t) -> const float* {   // larry, STRATA_XE_LT_COMPACT
+                return xl_compact ? xl + (size_t) im.lt_slot[(size_t) t] * H : xl + (size_t) t * H;
+            };
             double t_run = 0, t_sum = 0;
             size_t done = 0;
             while (light_ok && done < light.size()) {
@@ -4284,8 +4513,8 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                         uint8_t& hv = im.lt_have[(size_t) t * (1 + nf) + (size_t) (fs + 1)];
                         uint8_t* na = fs < 0 ? nullptr : im.lt_nact.data() + ((size_t) t * nf + (size_t) fs) * cpu::kNativeActBytes;
                         if (!hv) {
-                            if (fs < 0) cpu::act_quant_any(xl + (size_t) t * H, (int) H, im.lt_actq[(size_t) t]);
-                            else cpu::native_quant_act(f, xl + (size_t) t * H, na);
+                            if (fs < 0) cpu::act_quant_any(xrow(t), (int) H, im.lt_actq[(size_t) t]);
+                            else cpu::native_quant_act(f, xrow(t), na);
                             hv = 1;
                         }
                         j.act[si] = &im.lt_actq[(size_t) t];
@@ -4301,18 +4530,20 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             }
             if (light_ok) {   // weighted into the call's rows (routing order within a token: slot k ascending per expert)
                 const double ts = now_ms();
-                std::memset(im.lt_hs, 0, NE * sizeof(float));
+                const bool sc = lt_compact != 0;   // larry, STRATA_XE_LT_COMPACT: a compact row a token
+                std::memset(im.lt_hs, 0, (sc ? (size_t) nrows * H : NE) * sizeof(float));
                 for (size_t i = 0; i < light.size(); ++i) {
                     const std::vector<int32_t>& sl = by_e[(size_t) light[i]];
                     for (size_t si = 0; si < sl.size(); ++si) {
                         const int t = sl[si] / K;
                         const float wt = w[(size_t) sl[si]];
-                        float* o = im.lt_hs + (size_t) t * H;
+                        float* o = im.lt_hs + (size_t) (sc ? im.lt_slot[(size_t) t] : t) * H;
                         const float* p = im.lt_cpart.data() + (i * kMaxJobTok + si) * H;
                         for (int64_t h = 0; h < H; ++h) o[h] += wt * p[h];
                     }
                 }
                 t_sum = now_ms() - ts;
+                if (sc) im.lt_nrows = nrows;
             }
             ++im.lt_calls;
             im.lt_experts += (int64_t) light.size();
@@ -4344,7 +4575,11 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
     if (ps) {   // the layer's last call: the next layer's copies (if not on the queues yet), this slot takes l + 2
         im.pf_used += n_pf;
         if (last_call) {
-            if (im.pf[pslot ^ 1].layer == l + 1) pf_enqueue(im, pslot ^ 1, true);
+            // larry, STRATA_XE_PF_NOBLOCK: with the hot rings the next layer's copies are queued by the stagers (and its
+            // barriers recorded by them); its first call waits for its staging - this call's combine does not
+            static const int pf_nb = env_i("STRATA_XE_PF_NOBLOCK", 0);
+            const bool pf_block = !(pf_nb && hot_on() && !im.pf_rings.empty());
+            if (im.pf[pslot ^ 1].layer == l + 1) pf_enqueue(im, pslot ^ 1, pf_block);
             ps->layer = -1;
             if (l + 2 <= im.pf_last) pf_plan(im, pslot, l + 2);
         }
@@ -4360,9 +4595,14 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         // STRATA_XE_CPU_LIGHT: the pool's sum, read by the combine straight from pinned host memory - a copy in a
         // dense-card buffer (~70 MB after a 6.7K prompt) put DSpark's long prompts under ggml-sycl's fp16 weight-cache
         // floor (3 GB free on card 0): their dense phase +13-20 %
-        const float* cpu_part = light.empty() ? nullptr : im.lt_hs;
+        const float* cpu_part = light.empty() || im.lt_nrows >= 0 ? nullptr : im.lt_hs;   // larry, LT_COMPACT: rows after
         if (cmb > 0) {   // STRATA_XE_COMBINE: every busy card's part is in its slot (its thread waited for the push)
             std::lock_guard<PrioMutex> lk(g_submit);
+            const int ptl_rc = im.dense_q && dc->q == *im.dense_q ? 0 : 1 + dc->idx;   // larry, STRATA_GPU_PTL
+            const double ptl_tc = Ds41XeTier::ptl_on() ? now_ms() : 0;
+            ptl_stamp(im.ctx, ptl_rc, dc->q, 22, (int) l, n, ptl_tc);
+            struct PtlEnd { const sycl::context& cx; int r; sycl::queue& q; int l, n; double t;
+                            ~PtlEnd() { ptl_stamp(cx, r, q, 23, l, n, t); } } ptl_end{im.ctx, ptl_rc, dc->q, (int) l, n, ptl_tc};
             int idx[8] = {};
             const int np = (int) std::min<size_t>(others.size(), 8);
             for (int k = 0; k < np; ++k) idx[k] = others[(size_t) k]->idx;
@@ -4403,6 +4643,17 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 o[i] = s;
             });
         }
+        if (!light.empty() && im.lt_nrows > 0) {   // larry, STRATA_XE_LT_COMPACT: the CPU part's rows (the sum's last add)
+            std::lock_guard<PrioMutex> lk(g_submit);
+            const int32_t* rr = im.lt_rows;
+            const float* cp = im.lt_hs;
+            float* o = (float*) out_dev;
+            const size_t hh = (size_t) H;
+            cev = dc->q.parallel_for(sycl::range<1>((size_t) im.lt_nrows * hh), [=](sycl::id<1> i) {
+                const size_t j = i[0] / hh, h = i[0] % hh;
+                o[(size_t) rr[j] * hh + h] += cp[i[0]];
+            });
+        }
         cev.wait();
     } else {
         bool first = true;
@@ -4413,7 +4664,13 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             else for (size_t i = 0; i < NE; ++i) out_host[i] += c.cOUT_host[i];
         }
         if (first) std::memset(out_host, 0, NE * 4);
-        if (!light.empty()) for (size_t i = 0; i < NE; ++i) out_host[i] += im.lt_hs[i];
+        if (!light.empty() && im.lt_nrows >= 0) {   // larry, STRATA_XE_LT_COMPACT
+            for (int j = 0; j < im.lt_nrows; ++j) {
+                float* o = out_host + (size_t) im.lt_rows[j] * H;
+                const float* p = im.lt_hs + (size_t) j * H;
+                for (int64_t h = 0; h < H; ++h) o[h] += p[h];
+            }
+        } else if (!light.empty()) for (size_t i = 0; i < NE; ++i) out_host[i] += im.lt_hs[i];
     }
     if (const char* dp = std::getenv("STRATA_XE_DUMP_CHUNK")) {   // debug: every chunk call's output (per card too)
         static std::FILE* df = std::fopen(dp, "wb");
@@ -5473,6 +5730,13 @@ void Ds41XeTier::close() {
     if (im.hsum) { im.hsum_ev.wait(); sycl::free(im.hsum, im.ctx); im.hsum = nullptr; }
     if (im.lt_hs) { sycl::free(im.lt_hs, im.ctx); im.lt_hs = nullptr; im.lt_hs_cap = 0; }
     if (im.lt_x) { sycl::free(im.lt_x, im.ctx); im.lt_x = nullptr; im.lt_x_cap = 0; }
+    if (im.lt_rows) { sycl::free(im.lt_rows, im.ctx); im.lt_rows = nullptr; im.lt_rows_cap = 0; }   // larry, LT_COMPACT
+    if (im.lt_xg && im.dense >= 0 && (size_t) im.dense < im.cards.size()) {
+        sycl::queue& q = im.cards[(size_t) im.dense]->pq;
+        q.wait();
+        sycl::free(im.lt_xg, q);
+    }
+    im.lt_xg = nullptr; im.lt_xg_cap = 0;
     if (im.hslots) { for (auto& cp : im.cards) cp->q.wait(); sycl::free(im.hslots, im.ctx); im.hslots = nullptr; }
     if (im.cpu_thr.joinable()) {
         { std::lock_guard<std::mutex> lk(im.cpu_mu); im.cpu_state.store(3, std::memory_order_release); }
