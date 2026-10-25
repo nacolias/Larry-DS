@@ -5770,7 +5770,12 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
     Ds41XeImpl& im = *im_;
     static const int on = env_i("STRATA_XE_PREFETCH", 1);
     if (!on || !im.pf_stage_cap || im.pf_on || last < first) return false;
+    // larry, patch-pfbtrace (STRATA_XE_ALLOC_LOG=1): prefetch_begin's parts
+    static const bool pfb_log = env_i("STRATA_XE_ALLOC_LOG", 0) != 0;
+    const double pfb0 = now_ms();
+    std::string pfb;
     pc_drop(im);   // the promoted experts' VRAM back first (the buffers below are sized from what is free)
+    if (pfb_log) pfb += "pc_drop " + std::to_string((int) (now_ms() - pfb0)) + " ms";
     // the buffers: per expert card two of the largest layer's per-card share, within its free VRAM less a reserve
     // for run_big's own buffers (STRATA_XE_PREFETCH_RESERVE_GIB, 1.3; the xe driver spills an over-commit into host
     // RAM instead of failing, so stay well inside)
@@ -5812,22 +5817,40 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         if (cap < (size_t) im.blob_max) { c.pbuf_cap = 0; continue; }
         // sized to this prompt: a larger region left over would over-commit the card (the xe driver then spills buffers
         // into host RAM: a 16K prompt after an 8K one pushed larry past the watchdog, 2026-10-21 04:30)
-        if (!c.flex || c.flex_cap < 2 * cap || c.flex_cap > 2 * cap + ((size_t) 64 << 20)) {
+        // larry, patch-barstage3: a BAR region stays unless it is > 256 MiB too small or > 160 MiB too large (its CPU
+        // pages cost ~0.25 s a GiB to fault in again); the slots then take what it holds
+        const bool bar_f = c.flex && bar_cpu(c.flex);
+        const size_t f_lo = bar_f ? ((size_t) 256 << 20) : 0, f_hi = (size_t) (bar_f ? 160 : 64) << 20;
+        if (!c.flex || c.flex_cap + f_lo < 2 * cap || c.flex_cap > 2 * cap + f_hi) {
+            const double ta = now_ms();
+            const size_t was = c.flex_cap;
             if (c.flex) { c.q.wait(); local_free(c.q, c.flex); }
             c.flex = card_alloc(c.q, 2 * cap);   // larry, patch-barstage
             c.flex_cap = c.flex ? 2 * cap : 0;
+            if (pfb_log) {
+                char b[160];
+                std::snprintf(b, sizeof b, ", card %d flex %.2f -> %.2f GiB %s %.0f ms", c.idx, was / kGiB, c.flex_cap / kGiB,
+                              c.flex && bar_cpu(c.flex) ? "BAR" : "local", now_ms() - ta);
+                pfb += b;
+            }
             if (!c.flex) { c.pbuf_cap = 0; continue; }
             if (bar_cpu(c.flex)) touch.push_back(&c);
+        } else if (pfb_log) {
+            pfb += ", card " + std::to_string(c.idx) + " flex kept";
         }
+        if (pfb_log && keep_st) pfb += " (stream kept)";
+        const size_t use = std::min(cap, (c.flex_cap / 2) & ~(size_t) 255);   // larry, patch-barstage3
+        if (use < (size_t) im.blob_max) { c.pbuf_cap = 0; continue; }
         c.pbuf[0] = c.flex;
-        c.pbuf[1] = c.flex + cap;
-        c.pbuf_cap = cap;
+        c.pbuf[1] = c.flex + use;
+        c.pbuf_cap = use;
     }
     if (!touch.empty()) {   // larry, patch-barstage2: the new BAR regions' CPU pages, the cards side by side
         std::vector<double> ms(touch.size(), 0.0);
         std::vector<std::thread> th;
         for (size_t i = 0; i < touch.size(); ++i) th.emplace_back([&, i] { ms[i] = bar_touch(touch[i]->flex, touch[i]->flex_cap); });
         for (auto& t : th) t.join();
+        if (pfb_log) pfb += ", fault-in done at " + std::to_string((int) (now_ms() - pfb0)) + " ms";
         static const bool all = env_i("STRATA_XE_ALLOC_LOG", 0) != 0;
         if (all)
             for (size_t i = 0; i < touch.size(); ++i)
@@ -5887,6 +5910,8 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         }
         for (int i = 0; i < ns; ++i) im.pf_thr.emplace_back([&im, i] { pf_stager(im, i); });
     }
+    if (pfb_log)
+        std::fprintf(stderr, "xe prefetch begin: %s; call buffers etc. done at %.0f ms\n", pfb.c_str(), now_ms() - pfb0);
     static bool logged = false;
     if (!logged || xe_prof()) {
         logged = true;
