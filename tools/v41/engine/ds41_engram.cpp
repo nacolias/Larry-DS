@@ -171,6 +171,21 @@ static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & 
     return m ? m->read(buf, n, off) : ::pread(fd, buf, n, (off_t) off);
 }
 
+// larry, STRATA_ENGRAM_DIRECT (patch-engdirect.py): n bytes at off through an O_DIRECT fd - the enclosing 4 KiB
+// pages (a paged group never leaves its page) into this thread's aligned buffer, then the asked range; -1 on failure
+static bool engram_direct_on() {
+    static const bool on = std::getenv("STRATA_ENGRAM_DIRECT") && std::atoi(std::getenv("STRATA_ENGRAM_DIRECT")) != 0;
+    return on;
+}
+static ssize_t dread(int fd, void * buf, size_t n, uint64_t off) {
+    static thread_local uint8_t * pg = nullptr;
+    if (!pg && posix_memalign((void **) &pg, 4096, 8192) != 0) { pg = nullptr; return -1; }
+    const uint64_t a0 = off & ~(uint64_t) 4095, a1 = (off + n + 4095) & ~(uint64_t) 4095;
+    if (a1 - a0 > 8192 || ::pread(fd, pg, (size_t) (a1 - a0), (off_t) a0) != (ssize_t) (a1 - a0)) return -1;
+    std::memcpy(buf, pg + (off - a0), n);
+    return (ssize_t) n;
+}
+
 Ds41Engram::~Ds41Engram() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -180,6 +195,7 @@ Ds41Engram::~Ds41Engram() {
     for (auto & t : workers_) t.join();
     for (auto & t : tables_) {
         if (t.fd_w >= 0) ::close(t.fd_w);
+        if (t.fd_d >= 0) ::close(t.fd_d);
         if (t.fd_s >= 0) ::close(t.fd_s);
     }
 }
@@ -232,6 +248,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             t.fd_w = fd;
             t.rows = (int64_t) prow;
             t.rm_w = raw_map(pp, fd);
+            if (engram_direct_on() && !t.rm_w) t.fd_d = ::open(pp.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);   // larry
             tables_.push_back(t);
             std::fprintf(stderr, "engram: layer %d: paged table %s (a read a row)\n", (int) g.engram_layers[(size_t) e], pp.c_str());
             continue;
@@ -407,6 +424,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
     b->outp.assign(outp, outp + nel);
     const int64_t cols = cols_, dim = dim_, srsz = dim / 32, m = n * cols;
     const bool pool_dq = nthreads_ > 0 && n > 64;   // larry: a prompt batch's cached rows go to the pool
+    // larry, STRATA_ENGRAM_DIRECT: a prompt batch no prefetch read goes around the page cache
+    const bool direct = engram_direct_on() && n > 64 && !(pf_lo_ >= 0 && pos0 >= pf_lo_ && pos0 + n <= pf_hi_);
 
     std::vector<int64_t> ids((size_t) (nel * m));
     for (int64_t e = 0; e < nel; ++e)
@@ -490,7 +509,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
         auto t = std::make_shared<Task>();
         t->n = ng + nc;
         Batch * bp = b.get();
-        t->fn = [this, bp, dim, srsz, g0, ng, c0, c1, kCachedChunk](int64_t a, int64_t c) {
+        t->fn = [this, bp, dim, srsz, g0, ng, c0, c1, kCachedChunk, direct](int64_t a, int64_t c) {
             uint8_t bw[4096 + 512], bs[1024];
             for (int64_t gi = a; gi < c; ++gi) {
                 if (gi >= ng) {   // larry: a chunk of cached rows, dequantized from the cache pool (never evicted)
@@ -515,8 +534,10 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
                 }
                 const ReadGroup & G = bp->groups[(size_t) (g0 + gi)];
                 const Table & T = tables_[(size_t) G.e];
+                const bool dw = direct && T.fd_d >= 0 && G.len_w <= sizeof bw &&
+                                dread(T.fd_d, bw, G.len_w, G.off_w) == (ssize_t) G.len_w;   // larry: else buffered
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
-                    tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
+                    (!dw && tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w) ||
                     (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
@@ -587,6 +608,8 @@ bool Ds41Engram::wait_slot(const std::shared_ptr<Batch> & b, int e, std::string 
 std::shared_ptr<Ds41Engram::Batch> Ds41Engram::prefetch(int64_t pos0, int n, std::string & err) {
     // (a full row cache still gains: the reads warm the block device's page cache for the batch's own preads)
     if (tables_.empty() || n <= 0 || nthreads_ <= 0) return nullptr;
+    pf_lo_ = pos0;   // larry, STRATA_ENGRAM_DIRECT: this batch's reads stay buffered (the prefetch warms its pages)
+    pf_hi_ = pos0 + n;
     auto b = std::make_shared<Batch>();
     b->n = n;
     // hashing / sorting a 16K batch is ~0.1 s: its own thread plans it and waits its reads (hist_ is not written until

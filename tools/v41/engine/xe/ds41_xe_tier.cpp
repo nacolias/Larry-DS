@@ -33,6 +33,8 @@
 #include <thread>
 
 #include <pthread.h>
+#include <sys/mman.h>
+#include <cerrno>
 #include <sched.h>
 #if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
 #include <immintrin.h>
@@ -45,6 +47,9 @@ using xe::XeJob;
 using xe::kMaxJobTok;
 
 namespace {
+
+// larry, STRATA_XE_FN16=2 (patch-fn16k.py): every expert card can read the dense card's memory (peer access on)
+bool g_fn16_peer = true;
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -696,8 +701,18 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
         c->idx = (int) im.cards.size();
         c->gpu = i;
         c->dev = devs[(size_t) i];
-        c->q = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
-        c->pq = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
+        // larry, STRATA_XE_QPRIO (patch-qprio.py): the expert cards' prefetch queue low (1), their call queue high (2)
+        static const int qprio = env_i("STRATA_XE_QPRIO", 0);
+        const bool expert_card = !(dense_dev && devs[(size_t) i] == ddev);
+        namespace qp = sycl::ext::oneapi::property::queue;
+        if (qprio >= 2 && expert_card)
+            c->q = sycl::queue(im.ctx, c->dev, sycl::property_list{sycl::property::queue::in_order(), qp::priority_high()});
+        else
+            c->q = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
+        if (qprio >= 1 && expert_card)
+            c->pq = sycl::queue(im.ctx, c->dev, sycl::property_list{sycl::property::queue::in_order(), qp::priority_low()});
+        else
+            c->pq = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
         c->oq = sycl::queue(im.ctx, c->dev, sycl::property::queue::in_order());
         c->name = c->dev.get_info<sycl::info::device::name>();
         if (dense_dev && c->dev == ddev) {
@@ -708,6 +723,16 @@ bool Ds41XeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41
     }
     if (dense_dev && dense_card < 0) { err = "xe tier: the dense half's card is not among STRATA_XE_DEVICES"; return false; }
     im.dense = dense_card;
+    if (env_i("STRATA_XE_FN16", 0) >= 2 && im.dense >= 0) {   // larry, patch-fn16k.py: the peer reads of FN16's X
+        const sycl::device d0 = im.cards[(size_t) im.dense]->dev;
+        for (auto& cp : im.cards) {
+            if (cp->dense) continue;
+            if (!cp->dev.ext_oneapi_can_access_peer(d0)) { g_fn16_peer = false; continue; }
+            try { cp->dev.ext_oneapi_enable_peer_access(d0); } catch (const std::exception&) {}   // on already: fine
+        }
+        std::fprintf(stderr, "xe tier: STRATA_XE_FN16=2: the expert cards read X by peer loads%s\n",
+                     g_fn16_peer ? "" : " - NO PEER ACCESS: the copy engine reads it");
+    }
 
     // ---- scratch per card
     const int64_t H = geom.n_embd, F = geom.n_ff;
@@ -1000,6 +1025,60 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
         if (start.size() <= nslab) continue;   // keep at least one slab
         im.evict_from[ci] = start[start.size() - nslab];
     }
+    // larry, STRATA_XE_PIN_STREAM (see patch-pinstream.py): the arena's head re-ordered for the pinned budget - the
+    // dense card's predicted cache (the ranked arena's first STRATA_XE_PIN_STREAM_CACHE_GIB, default its seed budget)
+    // below layer L = STRATA_XE_SEED_TAIL_LAYERS, then the next-ranked experts of layers >= L while the budget lasts
+    if (env_i("STRATA_XE_PIN_STREAM", 0) && im.dense >= 0) {
+        const int tail_l = env_i("STRATA_XE_SEED_TAIL_LAYERS", 0);
+        XeCard& dc = *im.cards[(size_t) im.dense];
+        double cgib = env_d("STRATA_XE_PIN_STREAM_CACHE_GIB", 0.0);
+        if (cgib <= 0) {   // dense_budget's caps as the seed will see them (the slot budget is set later, at the seed)
+            cgib = env_d("STRATA_XE_DENSE_GIB", 10.0) + im.dense_bonus_gib;
+            const int64_t fr = dc.free_vram();
+            if (fr > 0) cgib = std::min(cgib, (fr + dc.used) / kGiB - env_d("STRATA_XE_DENSE_RESERVE_GIB", 8.0));
+        }
+        if (tail_l > 0 && tail_l < NL && cgib > 0) {
+            const int64_t cbud = (int64_t) (cgib * kGiB), pbud = (int64_t) (env_d("STRATA_XE_PINNED_GIB", 16.0) * kGiB);
+            std::vector<char> in_cache(rest.size(), 0), taken(rest.size(), 0);
+            int64_t cu = 0;
+            for (size_t i = 0; i < rest.size(); ++i) {   // seed_dense's walk: the next expert that still fits
+                const int64_t b = (int64_t) im.bbytes(rest[i].first, rest[i].second);
+                if (cu + b > cbud) continue;
+                cu += b;
+                in_cache[i] = 1;
+            }
+            std::vector<std::pair<int32_t, int32_t>> ord;
+            ord.reserve(rest.size());
+            int64_t pu = 0, n_lo = 0, n_hi = 0, b_hi = 0, n_kept = 0, b_kept = 0;
+            for (size_t i = 0; i < rest.size(); ++i)
+                if (in_cache[i] && rest[i].first < tail_l) {
+                    ord.push_back(rest[i]);
+                    taken[i] = 1;
+                    pu += (int64_t) im.bbytes(rest[i].first, rest[i].second);
+                    ++n_lo;
+                }
+            const int64_t b_lo = pu;
+            for (size_t i = 0; i < rest.size() && pu < pbud; ++i)
+                if (!in_cache[i] && rest[i].first >= tail_l) {
+                    const int64_t b = (int64_t) im.bbytes(rest[i].first, rest[i].second);
+                    ord.push_back(rest[i]);
+                    taken[i] = 1;
+                    pu += b;
+                    b_hi += b;
+                    ++n_hi;
+                }
+            for (size_t i = 0; i < rest.size(); ++i) {
+                if (taken[i]) continue;
+                if (in_cache[i]) { ++n_kept; b_kept += (int64_t) im.bbytes(rest[i].first, rest[i].second); }
+                ord.push_back(rest[i]);
+            }
+            rest.swap(ord);
+            std::fprintf(stderr, "xe tier: STRATA_XE_PIN_STREAM: the pinned arena = the dense card's cache below layer %d (%lld experts, "
+                         "%.2f GiB), then %lld next-ranked experts of layers %d.. (%.2f GiB); the cache's %lld of layers %d.. "
+                         "(%.2f GiB) pageable (cache predicted %.2f GiB)\n", tail_l, (long long) n_lo, b_lo / kGiB, (long long) n_hi,
+                         tail_l, b_hi / kGiB, (long long) n_kept, tail_l, b_kept / kGiB, cu / kGiB);
+        }
+    }
     // ---- the arena: the rest, in ranked order, up to the RAM budget, in pinned chunks (no blob straddles one)
     const char* aenv = std::getenv("STRATA_XE_ARENA_GIB");
     const double arena_cap_gib = aenv && *aenv ? std::atof(aenv) : 1e9;   // default: every expert not on a card
@@ -1084,6 +1163,10 @@ bool Ds41XeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t
             void* q = nullptr;
             if (posix_memalign(&q, 2u << 20, chunk_size[c]) != 0 || !q) { err = "xe tier: arena allocation failed"; return false; }
             p = (uint8_t*) q;
+            // larry, STRATA_XE_ARENA_THP: 2 MiB pages for the staging's streaming reads (faulted in when the arena fills)
+            static const int arena_thp = env_i("STRATA_XE_ARENA_THP", 0);
+            if (arena_thp && madvise(q, chunk_size[c], MADV_HUGEPAGE) != 0)
+                std::fprintf(stderr, "xe tier: madvise(MADV_HUGEPAGE) on an arena chunk failed (errno %d)\n", errno);
         }
         im.achunks.push_back(p);
     }
@@ -2075,6 +2158,29 @@ __attribute__((target("avx2")))
 void hot_copy(uint8_t* dst, const uint8_t* src, size_t n) {
     size_t i = 0;
 #if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__)
+    // larry, STRATA_XE_HOTCOPY_PF: software prefetch D bytes ahead (across the 4 KiB pages)
+    // larry, STRATA_XE_HOTCOPY_NTA (patch-hotnta.py): the same prefetch with the non-temporal hint
+    static const bool pf_nta = env_i("STRATA_XE_HOTCOPY_NTA", 0) != 0;
+    static const size_t pf_d = (size_t) std::max(0, env_i("STRATA_XE_HOTCOPY_PF", pf_nta ? 1024 : 0));
+    if (pf_d && ((uintptr_t) dst & 31) == 0) {
+        for (; i + 128 <= n; i += 128) {
+            if (i + pf_d < n && pf_nta) {
+                _mm_prefetch((const char*) (src + i + pf_d), _MM_HINT_NTA);
+                _mm_prefetch((const char*) (src + i + pf_d + 64), _MM_HINT_NTA);
+            } else if (i + pf_d < n) {
+                _mm_prefetch((const char*) (src + i + pf_d), _MM_HINT_T0);
+                _mm_prefetch((const char*) (src + i + pf_d + 64), _MM_HINT_T0);
+            }
+            const __m256i a = _mm256_loadu_si256((const __m256i*) (src + i));
+            const __m256i b = _mm256_loadu_si256((const __m256i*) (src + i + 32));
+            const __m256i c = _mm256_loadu_si256((const __m256i*) (src + i + 64));
+            const __m256i d = _mm256_loadu_si256((const __m256i*) (src + i + 96));
+            _mm256_store_si256((__m256i*) (dst + i), a);
+            _mm256_store_si256((__m256i*) (dst + i + 32), b);
+            _mm256_store_si256((__m256i*) (dst + i + 64), c);
+            _mm256_store_si256((__m256i*) (dst + i + 96), d);
+        }
+    }
     if (((uintptr_t) dst & 31) == 0)
         for (; i + 128 <= n; i += 128) {
             const __m256i a = _mm256_loadu_si256((const __m256i*) (src + i));
@@ -2991,29 +3097,79 @@ struct PrioMutex {
 };
 PrioMutex g_submit;
 
+/// larry, STRATA_XE_ZCOPY (patch-zcopy.py): `bytes` (a multiple of 4) of PINNED host memory at `src` to `dst` by a kernel
+/// on `q` - the compute engine reads the host memory (zero-copy); the card's one copy engine stays with the bulk DMA
+bool zcopy_on() { static const bool on = env_i("STRATA_XE_ZCOPY", 0) != 0; return on; }
+sycl::event zc_copy(sycl::queue& q, void* dst, const void* src, size_t bytes) {
+    if (bytes == 0) return {};
+    if (bytes % 16 == 0 && (((uintptr_t) dst | (uintptr_t) src) % 16) == 0) {
+        using v4 = sycl::vec<uint32_t, 4>;
+        const v4* sv = (const v4*) src;
+        v4* dv = (v4*) dst;
+        return q.parallel_for(sycl::range<1>(bytes / 16), [=](sycl::id<1> i) { dv[i] = sv[i]; });
+    }
+    const uint32_t* sv = (const uint32_t*) src;
+    uint32_t* dv = (uint32_t*) dst;
+    return q.parallel_for(sycl::range<1>(bytes / 4), [=](sycl::id<1> i) { dv[i] = sv[i]; });
+}
+/// larry: a small upload from pinned host memory - a kernel (STRATA_XE_ZCOPY) or the queue's memcpy
+sycl::event up_pinned(sycl::queue& q, void* dst, const void* src, size_t bytes) {
+    return zcopy_on() ? zc_copy(q, dst, src, bytes) : q.memcpy(dst, src, bytes);
+}
+
 /// STRATA_XE_HOTRING: `bytes` of host memory at `src` to `dst` on queue `q` in ring chunks: a slot whose last copy is
 /// still running is waited for (outside the submit lock), then filled and its DMA enqueued at once.  `pinned`: the
 /// source is DMA-able as it is (the chunks go straight, in the same order).  Returns the last copy's event.
+// larry, STRATA_XE_HOT_PROF: hot_put's parts in us, summed over threads (slot wait, copy, lock wait, submit), bytes
+std::atomic<int64_t> g_hp_wait{0}, g_hp_copy{0}, g_hp_lock{0}, g_hp_sub{0}, g_hp_bytes{0}, g_hp_pin{0};
+bool hot_prof() { static const bool on = env_i("STRATA_XE_HOT_PROF", 0) != 0; return on; }
 sycl::event hot_put(sycl::queue& q, uint8_t* dst, const uint8_t* src, size_t bytes, bool pinned, uint8_t* ring,
                     std::vector<sycl::event>& ev, int& next) {
     const size_t C = hot_chunk();
+    const bool hp = hot_prof();
+    auto us = [] { return (int64_t) (now_ms() * 1000.0); };
     const int R = hot_slots();
     if ((int) ev.size() != R) { ev.assign((size_t) R, sycl::event()); next = 0; }
     sycl::event last;
     for (size_t off = 0; off < bytes; off += C) {
         const size_t nb = std::min(C, bytes - off);
         if (pinned) {
+            // larry, STRATA_XE_HOT_PINWAIT (patch-hotpinwait.py): the chunk takes a slot (its previous DMA done first)
+            static const bool pin_wait = env_i("STRATA_XE_HOT_PINWAIT", 0) != 0;
+            int pk = -1;
+            if (pin_wait) {
+                pk = next;
+                next = (pk + 1) % R;
+                const int64_t tw = hp ? us() : 0;
+                ev[(size_t) pk].wait();
+                if (hp) g_hp_wait += us() - tw;
+            }
+            const int64_t t0 = hp ? us() : 0;
             std::lock_guard<PrioMutex> lk(g_submit);
+            const int64_t t1 = hp ? us() : 0;
             last = q.memcpy(dst + off, src + off, nb);
+            if (pk >= 0) ev[(size_t) pk] = last;
+            if (hp) { g_hp_lock += t1 - t0; g_hp_sub += us() - t1; g_hp_pin += (int64_t) nb; }
             continue;
         }
         const int k = next;
         next = (k + 1) % R;
+        // larry, STRATA_XE_HOTRING_SPIN: poll first (a blocking wait may sleep and wake late, every chunk)
+        static const int hot_spin = env_i("STRATA_XE_HOTRING_SPIN", 0);
+        if (hot_spin > 0)
+            for (int it = 0; it < (1 << 20) && ev[(size_t) k].get_info<sycl::info::event::command_execution_status>() !=
+                                                   sycl::info::event_command_status::complete; ++it)
+                for (int sp = 0; sp < hot_spin; ++sp) _mm_pause();
+        const int64_t t0 = hp ? us() : 0;
         ev[(size_t) k].wait();   // a default-constructed event is complete
+        const int64_t t1 = hp ? us() : 0;
         uint8_t* slot = ring + (size_t) k * C;
         hot_copy(slot, src + off, nb);
+        const int64_t t2 = hp ? us() : 0;
         std::lock_guard<PrioMutex> lk(g_submit);
+        const int64_t t3 = hp ? us() : 0;
         last = ev[(size_t) k] = q.memcpy(dst + off, slot, nb);
+        if (hp) { g_hp_wait += t1 - t0; g_hp_copy += t2 - t1; g_hp_lock += t3 - t2; g_hp_sub += us() - t3; g_hp_bytes += (int64_t) nb; }
     }
     return last;
 }
@@ -3361,7 +3517,8 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
     // the expert cards copy half the bytes and widen it
     static const int fn16_env = env_i("STRATA_XE_FN16", 0);
     XeCard* cd16 = im.dense >= 0 ? im.cards[(size_t) im.dense].get() : nullptr;
-    bool fn16 = fn16_env && x_dev && cd16 && n > kMaxJobTok && ((size_t) n * H) % 4 == 0;
+    static const int fn16_min = env_i("STRATA_XE_FN16_MIN", 0);   // larry, patch-fn16min.py: the big calls only
+    bool fn16 = fn16_env && x_dev && cd16 && n > kMaxJobTok && n >= fn16_min && ((size_t) n * H) % 4 == 0;
     sycl::event fn16_ev;
     // larry, patch-fn16q: on the dense card's own tier queue (DENSE_INLINE swapped its queue for the dense half's)
     sycl::queue& q16 = qswap.c && qswap.saved ? *qswap.saved : (cd16 ? cd16->q : im.cards[0]->q);
@@ -3427,7 +3584,20 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             c.cjobs_cap = BJ;
         }
         const double tq0 = prof ? now_ms() : 0;
-        if (fn16 && !c.dense && grow_loc(c.cXh, c.cXh_cap, (size_t) n * H, c.q)) {   // larry, STRATA_XE_FN16
+        if (fn16 && !c.dense && fn16_env >= 2 && g_fn16_peer && (((size_t) n * H) % 8) == 0) {
+            // larry, STRATA_XE_FN16=2 (patch-fn16k.py): the dense card's fp16 X by peer loads, widened here - the copy
+            // engine stays with the prefetch's staging
+            const sycl::half* hs = im.fn16;
+            float* xd = c.cX;
+            c.q.submit([&](sycl::handler& h) {
+                h.depends_on(fn16_ev);
+                h.parallel_for(sycl::range<1>((size_t) n * H / 8), [=](sycl::id<1> i) {
+                    const sycl::vec<sycl::half, 8> v = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(hs + 8 * i[0]);
+                    *reinterpret_cast<sycl::float4*>(xd + 8 * i[0]) = sycl::float4((float) v[0], (float) v[1], (float) v[2], (float) v[3]);
+                    *reinterpret_cast<sycl::float4*>(xd + 8 * i[0] + 4) = sycl::float4((float) v[4], (float) v[5], (float) v[6], (float) v[7]);
+                });
+            });
+        } else if (fn16 && !c.dense && grow_loc(c.cXh, c.cXh_cap, (size_t) n * H, c.q)) {   // larry, STRATA_XE_FN16
             c.q.memcpy(c.cXh, im.fn16, (size_t) n * H * 2, fn16_ev);   // card-to-card from the dense card, this card's queue
             const sycl::half* hs = c.cXh;
             float* xd = c.cX;
@@ -3482,9 +3652,13 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         // combine on this queue after it).  The staging: GEMM rows + slot map, each job batch's jobs + slot map.
         const float* xin = lite && c.dense ? x_dev : c.cX;
         const bool nowait = lite && c.dense && cmb > 0 && streamed[(size_t) c.idx].empty() && kept[(size_t) c.idx].empty();
+        // larry, STRATA_XE_ZCOPY (patch-zcopy.py): an expert card's uploads from pinned per-call copies too (no host waits);
+        // single-round calls only (the staging below is sized for one pass: nothing streamed in the call)
+        const bool zc = zcopy_on() && !c.dense && streamed[(size_t) c.idx].empty() && kept[(size_t) c.idx].empty();
+        const bool stg = nowait || zc;
         size_t nw_off = 0;
         bool out_init = !gather_init;   // larry, STRATA_XE_GATHER_INIT: false = the next gather writes the part
-        if (nowait) {
+        if (stg) {
             int64_t rg = 0, njp = 0, njr = 0;
             for (int32_t e : cl[(size_t) c.idx]) {
                 const int64_t m = (int64_t) by_e[(size_t) e].size();
@@ -3507,6 +3681,10 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         auto nw_take = [&](size_t bytes) -> uint8_t* {
             uint8_t* p = c.nw_host + nw_off;
             nw_off += (bytes + 255) & ~(size_t) 255;
+            if (zc && nw_off > c.nw_cap) {   // larry, patch-zcopy: never past the staging (sized for one pass)
+                std::fprintf(stderr, "xe tier: card %d: per-call staging overrun (%zu of %zu bytes) - aborting\n", c.idx, nw_off, c.nw_cap);
+                std::abort();
+            }
             return p;
         };
         std::vector<int32_t> S((size_t) n * K);
@@ -3683,7 +3861,8 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 std::vector<int64_t> ebase(NG + 1, 0);
                 for (size_t i = 0; i < NG; ++i) ebase[i + 1] = ebase[i] + (((int64_t) by_e[(size_t) ge[i]].size() + 7) & ~(int64_t) 7);
                 const int64_t R = ebase[NG];
-                const int64_t RB = std::max<int64_t>(1024, (gm_max + 7) & ~(int64_t) 7);
+                static const int64_t rb_env = std::max(256, env_i("STRATA_XE_GEMM_RB", 1024));   // larry, patch-gemmrb.py
+                const int64_t RB = std::max<int64_t>(rb_env, (gm_max + 7) & ~(int64_t) 7);
                 int64_t ntile_all = 0;
                 for (size_t i = 0; i < NG; ++i) {
                     const int64_t mt = ((int64_t) by_e[(size_t) ge[i]].size() + 127) / 128;
@@ -3728,14 +3907,14 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     for (size_t j = 0; j < v.size(); ++j) { S[(size_t) v[j]] = (int32_t) (ebase[i] + (int64_t) j); ptok[(size_t) (ebase[i] + (int64_t) j)] = v[j] / K; }
                     for (int64_t j = (int64_t) v.size(); j < ebase[i + 1] - ebase[i]; ++j) ptok[(size_t) (ebase[i] + j)] = v[0] / K;   // padding rows: any token
                 }
-                if (nowait) {   // larry, STRATA_XE_DENSE_LITE: from pinned per-call copies, no wait
+                if (stg) {   // larry, STRATA_XE_DENSE_LITE / STRATA_XE_ZCOPY: from pinned per-call copies, no wait
                     uint8_t* hp = nw_take(ptok.size() * 4);
                     uint8_t* hs = nw_take(S.size() * 4);
                     std::memcpy(hp, ptok.data(), ptok.size() * 4);
                     std::memcpy(hs, S.data(), S.size() * 4);
                     std::lock_guard<PrioMutex> lk(g_submit);
-                    c.q.memcpy(dtok, hp, ptok.size() * 4);
-                    c.q.memcpy(c.cS, hs, S.size() * 4);
+                    up_pinned(c.q, dtok, hp, ptok.size() * 4);
+                    up_pinned(c.q, c.cS, hs, S.size() * 4);
                 } else {
                     {
                         std::lock_guard<PrioMutex> lk(g_submit);
@@ -3795,11 +3974,11 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                                 ++jo;
                             }
                         }
-                        c.q.memcpy(djobs + jo0, hjobs + jo0, (jo - jo0) * sizeof(xe::DqJob));
+                        up_pinned(c.q, djobs + jo0, hjobs + jo0, (jo - jo0) * sizeof(xe::DqJob));   // larry, ZCOPY
                         for (int g = 0; g < 6; ++g) {
                             if (gt[g].empty()) continue;
                             std::memcpy(htiles + to, gt[g].data(), gt[g].size() * sizeof(xe::DqTile));
-                            c.q.memcpy(dtiles + to, htiles + to, gt[g].size() * sizeof(xe::DqTile));
+                            up_pinned(c.q, dtiles + to, htiles + to, gt[g].size() * sizeof(xe::DqTile));   // larry, ZCOPY
                             xe::xe_dqgemm(c.q, gtype[g], (g & 1) != 0, djobs + jo0, dtiles + to, (int) gt[g].size(), (int) (phase == 0 ? H : F));
                             to += gt[g].size();
                         }
@@ -3843,14 +4022,14 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 std::fill(S.begin(), S.end(), -1);
                 for (int32_t e : ge)
                     for (int32_t sk : by_e[(size_t) e]) { S[(size_t) sk] = (int32_t) ptok.size(); ptok.push_back(sk / K); }
-                if (nowait) {   // larry, STRATA_XE_DENSE_LITE: from pinned per-call copies, no wait
+                if (stg) {   // larry, STRATA_XE_DENSE_LITE / STRATA_XE_ZCOPY: from pinned per-call copies, no wait
                     uint8_t* hp = nw_take(ptok.size() * 4);
                     uint8_t* hs = nw_take(S.size() * 4);
                     std::memcpy(hp, ptok.data(), ptok.size() * 4);
                     std::memcpy(hs, S.data(), S.size() * 4);
                     std::lock_guard<PrioMutex> lk(g_submit);
-                    c.q.memcpy(dtok, hp, ptok.size() * 4);
-                    c.q.memcpy(c.cS, hs, S.size() * 4);
+                    up_pinned(c.q, dtok, hp, ptok.size() * 4);
+                    up_pinned(c.q, c.cS, hs, S.size() * 4);
                 } else {
                     {
                         std::lock_guard<PrioMutex> lk(g_submit);
@@ -3916,9 +4095,9 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             auto run_jobs = [&](const std::vector<XeJob>& js, const std::vector<std::vector<int32_t>>& jss, bool pl) -> bool {
                 for (size_t b0 = 0; b0 < js.size(); b0 += (size_t) BJ) {
                     const size_t nb = std::min<size_t>((size_t) BJ, js.size() - b0);
-                    if (!nowait) c.q.wait();   // cjobs / cjobs_host and cS are read by the previous batch / the GEMM gather
+                    if (!stg) c.q.wait();   // cjobs / cjobs_host and cS are read by the previous batch / the GEMM gather
                     if (call_tl) { if (tl.b == 0) tl.b = now_ms() - t0; tl.nj += (int64_t) nb; }
-                    XeJob* jh = nowait ? (XeJob*) nw_take(nb * sizeof(XeJob)) : c.cjobs_host;   // larry, STRATA_XE_DENSE_LITE
+                    XeJob* jh = stg ? (XeJob*) nw_take(nb * sizeof(XeJob)) : c.cjobs_host;   // larry, STRATA_XE_DENSE_LITE / ZCOPY
                     std::fill(S.begin(), S.end(), -1);
                     int max_nt = 1;
                     for (size_t q = 0; q < nb; ++q) {
@@ -3952,16 +4131,21 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                     }
                     {
                         const int32_t* sp = S.data();
-                        if (nowait) {   // larry, STRATA_XE_DENSE_LITE: a per-batch pinned copy, no wait
+                        if (stg) {   // larry, STRATA_XE_DENSE_LITE / ZCOPY: a per-batch pinned copy, no wait
                             uint8_t* hs = nw_take(S.size() * 4);
                             std::memcpy(hs, S.data(), S.size() * 4);
                             sp = (const int32_t*) hs;
                         }
                         std::lock_guard<PrioMutex> lk(g_submit);
-                        c.q.memcpy(c.cjobs, jh, nb * sizeof(XeJob));
-                        c.q.memcpy(c.cS, sp, S.size() * 4);
+                        if (stg) {   // pinned sources: a kernel under ZCOPY
+                            up_pinned(c.q, c.cjobs, jh, nb * sizeof(XeJob));
+                            up_pinned(c.q, c.cS, sp, S.size() * 4);
+                        } else {
+                            c.q.memcpy(c.cjobs, jh, nb * sizeof(XeJob));
+                            c.q.memcpy(c.cS, sp, S.size() * 4);
+                        }
                     }
-                    if (!nowait) c.q.wait();
+                    if (!stg) c.q.wait();
                     std::lock_guard<PrioMutex> lk(g_submit);
                     const double tlk = prof ? now_ms() : 0;
                     struct LkT { bool on; double t0; ~LkT() { if (on) g_bp.lk_jobs_us += (int64_t) ((now_ms() - t0) * 1000.0); } } lkt{prof, tlk};
@@ -5151,6 +5335,13 @@ bool Ds41XeTier::run_chunk_wait() {
 void Ds41XeTier::prefetch_end() {
     Ds41XeImpl& im = *im_;
     if (!im.pf_on) return;
+    if (hot_prof()) {   // larry, STRATA_XE_HOT_PROF
+        std::fprintf(stderr, "xe hot prof: %.2f GB through the rings (%.2f GB pinned direct): slot waits %.0f ms, copies %.0f ms (%.1f GB/s a "
+                     "thread), lock waits %.0f ms, submits %.0f ms (thread-ms)\n", g_hp_bytes.load() / 1e9, g_hp_pin.load() / 1e9,
+                     g_hp_wait.load() / 1e3, g_hp_copy.load() / 1e3, g_hp_copy.load() > 0 ? g_hp_bytes.load() / 1e3 / g_hp_copy.load() : 0.0,
+                     g_hp_lock.load() / 1e3, g_hp_sub.load() / 1e3);
+        g_hp_wait = 0; g_hp_copy = 0; g_hp_lock = 0; g_hp_sub = 0; g_hp_bytes = 0; g_hp_pin = 0;
+    }
     {
         std::unique_lock<std::mutex> lk(im.pf_mu);   // a staging still running reads the arena into its stage
         im.pf_cv.wait(lk, [&] { return im.pf[0].staged == 0 && im.pf[1].staged == 0; });

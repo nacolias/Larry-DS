@@ -5855,7 +5855,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
  
-@@ -6066,6 +6864,29 @@
+@@ -6066,6 +6864,43 @@
              continue;
          }
  
@@ -5881,11 +5881,25 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +                i = last;
 +                continue;
 +            }
++            // larry, GGML_SYCL_LARRY_CPYKERNEL (patch-glue3.py): the single copy on the compute engine, 16 bytes a work-item
++            static const int cpy_kernel = ggml_sycl_get_env("GGML_SYCL_LARRY_CPYKERNEL", 0);
++            if (cpy_kernel) {
++                const size_t nb = (size_t) seg[0].n * 4;
++                if (nb % 16 == 0 && (uintptr_t) seg[0].s % 16 == 0 && (uintptr_t) seg[0].d % 16 == 0) {
++                    using v4 = sycl::vec<uint32_t, 4>;
++                    const v4 * vs = (const v4 *) seg[0].s;
++                    v4 * vd = (v4 *) seg[0].d;
++                    sycl_ctx->stream()->parallel_for(sycl::range<1>(nb / 16), [=](sycl::id<1> k) { vd[k] = vs[k]; });
++                } else {
++                    larry_cpy_batch(*sycl_ctx->stream(), seg, 1);
++                }
++                continue;
++            }
 +        }
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6940,64 @@
+@@ -6119,6 +6954,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -5950,7 +5964,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +7108,12 @@
+@@ -6229,6 +7122,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -5963,7 +5977,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7354,39 @@
+@@ -6469,6 +7368,39 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

@@ -76,6 +76,7 @@ public:
 
 private:
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
+                   int fd_d = -1;   // larry, STRATA_ENGRAM_DIRECT: a paged table's O_DIRECT fd
                    std::shared_ptr<RawMap> rm_w, rm_s;
                    // larry: a paged table (engram-L<layer>.epg on fd_w / rm_w): after a header page, 15 rows of 272 bytes
                    // (dim weight bytes, dim / 32 scale bytes, zeros) a 4 KiB page - a row's scales follow its weights
@@ -99,6 +100,7 @@ private:
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
     uint64_t bytes_ = 0, reads_ = 0;
+    int64_t pf_lo_ = -1, pf_hi_ = -1;   // larry, STRATA_ENGRAM_DIRECT: the positions the last prefetch read
 
     // A fixed I/O pool with a FIFO job queue.  The row reads are latency-bound, so the pool is the disk's queue depth:
     // a batch fires one job per worker and the jobs steal chunks of the batch's read list.  Backs both rows()/start()

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <map>
 #include <set>
 #include <thread>
@@ -269,6 +270,9 @@ struct Ds41Dense::Impl {
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
     std::shared_ptr<Ds41Engram::Batch> eng_pf;   // larry: the next batch's rows being read into the row cache
+    // larry, STRATA_ENG_START_ASYNC: a prompt batch's start_into on a thread (eng_batch is set when it is resolved)
+    std::future<std::shared_ptr<Ds41Engram::Batch>> eng_fut;
+    std::string eng_fut_err;
     // larry, STRATA_ENG_PIN: a prompt batch's rows in pinned memory, uploaded async (eng_pin_n floats a slot; 0 = the
     // batch used eng_rows), the next batch's writes waiting on eng_pin_ev
     ggml_backend_buffer_t eng_pin_buf = nullptr;
@@ -1969,7 +1973,16 @@ static bool eng_pin_ok(Ds41Dense::Impl & im, size_t per) {
 // slots, all n columns) go up in one shot, so the second Engram layer (14) is a plain read of the same tensor.
 // larry: the Engram batch's host-side wait alone for one slot (no device work: a pipelined span runs it before the
 // submit lock)
+// larry, STRATA_ENG_START_ASYNC: the started batch from its thread (a no-op without one)
+static bool eng_resolve(Ds41Dense::Impl & im) {
+    if (!im.eng_fut.valid()) return true;
+    im.eng_batch = im.eng_fut.get();
+    if (!im.eng_batch) { im.err = im.eng_fut_err.empty() ? "engram: batch start failed" : im.eng_fut_err; im.eng_pin_n = 0; return false; }
+    return true;
+}
+
 static bool engram_wait_host(Ds41Dense::Impl & im, int slot) {
+    if (!eng_resolve(im)) return false;
     if (!im.eng_batch || slot < 0 || slot > 1 || im.eng_waited[slot] || im.eng_up[slot]) return true;
     const double t0 = g_eng_prof ? eng_now() : 0;
     if (!im.engram.wait_slot(im.eng_batch, slot, im.err)) { im.eng_batch.reset(); return false; }
@@ -1981,6 +1994,7 @@ static bool engram_wait_host(Ds41Dense::Impl & im, int slot) {
 // Slot `slot`'s rows up (after its reads): pinned rows async in queue order (before this layer's graph); the batch is
 // done - and the next batch's prefetch launched - once every slot is up
 static bool engram_ready(Ds41Dense::Impl & im, int slot) {
+    if (!eng_resolve(im)) return false;
     if (!im.eng_batch) return true;
     const int ns = std::min(im.engram.n_slots(), 2);
     if (slot < 0 || slot >= ns || im.eng_up[slot]) return true;
@@ -2176,7 +2190,15 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         } else {
             const double t0 = g_eng_prof ? eng_now() : 0;
             const size_t per = (size_t) n * (size_t) (im.EC * im.ED);
-            if (eng_pin_ok(im, per)) {
+            static const bool start_async = env_on("STRATA_ENG_START_ASYNC", false);
+            if (start_async && eng_pin_ok(im, per)) {   // larry: the start on a thread, resolved at the first wait
+                im.eng_pin_n = per;
+                im.eng_fut_err.clear();
+                float * const * outp = im.eng_pin;
+                im.eng_fut = std::async(std::launch::async, [&im, pos0, n, outp]() {
+                    return im.engram.start_into(pos0, n, outp, im.eng_fut_err);
+                });
+            } else if (eng_pin_ok(im, per)) {
                 im.eng_batch = im.engram.start_into(pos0, n, im.eng_pin, im.err);
                 im.eng_pin_n = im.eng_batch ? per : 0;
             } else {
@@ -2184,7 +2206,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             }
             if (g_eng_prof) { eng_t_start = eng_now() - t0; eng_t_wait = eng_t_wait1 = 0; eng_t_n = n; }
             for (int e = 0; e < 2; ++e) im.eng_waited[e] = im.eng_up[e] = false;
-            if (!im.eng_batch) return false;
+            if (!im.eng_batch && !im.eng_fut.valid()) return false;
         }
     }
     if (im.up_async) ggml_backend_event_record(im.up_ev, im.backend);   // the staging buffer's reuse waits for it
@@ -2259,7 +2281,7 @@ void Ds41Dense::engram_prefetch(const int * tids, int n, int pos0) {
     // inputs rewrite them)
     im.eng_pf_tids.assign(tids, tids + n);
     im.eng_pf_pos0 = pos0;
-    if (!im.eng_batch) eng_pf_launch(im);
+    if (!im.eng_batch && !im.eng_fut.valid()) eng_pf_launch(im);   // larry: not under a batch still starting
 }
 
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
