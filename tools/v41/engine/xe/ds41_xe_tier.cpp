@@ -76,6 +76,14 @@ constexpr size_t kSlab = (size_t) 1 << 30;       ///< device expert storage is b
 /// peer in the context, and on larry (card pairs behind ACS redirect) that costs ~1 GiB of host RAM per GiB once the
 /// peers hold memory: the expert cards' 3 x 28 GiB of slabs +13.8 GiB of driver-held RAM, the dense card's 1 GiB seed
 /// slabs 60-600 ms and +1 GiB each (bench/dqb/alloc_probe3.cpp; natively: +28 MiB, 0 ms).
+/// larry, STRATA_ADDR_LOG=1: a line per device allocation / free (diagnostic)
+inline bool addr_log_on() { static const bool on = std::getenv("STRATA_ADDR_LOG") != nullptr; return on; }
+inline void addr_log(const char* what, sycl::queue& q, const void* p, size_t bytes) {
+    if (!addr_log_on()) return;
+    std::string pci = "?";
+    try { pci = q.get_device().get_info<sycl::ext::intel::info::device::pci_address>(); } catch (...) {}
+    std::fprintf(stderr, "addr: %s %s %p +0x%zx\n", what, pci.c_str(), p, bytes);
+}
 inline bool local_alloc_on() { static const bool on = std::getenv("STRATA_XE_LOCAL_ALLOC") == nullptr || std::atoi(std::getenv("STRATA_XE_LOCAL_ALLOC")) != 0; return on; }
 inline uint8_t* local_alloc(sycl::queue& q, size_t bytes) {
     if (!local_alloc_on()) return sycl::malloc_device<uint8_t>(bytes, q);
@@ -87,10 +95,12 @@ inline uint8_t* local_alloc(sycl::queue& q, size_t bytes) {
     // resident on this card now: such memory is otherwise committed at first touch (the free-VRAM query does not see
     // it, and a card out of VRAM then fails the touching command - no spill into host RAM as UR / UMF memory does)
     if (zeContextMakeMemoryResident(zc, zd, p, bytes) != ZE_RESULT_SUCCESS) { zeMemFree(zc, p); return nullptr; }
+    addr_log("tier local alloc", q, p, bytes);
     return (uint8_t*) p;
 }
 inline void local_free(sycl::queue& q, void* p) {
     if (!p) return;
+    addr_log("tier local free", q, p, 0);
     if (!local_alloc_on()) { sycl::free(p, q); return; }
     zeMemFree(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context()), p);
 }
@@ -814,14 +824,18 @@ int64_t evict_slabs(Ds41XeImpl& im, XeCard& c, int64_t need) {
     int64_t n = 0, bytes = 0;
     while (c.free_vram() < need && c.slabs.size() > 1 && set.size() > from) {
         uint8_t* last = c.slabs.back();
-        size_t k = set.size();   // the slab's experts: a suffix of set
-        while (k > 0) {
-            const auto& le = set[k - 1];
-            const uint8_t* p = im.dptr[(size_t) im.key(le.first, le.second)];
-            if (p < last || p >= last + kSlab) break;
-            --k;
-        }
-        if (k < from) break;     // the slab holds experts that are not evictable
+        // larry, patch-pcrace: the slab's experts wherever they are in the set (not only its suffix) - moved to its end
+        auto in_slab = [&](const std::pair<int32_t, int32_t>& le) {
+            const size_t key = (size_t) im.key(le.first, le.second);
+            const uint8_t* p = im.dptr[key];
+            return im.card_of[key] == (int8_t) c.idx && p >= last && p < last + kSlab;
+        };
+        bool fixed_in = false;
+        for (size_t i = 0; i < from && i < set.size(); ++i) fixed_in = fixed_in || in_slab(set[i]);
+        if (fixed_in) break;     // the slab holds experts that are not evictable
+        const size_t k = (size_t) (std::stable_partition(set.begin() + (std::ptrdiff_t) from, set.end(),
+                                                         [&](const std::pair<int32_t, int32_t>& le) { return !in_slab(le); }) -
+                                   set.begin());
         // their host copies first, from the model file (pageable; the arena's own blobs stay where they are)
         std::vector<std::pair<int32_t, int32_t>> list(set.begin() + (std::ptrdiff_t) k, set.end());
         std::vector<size_t> off(list.size());
@@ -1210,6 +1224,8 @@ int64_t seed_dense(Ds41XeImpl& im, XeCard& c, const std::vector<std::pair<int32_
         if (le.first < 0 || le.first >= im.g.n_layers || le.second < 0 || le.second >= im.g.n_experts) continue;
         const size_t key = (size_t) im.key(le.first, le.second);
         if (im.card_of[key] >= 0 || !im.aptr[key]) continue;
+        // larry, patch-pcrace: not an expert a promotion holds (queued / filling / done): its completion would move it
+        if (key < im.pc_where.size() && im.pc_where[key] != -1) continue;
         const size_t b = im.bbytes(le.first, le.second);
         if (c.used + (int64_t) b > c.budget) continue;
         const double ta = now_ms();
@@ -1281,19 +1297,31 @@ int64_t Ds41XeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     int64_t released = 0;
     while (c.free_vram() < need_bytes && !c.slabs.empty()) {
         uint8_t* last = c.slabs.back();
-        while (!im.dense_set.empty()) {   // the slab's experts: a suffix of dense_set (slabs fill in seeding order)
-            const auto& le = im.dense_set.back();
+        // larry, patch-pcrace: EVERY cached expert in the slab goes - not just dense_set's suffix (an entry a late
+        // promotion had moved stopped that walk, and the slab was freed under live experts: card-0 CAT errors) - and
+        // entries no longer on this card leave the list
+        size_t w = 0;
+        for (size_t i = 0; i < im.dense_set.size(); ++i) {
+            const auto le = im.dense_set[i];
             const size_t key = (size_t) im.key(le.first, le.second);
+            if (im.card_of[key] != (int8_t) c.idx) {   // stale: on another card / in the arena since
+                c.used -= (int64_t) im.bbytes(le.first, le.second);
+                --c.n_experts;
+                continue;
+            }
             const uint8_t* p = im.dptr[key];
-            if (p < last || p >= last + kSlab) break;
-            im.card_of[key] = -1;
-            im.dptr[key] = nullptr;
-            rt_put(im, key);
-            c.used -= (int64_t) im.bbytes(le.first, le.second);
-            --c.n_experts;
-            im.dense_set.pop_back();
-            ++released;
+            if (p >= last && p < last + kSlab) {
+                im.card_of[key] = -1;
+                im.dptr[key] = nullptr;
+                rt_put(im, key);
+                c.used -= (int64_t) im.bbytes(le.first, le.second);
+                --c.n_experts;
+                ++released;
+                continue;
+            }
+            im.dense_set[w++] = le;
         }
+        im.dense_set.resize(w);
         local_free(c.q, last);
         c.slabs.pop_back();
         c.slab_used = kSlab;   // the slabs left are full: the next expert opens a new one
@@ -2228,6 +2256,9 @@ void pc_poll(Ds41XeImpl& im, bool push) {
                 im.pc_where[(size_t) j.key] = -1;
                 std::fprintf(stderr, "xe tier: promotion of layer %lld expert %lld on card %d: slot differs from a fresh repack\n",
                              (long long) l, (long long) e, c.idx);
+            } else if (im.card_of[(size_t) j.key] >= 0) {   // larry, patch-pcrace: placed meanwhile - it stays there
+                c.pc_key[(size_t) j.slot] = -1;
+                im.pc_where[(size_t) j.key] = -1;
             } else {
                 im.card_of[(size_t) j.key] = (int8_t) c.idx;
                 im.dptr[(size_t) j.key] = slot;
@@ -2880,9 +2911,10 @@ namespace {
 template <class T>
 bool grow_dev(T*& p, size_t& cap, size_t need, sycl::queue& q) {
     if (cap >= need) return true;
-    if (p) { q.wait(); sycl::free(p, q); }
+    if (p) { q.wait(); addr_log("tier usm free", q, p, 0); sycl::free(p, q); }
     p = sycl::malloc_device<T>(need, q);
     cap = p ? need : 0;
+    if (p) addr_log("tier usm alloc", q, p, need * sizeof(T));
     return p != nullptr;
 }
 template <class T>

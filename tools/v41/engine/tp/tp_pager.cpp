@@ -13,6 +13,26 @@
 #include <cstring>
 #include <thread>
 
+// larry, STRATA_ADDR_LOG=1: the Level Zero virtual-memory calls of this file, logged (diagnostic)
+static inline bool vm_log_on() { static const bool on = std::getenv("STRATA_ADDR_LOG") != nullptr; return on; }
+static inline ze_result_t larry_vm_map(ze_context_handle_t c, const void * p, size_t n, ze_physical_mem_handle_t h, size_t o,
+                                       ze_memory_access_attribute_t a) {
+    if (vm_log_on()) std::fprintf(stderr, "addr: vmm map %p +0x%zx\n", p, n);
+    return (zeVirtualMemMap)(c, p, n, h, o, a);
+}
+static inline ze_result_t larry_vm_unmap(ze_context_handle_t c, const void * p, size_t n) {
+    if (vm_log_on()) std::fprintf(stderr, "addr: vmm unmap %p +0x%zx\n", p, n);
+    return (zeVirtualMemUnmap)(c, p, n);
+}
+static inline ze_result_t larry_vm_reserve(ze_context_handle_t c, const void * s, size_t n, void ** pp) {
+    const ze_result_t r = (zeVirtualMemReserve)(c, s, n, pp);
+    if (vm_log_on()) std::fprintf(stderr, "addr: vmm reserve %p +0x%zx\n", pp ? *pp : nullptr, n);
+    return r;
+}
+#define zeVirtualMemMap larry_vm_map
+#define zeVirtualMemUnmap larry_vm_unmap
+#define zeVirtualMemReserve larry_vm_reserve
+
 namespace strata::v41 {
 
 namespace {
