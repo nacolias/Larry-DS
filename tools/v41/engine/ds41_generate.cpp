@@ -1285,10 +1285,15 @@ int main(int argc, char ** argv) {
                 static const bool pipe_env = !(std::getenv("STRATA_PIPE") && std::getenv("STRATA_PIPE")[0] == '0');
                 float * prdev = routed_host ? nullptr : dense.routed_dev();
                 // the parts of layer l's columns: [lo, mid) and [mid, B), one part [lo, B) (mid < 0), or none (lo >= B)
+                // larry, STRATA_PIPE_MIN_PART (patch-pipesplit.py, default 0): a layer splits only when both parts have at
+                // least this many columns (a 530-token batch went 512 + 18: an 18-token tier call a layer, ~12-16 ms each)
+                static const int pipe_min_part = std::getenv("STRATA_PIPE_MIN_PART") ? std::atoi(std::getenv("STRATA_PIPE_MIN_PART")) : 0;
+                bool kept_whole = false;   // larry, patch-pipesplit2: a layer STRATA_PIPE_MIN_PART kept in one part
                 auto split_of = [&](int l, int & lo, int & mid) {
                     lo = (cut > 0 && l >= CL) ? cut : 0;
                     mid = lo + (int) std::lround((double) (B - lo) / 2.0 / SB) * SB;
                     if (mid <= lo || mid >= B) mid = -1;
+                    if (mid > 0 && (mid - lo < pipe_min_part || B - mid < pipe_min_part)) { mid = -1; kept_whole = true; }
                 };
                 bool pipe = pipe_env && prdev && !mc.cpu_only, any2 = false;
                 int part_max = 0;   // the largest tier call of the batch
@@ -1299,7 +1304,7 @@ int main(int argc, char ** argv) {
                     if (mid > 0) { any2 = true; part_max = std::max(part_max, std::max(mid - lo, B - mid)); }
                     else part_max = std::max(part_max, B - lo);
                 }
-                pipe = pipe && any2 && part_max <= piece;
+                pipe = pipe && (any2 || kept_whole) && part_max <= piece;   // larry, patch-pipesplit2: kept_whole too
                 // larry: the tier streams each layer's arena experts onto the expert cards ahead of its run_chunk_dev
                 // (layers whose tier call has >= STRATA_XE_PREFETCH_MIN tokens; with enc-skip the layers from CL on
                 // run only the phase-B columns: STRATA_XE_PREFETCH_MIN_B, default the same).  Below its threshold a
