@@ -257,6 +257,10 @@ struct Ds41Dense::Impl {
     std::vector<std::array<int64_t, 3>> span_cap;   // [sub-batch][ratio] pass_cap
     HostRows<float> host_fn, host_wts;
     std::vector<float> host_logits, host_emb;
+    // larry, STRATA_EMB_PIN: the token table pinned (f16 rows), a batch's rows staged pinned, i_emb f16
+    bool emb_f16 = false;
+    HostRows<uint16_t> emb_pin, emb_stage;
+    ggml_backend_event_t emb_ev = nullptr;
     HostRows<int32_t> host_ids;
     const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap
     std::vector<std::vector<float>> eng_rows;
@@ -1530,7 +1534,9 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * e = ggml_reshape_3d(gc, b.cols2(im.i_emb, D, n, col0), D, 1, n);
+    ggml_tensor * e = b.cols2(im.i_emb, D, n, col0);
+    if (e->type != GGML_TYPE_F32) e = ggml_cast(gc, e, GGML_TYPE_F32);   // larry, STRATA_EMB_PIN: f16 rows (exact)
+    e = ggml_reshape_3d(gc, e, D, 1, n);
     ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_repeat_4d(gc, e, D, HC, n, 1), b.cols3(im.x_state, D, HC, n, col0)));
     ggml_tensor * one = ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, 1, n), 1.0f);
     ggml_tensor * oh = ggml_pad(gc, one, (int) (HC - 1), 0, 0, 0);                            // [1, 0, 0, 0] per token
@@ -1620,7 +1626,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.cand = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.CB, NC);
     for (auto & L : im.ly)
         if (L.idx_src) { L.sel = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.ITOP, NC); L.selm = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.ITOP, NC); }
-    im.i_emb = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    im.i_emb = ggml_new_tensor_2d(c, im.emb_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, D, NC);   // larry, STRATA_EMB_PIN: f16
     im.i_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, NC);
     im.i_widx = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.SWA * NC);
     im.span_memo_pos0 = -1;   // new tensors: nothing uploaded yet
@@ -1727,6 +1733,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.cpu = ggml_backend_is_cpu(im.backend);
     im.sycl = !im.cpu && std::strstr(ggml_backend_name(im.backend), "SYCL") != nullptr;
     if (!load_weights(im, err)) return false;
+    im.emb_f16 = im.sycl && env_on("STRATA_EMB_PIN", false);   // larry (before the columns are allocated)
     // larry, STRATA_ENGRAM_THREADS: the row reader's pool = its queue depth over both NVMe drives (a cold 16K prompt
     // batch is ~1.4M random reads: at 32 a cold 31.6K prompt waited ~4 s for its first batch's rows)
     const int eng_threads = std::getenv("STRATA_ENGRAM_THREADS") ? std::atoi(std::getenv("STRATA_ENGRAM_THREADS")) : cfg.engram_threads;
@@ -1851,6 +1858,26 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
 #endif
     im.host_ids.resize((size_t) (im.NU * NCM), pin_be);
     im.host_wts.resize((size_t) (im.NU * NCM), pin_be);
+    if (im.emb_f16) {   // larry, STRATA_EMB_PIN: the table into pinned memory once (8 threads), the batch stage
+        const double te0 = dprof_now();
+        const size_t nrow = (size_t) im.g.vocab, rowb = (size_t) D * 2;
+        im.emb_pin.resize(nrow * (size_t) D, pin_be);
+        im.emb_stage.resize((size_t) D * (size_t) NCM, pin_be);
+        if (im.emb_pin.buf && im.emb_stage.buf) {
+            std::vector<std::thread> th;
+            for (int k = 0; k < 8; ++k)
+                th.emplace_back([&, k] {
+                    const size_t r0 = nrow * (size_t) k / 8, r1 = nrow * (size_t) (k + 1) / 8;
+                    std::memcpy(im.emb_pin.data() + r0 * (size_t) D, im.embd + r0 * rowb, (r1 - r0) * rowb);
+                });
+            for (auto & t : th) t.join();
+            std::fprintf(stderr, "ds41_dense: token table pinned (%.2f GB, %.0f ms), batch embeddings staged f16\n",
+                         nrow * rowb / 1e9, dprof_now() - te0);
+        } else {
+            std::fprintf(stderr, "ds41_dense: STRATA_EMB_PIN: pinned allocation failed - embeddings from the mmap (f16)\n");
+            im.emb_pin.resize(0);
+        }
+    }
 #ifdef DS41_HAVE_CUDA
     // pinned too: attn_router reads fn / ids / wts back with three async copies and one sync (truly async only from
     // pinned memory)
@@ -2016,13 +2043,45 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
     // embeddings (F16 rows on the mmap)
+    const double tu0 = g_dprof_on && n > 64 ? dprof_now() : 0;   // larry, STRATA_DENSE_PROF: the batch inputs' parts
+    for (int t = 0; t < n; ++t)
+        if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
+    double tu1 = 0;
+    if (im.emb_f16) {   // larry, STRATA_EMB_PIN: the rows as they are (f16), from the pinned table
+        const uint16_t * tab = !im.emb_pin.empty() ? im.emb_pin.data() : reinterpret_cast<const uint16_t *>(im.embd);
+        const size_t rowb = (size_t) D * 2;
+        if (n > 8 && (size_t) n * (size_t) D <= im.emb_stage.size()) {
+            if (im.emb_ev) ggml_backend_event_synchronize(im.emb_ev);   // the previous batch's upload has read the stage
+            else im.emb_ev = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+            uint16_t * st = im.emb_stage.data();
+            const int nt = n >= 1024 ? 8 : 1;
+            std::vector<std::thread> th;
+            auto part = [&](int k) {
+                for (int t = n * k / nt; t < n * (k + 1) / nt; ++t)
+                    std::memcpy(st + (size_t) t * (size_t) D, tab + (size_t) tids[t] * (size_t) D, rowb);
+            };
+            for (int k = 1; k < nt; ++k) th.emplace_back(part, k);
+            part(0);
+            for (auto & t : th) t.join();
+            tu1 = g_dprof_on && n > 64 ? dprof_now() : 0;
+            ggml_backend_tensor_set_async(im.backend, im.i_emb, st, 0, (size_t) n * rowb);
+            if (im.emb_ev) ggml_backend_event_record(im.emb_ev, im.backend);
+            else ggml_backend_synchronize(im.backend);
+        } else {
+            std::vector<uint16_t> rows((size_t) n * (size_t) D);
+            for (int t = 0; t < n; ++t) std::memcpy(rows.data() + (size_t) t * (size_t) D, tab + (size_t) tids[t] * (size_t) D, rowb);
+            im.up_set(im.i_emb, rows.data(), rows.size() * 2);
+        }
+    } else {
     im.host_emb.resize((size_t) (D * n));
     for (int t = 0; t < n; ++t) {
-        if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
         const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
         for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
     }
+    tu1 = g_dprof_on && n > 64 ? dprof_now() : 0;
     im.up_set(im.i_emb, im.host_emb.data(), im.host_emb.size() * 4);
+    }
+    const double tu2 = g_dprof_on && n > 64 ? dprof_now() : 0;
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
     im.up_set(im.i_pos, pos.data(), (size_t) n * 4);
@@ -2083,6 +2142,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         im.up_set(im.i_sidx, si.data(), si.size() * 4);
         im.up_set(im.i_sslot, ss.data(), ss.size() * 4);
     }
+    const double tu3 = g_dprof_on && n > 64 ? dprof_now() : 0;
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
     // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
     // embeddings upload, the init graph and the layers below it.  A tiny batch (decode) still runs on the caller.
@@ -2128,6 +2188,9 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         }
     }
     if (im.up_async) ggml_backend_event_record(im.up_ev, im.backend);   // the staging buffer's reuse waits for it
+    if (g_dprof_on && n > 64)
+        std::fprintf(stderr, "dense prof: begin_batch inputs (%d tokens): embeddings %.1f ms, their upload %.1f ms, maps %.1f ms, "
+                     "Engram start %.1f ms\n", n, tu1 - tu0, tu2 - tu1, tu3 - tu2, dprof_now() - tu3);
     return true;
 }
 
@@ -2212,6 +2275,7 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
         span_pass_caps(im, pos0 + (int) (i * im.S), (int) std::min<int64_t>(im.S, (int64_t) B - i * im.S),
                        im.span_cap[(size_t) i].data());
     // the batch's initial state, one sub-batch at a time (x_state = embd, pre_state = one-hot)
+    const double ti0 = g_dprof_on ? dprof_now() : 0;
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
     for (int64_t i = 0; i < nb; ++i) {
         const int64_t c0 = i * im.S, sn = std::min<int64_t>(im.S, (int64_t) B - c0);
@@ -2222,6 +2286,7 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
         ggml_free(gc);
         if (!ok) { im.err = "batch init failed"; return false; }
     }
+    if (g_dprof_on) std::fprintf(stderr, "dense prof: begin_batch init graphs (%lld spans) %.1f ms\n", (long long) nb, dprof_now() - ti0);
     return true;
 }
 
