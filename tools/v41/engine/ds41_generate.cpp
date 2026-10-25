@@ -1895,7 +1895,11 @@ int main(int argc, char ** argv) {
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41Tier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
-                    const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
+                    // larry, patch-keepneed: the batch's VRAM from the calibration the batch width below uses
+                    // (STRATA_SERVE_BATCH_FIXED_GIB / _COL_MIB; the CUDA engine's 4.3 / 0.95 released the whole cache)
+                    static const double kfix = std::getenv("STRATA_SERVE_BATCH_FIXED_GIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_FIXED_GIB")) : 4.3;
+                    static const double kcol = std::getenv("STRATA_SERVE_BATCH_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_COL_MIB")) : 0.95;
+                    const double need = (kfix * 1073741824.0 + kcol * 1048576.0 * (double) std::min(dh, PB)) +
                                         a.vram_margin_gib * 1073741824.0;
                     std::string kerr;
                     const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);

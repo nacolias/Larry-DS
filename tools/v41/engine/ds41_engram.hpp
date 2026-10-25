@@ -8,6 +8,8 @@
 // ascending and the unique rows whose bytes share a 4 KiB page are one pread - which on the exFAT volume the tables live
 // on is the difference between a random walk the driver serializes (~23K reads/s) and a sorted one it does not (~135K/s).
 // rows_reference() keeps the original per-row random reader so the bench can diff the two byte for byte.
+// larry: a table may instead be an engram-L<layer>.epg (bench/engram/engram_epg.py: 4 KiB pages of 15 rows of weights +
+// scales) - one read a row - found in the same dirs before the shards.
 #pragma once
 
 #include "ds41_geometry.hpp"
@@ -56,6 +58,9 @@ public:
     /// outp[e] null: slot e is not read (engine1 reads the first Engram layer's rows before the second's).
     std::shared_ptr<Batch> start_into(int64_t pos0, int n, float * const * outp, std::string & err);
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
+    /// larry: wait for slot e's rows of a start()ed batch only (each slot's reads are their own task, queued in slot
+    /// order: the first Engram layer's rows are read first).  wait() still waits for the whole batch.
+    bool wait_slot(const std::shared_ptr<Batch> & b, int e, std::string & err);
     /// larry: warm the row cache with the rows of positions pos0..pos0+n-1 (every slot; their tokens set): the reads
     /// queue on the I/O pool behind any batch already started, fill the cache (until full; past that they still warm
     /// the page cache) and write no output.  Null when nothing is left to read.  wait() it before the next start().
@@ -71,7 +76,13 @@ public:
 
 private:
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
-                   std::shared_ptr<RawMap> rm_w, rm_s; };
+                   std::shared_ptr<RawMap> rm_w, rm_s;
+                   // larry: a paged table (engram-L<layer>.epg on fd_w / rm_w): after a header page, 15 rows of 272 bytes
+                   // (dim weight bytes, dim / 32 scale bytes, zeros) a 4 KiB page - a row's scales follow its weights
+                   bool paged = false;
+                   uint64_t row_off(uint64_t r, uint64_t dim) const { return paged ? 4096 * (1 + r / 15) + 272 * (r % 15) : off_w + r * dim; }
+                   uint64_t page_of(uint64_t r, uint64_t dim) const { return paged ? r / 15 : (off_w + r * dim) >> 12; }
+                   uint64_t stride(uint64_t dim) const { return paged ? 272 : dim; } };
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;

@@ -474,6 +474,8 @@ struct Ds41XeImpl {
         int64_t n = 0, bytes = 0;      ///< experts / bytes planned
         double t_enq = 0;              ///< when its copies went on the queues (STRATA_XE_PROF)
         bool timed = false;
+        double t_plan = 0, t_staged = 0;   ///< larry, STRATA_XE_PF_TRACE: planned / last copy submitted (now_ms)
+        bool traced = false;
     };
     PfSlot pf[2];
     size_t pf_stage_cap = 0;           ///< bytes per slot's stage
@@ -2891,6 +2893,17 @@ bool grow_host(T*& p, size_t& cap, size_t need, sycl::queue& q) {
     cap = p ? need : 0;
     return p != nullptr;
 }
+/// larry: the card's stream buffer, card-local (local_alloc) and grown by half its size at least (to `cap`; whole 32 MiB)
+bool grow_stream(XeCard& c, size_t need, size_t cap) {
+    if (c.stream_bytes >= need) return true;
+    const size_t step = (size_t) 32 << 20;
+    size_t want = std::max(need, c.stream_bytes + c.stream_bytes / 2);
+    want = std::min((want + step - 1) / step * step, std::max(need, cap));
+    if (c.stream) { c.q.wait(); local_free(c.q, c.stream); c.stream = nullptr; c.stream_bytes = 0; }
+    c.stream = local_alloc(c.q, want);
+    c.stream_bytes = c.stream ? want : 0;
+    return c.stream != nullptr;
+}
 
 /// The Level Zero driver (NEO 26.35) deadlocks when several host threads enqueue to different devices at once while
 /// one of them copies from PAGEABLE host memory (seen 2026-10-19: three appendUSMMemcpy and one appendKernelLaunch
@@ -2988,6 +3001,9 @@ void pf_plan(Ds41XeImpl& im, int s, int64_t l) {
     ps.layer = l;
     ps.enqueued = false;
     ps.timed = false;
+    ps.t_plan = now_ms();   // larry, STRATA_XE_PF_TRACE
+    ps.t_staged = 0;
+    ps.traced = false;
     ps.card.assign((size_t) E, -1);
     ps.off.assign((size_t) E, 0);
     ps.soff.assign((size_t) E, SIZE_MAX);
@@ -3063,7 +3079,7 @@ void pf_stager(Ds41XeImpl& im, int idx) {
         if (xe_prof()) { g_bp.st_us += (int64_t) ((now_ms() - ts) * 1000.0); g_bp.st_bytes += (int64_t) im.bbytes(l, e); }
         std::lock_guard<std::mutex> lk(im.pf_mu);
         --ps.active;
-        if (ps.active == 0 && ps.next >= E) { ps.staged = 0; im.pf_cv.notify_all(); }
+        if (ps.active == 0 && ps.next >= E) { ps.staged = 0; ps.t_staged = now_ms(); im.pf_cv.notify_all(); }
     }
 }
 
@@ -3146,7 +3162,22 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
     int pslot = -1;
     if (im.pf_on) {
         for (int s2 = 0; s2 < 2; ++s2) if (im.pf[s2].layer == l) { pslot = s2; ps = &im.pf[s2]; }
+        // larry, STRATA_XE_PF_TRACE: the slot's timeline at its first call (the host waits for its DMAs here)
+        static const bool pf_trace = env_i("STRATA_XE_PF_TRACE", 0) != 0;
+        const double t_call = now_ms();
+        const double t_st0 = ps ? ps->t_staged : 0;
         if (ps) pf_enqueue(im, pslot, true);
+        if (ps && pf_trace && !ps->traced) {
+            ps->traced = true;
+            const double t_enq_done = now_ms();
+            for (auto& cp : im.cards) if (cp->pbuf_cap && cp->pbuf[pslot]) cp->pev[pslot].wait();
+            const double t_dma = now_ms();
+            const double tst = ps->t_staged > 0 ? ps->t_staged : t_enq_done;
+            std::fprintf(stderr, "pf trace: layer %lld (call n %d): planned %.0f ms before, staged %s%.0f ms, enqueue wait %.0f ms, "
+                         "DMAs done +%.0f ms; %.2f GB, %lld experts\n", (long long) l, n, t_call - ps->t_plan,
+                         t_st0 > 0 ? "-" : "+", t_st0 > 0 ? t_call - t_st0 : tst - t_call, t_enq_done - t_call, t_dma - t_call,
+                         ps->bytes / 1e9, (long long) ps->n);
+        }
         if (ps && prof && !ps->timed) {   // the layer's copies: done how long after their enqueue (this waits for them)
             ps->timed = true;
             const double tw = now_ms();
@@ -3233,7 +3264,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         const size_t sneed = std::min<size_t>(stream_cap, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1));
         // with the prefetch on, a regrowth goes straight to the cap (planned into the prefetch's reserve)
         const size_t sreq = !kept[(size_t) c.idx].empty() ? c.stream_bytes : im.pf_on && sneed > c.stream_bytes ? stream_cap : sneed;
-        if (!grow_dev(c.stream, c.stream_bytes, sreq, c.q)) {
+        if (!grow_stream(c, sreq, stream_cap)) {
             std::fprintf(stderr, "xe tier: card %d: stream buffer allocation failed (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
             return false;
         }
@@ -4753,7 +4784,7 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
         if (c.dense) continue;
-        if (c.stream) { c.q.wait(); sycl::free(c.stream, c.q); c.stream = nullptr; c.stream_bytes = 0; }   // regrown on demand
+        if (c.stream) { c.q.wait(); local_free(c.q, c.stream); c.stream = nullptr; c.stream_bytes = 0; }   // regrown on demand
         c.st_layer = -1;
         const int64_t have = (int64_t) (c.cX_cap + c.cOUT_cap) * 4 + (int64_t) c.cS_cap * 8 + (int64_t) c.gscratch_cap +
                              (c.cjobs_cap ? BJ * kMaxJobTok * (F + H) * 4 : 0) + (int64_t) c.cxq_rows * H * 2;
@@ -4780,7 +4811,7 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         XeCard& c = *cp;
         if (c.dense || !c.pbuf_cap) continue;
         const size_t sb = (size_t) (env_d("STRATA_XE_PREFETCH_STREAM_GIB", 0.25) * kGiB) & ~(size_t) 255;
-        if (!grow_dev(c.stream, c.stream_bytes, sb, c.q) || !grow_dev(c.cX, c.cX_cap, (size_t) nc * H, c.q) ||
+        if (!grow_stream(c, sb, sb) || !grow_dev(c.cX, c.cX_cap, (size_t) nc * H, c.q) ||
             !grow_dev(c.cOUT, c.cOUT_cap, (size_t) nc * H, c.q))
             std::fprintf(stderr, "xe prefetch: card %d: call buffers not pre-allocated (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
         if (c.cS_cap < (size_t) nc * K) {
@@ -4978,7 +5009,8 @@ void Ds41XeTier::close() {
         if (c.flex) { c.q.wait(); local_free(c.q, c.flex); }
         c.flex = nullptr;
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
-        fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY); fr(c.stream);
+        fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY);
+        local_free(c.q, c.stream);   // larry: card-local (grow_stream)
         fr(c.gscratch); fr(c.cX2); fr(c.cX2h); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
         fr(c.hring); fr(c.hchk);
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }

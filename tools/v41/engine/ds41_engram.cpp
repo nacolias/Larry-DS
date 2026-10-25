@@ -202,8 +202,41 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
         index = slurp(d + "/model.safetensors.index.json");
         if (!index.empty()) break;
     }
-    if (index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs"; return false; }
     for (int64_t e = 0; e < nel; ++e) {
+        // larry: a paged copy of the table (engram-L<layer>.epg) in any of the dirs first
+        std::string pp;
+        for (const auto & d : dirs) {
+            const std::string cand = d + "/engram-L" + std::to_string(g.engram_layers[(size_t) e]) + ".epg";
+            if (exists(cand)) { pp = cand; break; }
+        }
+        if (!pp.empty()) {
+            const int fd = ::open(pp.c_str(), O_RDONLY);
+            if (fd < 0) { err = "engram: cannot open " + pp; return false; }
+            uint8_t hd[40] = {};
+            uint64_t prow = 0;
+            uint32_t f[6] = {};   // row bytes, rows a page, weight bytes, scale bytes, page bytes, layer
+            struct stat st;
+            const bool okh = ::pread(fd, hd, sizeof hd, 0) == (ssize_t) sizeof hd && ::fstat(fd, &st) == 0;
+            std::memcpy(&prow, hd + 8, 8);
+            std::memcpy(f, hd + 16, sizeof f);
+            if (!okh || std::memcmp(hd, "EPG1\0\0\0\0", 8) != 0 || prow != (uint64_t) g.engram_rows[(size_t) e] || f[0] != 272 ||
+                f[1] != 15 || f[2] != (uint32_t) dim_ || f[3] != (uint32_t) (dim_ / 32) || f[4] != 4096 ||
+                f[5] != (uint32_t) g.engram_layers[(size_t) e] || (uint64_t) st.st_size != 4096ull * (1 + (prow + 14) / 15)) {
+                ::close(fd);
+                err = "engram: " + pp + " is not a paged table of this model's layer " + std::to_string(g.engram_layers[(size_t) e]);
+                return false;
+            }
+            ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            Table t;
+            t.paged = true;
+            t.fd_w = fd;
+            t.rows = (int64_t) prow;
+            t.rm_w = raw_map(pp, fd);
+            tables_.push_back(t);
+            std::fprintf(stderr, "engram: layer %d: paged table %s (a read a row)\n", (int) g.engram_layers[(size_t) e], pp.c_str());
+            continue;
+        }
+        if (index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs"; return false; }
         const std::string base = "layers." + std::to_string(g.engram_layers[(size_t) e]) + ".engram.embed.";
         Table t;
         for (int k = 0; k < 2; ++k) {
@@ -284,8 +317,10 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
             const Table & T = tables_[(size_t) e];
             const int64_t r = ids[(size_t) j];
             if (r < 0 || r >= T.rows ||
-                ::pread(T.fd_w, w, (size_t) dim_, (off_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
-                ::pread(T.fd_s, s, (size_t) (dim_ / 32), (off_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
+                ::pread(T.fd_w, w, (size_t) dim_, (off_t) T.row_off((uint64_t) r, (uint64_t) dim_)) != (ssize_t) dim_ ||
+                ::pread(T.paged ? T.fd_w : T.fd_s, s, (size_t) (dim_ / 32),
+                        (off_t) (T.paged ? T.row_off((uint64_t) r, (uint64_t) dim_) + (uint64_t) dim_
+                                         : T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
                 bad.fetch_add(1);
                 continue;
             }
@@ -320,7 +355,8 @@ struct Ds41Engram::Batch {
     std::vector<std::vector<uint32_t>> uniq;          // [layer] sorted unique row ids
     std::vector<std::vector<uint64_t>> packed;         // [layer] sorted (row_id << 32 | slot): no-comparator sort
     std::vector<std::vector<uint32_t>> run_begin;     // [layer] unique row -> first sorted position (size u+1)
-    std::shared_ptr<Task> read_task;
+    std::shared_ptr<Task> read_task;                  // prefetch(): every slot's reads
+    std::vector<std::shared_ptr<Task>> slot_tasks;    // larry, start(): slot e's reads + cached rows
     std::atomic<int> bad { 0 };
     std::atomic<uint64_t> bytes { 0 };
     // larry: a prompt batch's cached rows (slot, unique index, cache entry), dequantized by the pool with the reads
@@ -377,7 +413,10 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
         for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) ((e * n + t) * cols)]);
 
     b->uniq.resize((size_t) nel); b->packed.resize((size_t) nel); b->run_begin.resize((size_t) nel);
+    std::vector<int64_t> gb((size_t) nel, 0), ge((size_t) nel, 0), cb((size_t) nel, 0), ce((size_t) nel, 0);   // larry: slot ranges
     for (int64_t e = 0; e < nel; ++e) {
+        gb[(size_t) e] = ge[(size_t) e] = (int64_t) b->groups.size();
+        cb[(size_t) e] = ce[(size_t) e] = (int64_t) b->cached.size();
         if (!b->outp[(size_t) e]) continue;   // larry, engine1: this slot not wanted by this call (outp[e] null)
         const Table & T = tables_[(size_t) e];
         // pack (row_id << 32 | slot) so the sort is a plain integer sort - no comparator, no indirection
@@ -422,34 +461,41 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
             }
         }
         size_t i = 0;
+        (void) bw;
         while (i < u) {
             if ((uint64_t) uq[i] >= (uint64_t) T.rows || hit[i]) { ++i; continue; }   // out of range (bad set) / cached
-            const uint64_t pw = bw + (uint64_t) uq[i] * (uint64_t) dim;
-            const uint64_t page = pw & ~(uint64_t) 4095;
+            const uint64_t page = T.page_of(uq[i], (uint64_t) dim);
             size_t j = i + 1;
-            while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows && !hit[j] &&
-                   ((bw + (uint64_t) uq[j] * (uint64_t) dim) & ~(uint64_t) 4095) == page) ++j;
-            const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) dim;
-            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) dim + (uint64_t) dim;
-            const uint64_t s0 = bs + (uint64_t) uq[i] * (uint64_t) srsz;
-            const uint64_t s1 = bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
+            while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows && !hit[j] && T.page_of(uq[j], (uint64_t) dim) == page) ++j;
+            // larry: a paged table's span holds the rows' scales too (len_s 0: no second read)
+            const uint64_t w0 = T.row_off(uq[i], (uint64_t) dim);
+            const uint64_t w1 = T.row_off(uq[j - 1], (uint64_t) dim) + (uint64_t) (T.paged ? dim + srsz : dim);
+            const uint64_t s0 = T.paged ? 0 : bs + (uint64_t) uq[i] * (uint64_t) srsz;
+            const uint64_t s1 = T.paged ? 0 : bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
             b->groups.push_back(ReadGroup{ e, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
             i = j;
         }
+        ge[(size_t) e] = (int64_t) b->groups.size();
+        ce[(size_t) e] = (int64_t) b->cached.size();
     }
-    const int64_t ng = (int64_t) b->groups.size();
     const int64_t kCachedChunk = 512;   // cached rows per pool item
-    const int64_t nc = ((int64_t) b->cached.size() + kCachedChunk - 1) / kCachedChunk;
+    b->slot_tasks.assign((size_t) nel, nullptr);
+    // larry: a task per slot (its read groups, then its cached rows), fired in slot order - the FIFO pool reads the
+    // first Engram layer's rows first, and wait_slot(b, 0) returns before the second layer's are read
+    for (int64_t e = 0; e < nel; ++e) {
+    const int64_t g0 = gb[(size_t) e], ng = ge[(size_t) e] - gb[(size_t) e];
+    const int64_t c0 = cb[(size_t) e], c1 = ce[(size_t) e];
+    const int64_t nc = (c1 - c0 + kCachedChunk - 1) / kCachedChunk;
     if (ng + nc > 0) {
         auto t = std::make_shared<Task>();
         t->n = ng + nc;
         Batch * bp = b.get();
-        t->fn = [this, bp, dim, srsz, ng, kCachedChunk](int64_t a, int64_t c) {
+        t->fn = [this, bp, dim, srsz, g0, ng, c0, c1, kCachedChunk](int64_t a, int64_t c) {
             uint8_t bw[4096 + 512], bs[1024];
-            for (int64_t g = a; g < c; ++g) {
-                if (g >= ng) {   // larry: a chunk of cached rows, dequantized from the cache pool (never evicted)
-                    const size_t q0 = (size_t) ((g - ng) * kCachedChunk);
-                    const size_t q1 = std::min(bp->cached.size(), q0 + (size_t) kCachedChunk);
+            for (int64_t gi = a; gi < c; ++gi) {
+                if (gi >= ng) {   // larry: a chunk of cached rows, dequantized from the cache pool (never evicted)
+                    const size_t q0 = (size_t) (c0 + (gi - ng) * kCachedChunk);
+                    const size_t q1 = std::min((size_t) c1, q0 + (size_t) kCachedChunk);
                     for (size_t q = q0; q < q1; ++q) {
                         const Batch::CachedRow & cr = bp->cached[q];
                         const auto & pk = bp->packed[cr.e];
@@ -467,22 +513,23 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
                     }
                     continue;
                 }
-                const ReadGroup & G = bp->groups[(size_t) g];
+                const ReadGroup & G = bp->groups[(size_t) (g0 + gi)];
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
-                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
+                    (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
                 const auto & rb = bp->run_begin[(size_t) G.e];
                 float * oe = bp->outp[(size_t) G.e];
                 const uint32_t r0 = uq[G.u0];      // the group's first (lowest-offset) row: the buffer's origin
+                const uint64_t wst = T.stride((uint64_t) dim);
                 for (uint32_t k = 0; k < G.count; ++k) {
                     const uint32_t uu = G.u0 + k;
                     const uint32_t row = uq[uu];
-                    const uint8_t * w = bw + (uint64_t) (row - r0) * (uint64_t) dim;
-                    const uint8_t * s = bs + (uint64_t) (row - r0) * (uint64_t) srsz;
+                    const uint8_t * w = bw + (uint64_t) (row - r0) * wst;
+                    const uint8_t * s = T.paged ? w + dim : bs + (uint64_t) (row - r0) * (uint64_t) srsz;
                     if (cache_cap_ && cache_used_ < cache_cap_) {   // keep the raw row (fill-until-full)
                         std::lock_guard<std::mutex> lk(cache_mu_);
                         if (cache_used_ < cache_cap_ && cache_idx_.emplace(((uint64_t) G.e << 32) | row, (uint32_t) cache_used_).second) {
@@ -503,7 +550,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
                 }
             }
         };
-        b->read_task = t;
+        b->slot_tasks[(size_t) e] = t;
         if (nthreads_ <= 0 || t->n < 4) {            // tiny batch: run on the caller, no queue round-trip.  (Was n <= 2 *
                                                      // nthreads: a decode token's ~48 preads then ran serially, ~11 ms cold.)
             t->parts = 1;
@@ -514,6 +561,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
             fire(t, std::min<int64_t>(t->n, 8 * nthreads_));
         }
     }
+    }
     return b;
 }
 
@@ -521,8 +569,17 @@ bool Ds41Engram::wait(const std::shared_ptr<Batch> & b, std::string & err) {
     if (!b) { err = "engram: null batch"; return false; }
     if (b->th.joinable()) b->th.join();   // a prefetch: its planner fired and waited its reads
     if (b->read_task) b->read_task->wait();
+    for (auto & t : b->slot_tasks) if (t) t->wait();
     reads_ += (uint64_t) b->groups.size();
     bytes_ += b->bytes.load();
+    if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
+    return true;
+}
+
+bool Ds41Engram::wait_slot(const std::shared_ptr<Batch> & b, int e, std::string & err) {
+    if (!b) { err = "engram: null batch"; return false; }
+    if (b->th.joinable() || b->read_task) return wait(b, err);   // a prefetch: no per-slot tasks
+    if (e >= 0 && e < (int) b->slot_tasks.size() && b->slot_tasks[(size_t) e]) b->slot_tasks[(size_t) e]->wait();
     if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
     return true;
 }
@@ -560,16 +617,16 @@ void Ds41Engram::prefetch_run(Batch * b, int64_t pos0, int n) {
                 if (!cache_idx_.count(((uint64_t) e << 32) | x)) uq.push_back(x);
             }
         }
-        const uint64_t bw = T.off_w, bs = T.off_s;
+        const uint64_t bs = T.off_s;
         size_t i = 0;
-        while (i < uq.size()) {   // page-coalesced, as start()
-            const uint64_t page = (bw + (uint64_t) uq[i] * (uint64_t) dim) & ~(uint64_t) 4095;
+        while (i < uq.size()) {   // page-coalesced, as start() (larry: a paged table's span has the scales too)
+            const uint64_t page = T.page_of(uq[i], (uint64_t) dim);
             size_t j = i + 1;
-            while (j < uq.size() && ((bw + (uint64_t) uq[j] * (uint64_t) dim) & ~(uint64_t) 4095) == page) ++j;
-            const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) dim;
-            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) dim + (uint64_t) dim;
-            const uint64_t s0 = bs + (uint64_t) uq[i] * (uint64_t) srsz;
-            const uint64_t s1 = bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
+            while (j < uq.size() && T.page_of(uq[j], (uint64_t) dim) == page) ++j;
+            const uint64_t w0 = T.row_off(uq[i], (uint64_t) dim);
+            const uint64_t w1 = T.row_off(uq[j - 1], (uint64_t) dim) + (uint64_t) (T.paged ? dim + srsz : dim);
+            const uint64_t s0 = T.paged ? 0 : bs + (uint64_t) uq[i] * (uint64_t) srsz;
+            const uint64_t s1 = T.paged ? 0 : bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
             b->groups.push_back(ReadGroup{ e, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
             i = j;
         }
@@ -585,7 +642,7 @@ void Ds41Engram::prefetch_run(Batch * b, int64_t pos0, int n) {
             const Table & T = tables_[(size_t) G.e];
             if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                 tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
-                tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
+                (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); continue; }
             bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
             const auto & uq = bp->uniq[(size_t) G.e];
             const uint32_t r0 = uq[G.u0];
@@ -594,8 +651,9 @@ void Ds41Engram::prefetch_run(Batch * b, int64_t pos0, int n) {
                 const uint32_t row = uq[G.u0 + k];
                 if (!cache_idx_.emplace(((uint64_t) G.e << 32) | row, (uint32_t) cache_used_).second) continue;
                 uint8_t * d = &cache_pool_[cache_used_ * (size_t) (dim + srsz)];
-                std::memcpy(d, bw + (uint64_t) (row - r0) * (uint64_t) dim, (size_t) dim);
-                std::memcpy(d + dim, bs + (uint64_t) (row - r0) * (uint64_t) srsz, (size_t) srsz);
+                const uint8_t * w = bw + (uint64_t) (row - r0) * T.stride((uint64_t) dim);
+                std::memcpy(d, w, (size_t) dim);
+                std::memcpy(d + dim, T.paged ? w + dim : bs + (uint64_t) (row - r0) * (uint64_t) srsz, (size_t) srsz);
                 ++cache_used_;
             }
         }
