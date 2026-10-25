@@ -1310,11 +1310,18 @@ int main(int argc, char ** argv) {
                     dense.set_pass_ring(ring_env);
                     bool inflight = false;
                     int fl = -1, fa = 0, fb = 0;   // the part whose finish waits for the tier call in flight
+                    // larry, STRATA_PIPE_TRACE: each step's start (ms into the layer loop) and duration
+                    static const bool pipe_trace = std::getenv("STRATA_PIPE_TRACE") != nullptr;
+                    const double pt0 = now_ms();
+                    auto ptr = [&](const char * what, int l, int a0, int a1, double t) {
+                        if (pipe_trace) std::fprintf(stderr, "pipe trace: %8.1f  L%-2d %s [%5d,%5d) %7.1f ms\n", t - pt0, l, what, a0, a1, now_ms() - t);
+                    };
                     auto PD = [&](int l, int a0, int a1) -> bool {
                         const double t = now_ms();
                         for (int s = a0; s < a1; s += SB)
                             if (!dense.attn_router_span(l, s, std::min(SB, a1 - s))) { ferr = dense.last_error(); return false; }
                         fd_dense += now_ms() - t;
+                        ptr("D", l, a0, a1, t);
                         return true;
                     };
                     auto PF = [&](int l, int a0, int a1) -> bool {
@@ -1322,6 +1329,7 @@ int main(int argc, char ** argv) {
                         for (int s = a0; s < a1; s += SB)
                             if (!dense.finish_span(l, s, std::min(SB, a1 - s))) { ferr = dense.last_error(); return false; }
                         fd_dense += now_ms() - t;
+                        ptr("F", l, a0, a1, t);
                         return true;
                     };
                     // serve DSpark seed (bcap_n > 0): the batch's last bcap_n rows of the state leaving dm_layers[j] (as
@@ -1363,12 +1371,14 @@ int main(int argc, char ** argv) {
                         const double t = now_ms();
                         const bool ok = tier.run_chunk_wait();
                         fd_tier += now_ms() - t;
+                        ptr("J", fl, fa, fb, t);
                         if (!ok) { ferr = "tier run refused"; return false; }
                         if (dump_col >= fa && dump_col < fb && prdev)
                             tier.dbg_capture(2 * fl + 1, prdev + (size_t) dump_col * n_embd, (size_t) n_embd * 4);
                         return PF(fl, fa, fb) && (fb < B || PC(fl));
                     };
                     auto PT = [&](int l, int a0, int a1, bool last) -> bool {
+                        const double tt = now_ms();
                         dense.pass_sync();   // the part's ids / weights / fn are final (the pass ring does not wait)
                         if (dump_col >= a0 && dump_col < a1) {
                             dc_ids[(size_t) l].assign(dense.batch_ids() + (size_t) dump_col * top_k, dense.batch_ids() + (size_t) (dump_col + 1) * top_k);
@@ -1381,6 +1391,7 @@ int main(int argc, char ** argv) {
                                                             fn_dev ? fn_dev + (size_t) a0 * n_embd : nullptr);
                         if (!inflight) { ferr = "tier run refused"; return false; }
                         fl = l; fa = a0; fb = a1;
+                        ptr("T", l, a0, a1, tt);
                         return true;
                     };
                     // two-part layer l:  D(l,0) [T(l-1,1) runs] | join, F(l-1,1) | T(l,0) | D(l,1) [T(l,0) runs] | join,

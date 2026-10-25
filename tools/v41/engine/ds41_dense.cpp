@@ -176,6 +176,10 @@ struct Ds41Dense::Impl {
     ggml_tensor * comb_f = nullptr;       // [HC, HC, NC]
     ggml_tensor * shexp = nullptr;        // [D, NC]
     ggml_tensor * o_fn = nullptr;         // [D, NC]    ffn_norm activation (the routed experts' input)
+    // larry: o_fn's own buffer, NCmax columns for the engine's life (the expert cards read it card-to-card; a fresh
+    // buffer per batch paid the peer mapping at the tier's first copy)
+    ggml_context * fn_ctx = nullptr;
+    ggml_backend_buffer_t fn_buf = nullptr;
     // larry, STRATA_TP_OPROJ=2: between a decode layer's two attention halves (<= 8 columns) - the de-RoPEd attention
     // output, the attention hc mixes (hc_fb's pre | post | comb planes) and the output projection
     ggml_tensor * o_att = nullptr;        // [OGD * OG, <= 8]
@@ -1586,7 +1590,15 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.post_f = ggml_new_tensor_2d(c, GGML_TYPE_F32, HC, NC);
     im.comb_f = ggml_new_tensor_3d(c, GGML_TYPE_F32, HC, HC, NC);
     im.shexp = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
-    im.o_fn = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    if (!im.fn_buf) {   // larry: allocated once, NCmax columns (views take the first NC)
+        ggml_init_params fp = { ggml_tensor_overhead() * 2, nullptr, true };
+        im.fn_ctx = ggml_init(fp);
+        ggml_tensor * fn = ggml_new_tensor_2d(im.fn_ctx, GGML_TYPE_F32, D, std::max(NC, im.NCmax));
+        im.fn_buf = ggml_backend_alloc_ctx_tensors(im.fn_ctx, im.backend);
+        if (!im.fn_buf) { err = "cannot allocate the FFN input columns"; return false; }
+        ggml_backend_buffer_clear(im.fn_buf, 0);
+        im.o_fn = fn;
+    }
     {
         const int64_t NO = std::min<int64_t>(NC, 8);
         im.o_att = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.OGD * im.OG, NO);

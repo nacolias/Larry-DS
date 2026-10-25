@@ -2893,6 +2893,15 @@ bool grow_host(T*& p, size_t& cap, size_t need, sycl::queue& q) {
     cap = p ? need : 0;
     return p != nullptr;
 }
+/// larry: grow_dev in card-local memory (local_alloc / local_free): buffers no other card's queue touches
+template <class T>
+bool grow_loc(T*& p, size_t& cap, size_t need, sycl::queue& q) {
+    if (cap >= need) return true;
+    if (p) { q.wait(); local_free(q, p); }
+    p = reinterpret_cast<T*>(local_alloc(q, need * sizeof(T)));
+    cap = p ? need : 0;
+    return p != nullptr;
+}
 /// larry: the card's stream buffer, card-local (local_alloc) and grown by half its size at least (to `cap`; whole 32 MiB)
 bool grow_stream(XeCard& c, size_t need, size_t cap) {
     if (c.stream_bytes >= need) return true;
@@ -3272,7 +3281,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             std::fprintf(stderr, "xe tier: card %d: stream buffer moved with experts kept in it\n", c.idx);
             return false;
         }
-        if (!grow_dev(c.cX, c.cX_cap, (size_t) n * H, c.q) || !grow_dev(c.cOUT, c.cOUT_cap, (size_t) n * H, c.q)) {
+        if (!grow_loc(c.cX, c.cX_cap, (size_t) n * H, c.q) || !grow_dev(c.cOUT, c.cOUT_cap, (size_t) n * H, c.q)) {
             std::fprintf(stderr, "xe tier: card %d: chunk X/OUT allocation failed (n %d, %.2f GiB free)\n", c.idx, n, c.free_vram() / kGiB);
             return false;
         }
@@ -3516,7 +3525,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 bool grown;
                 {
                     std::lock_guard<PrioMutex> lk(g_submit);
-                    grown = grow_dev(c.gscratch, c.gscratch_cap, c.gscratch_cap < need ? need + need / 4 : need, c.q);   // headroom: few regrowths
+                    grown = grow_loc(c.gscratch, c.gscratch_cap, c.gscratch_cap < need ? need + need / 4 : need, c.q);   // headroom: few regrowths
                     if (grown && c.dq_host_cap < jbytes + tbytes) {
                         const size_t hb = (jbytes + tbytes) + (jbytes + tbytes) / 4;
                         if (c.dq_host) sycl::free(c.dq_host, c.q);
@@ -3630,7 +3639,7 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 bool grown;
                 {
                     std::lock_guard<PrioMutex> lk(g_submit);
-                    grown = grow_dev(c.gscratch, c.gscratch_cap, need, c.q);
+                    grown = grow_loc(c.gscratch, c.gscratch_cap, need, c.q);
                 }
                 if (!grown) {
                     std::fprintf(stderr, "xe tier: card %d: GEMM scratch allocation failed (%.2f GiB, %.2f GiB free)\n", c.idx,
@@ -4015,6 +4024,13 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             }
             std::fflush(df);
         }
+    }
+    {   // larry, STRATA_XE_PF_TRACE: the call's wall split
+        static const bool ct = env_i("STRATA_XE_PF_TRACE", 0) != 0;
+        if (ct)
+            std::fprintf(stderr, "call trace: layer %lld n %d: %.1f ms = prefetch %.1f + plan %.1f + lock %.1f + prep %.1f + cards %.1f + "
+                         "combine %.1f\n", (long long) l, n, now_ms() - t0, t_pf - t0, t_plan - t_pf, t_lk - t_plan, t_prep - t_lk,
+                         t_cards - t_prep, now_ms() - t_cards);
     }
     if (prof) {
         g_bp.prep += t_prep - t0;
@@ -4811,7 +4827,7 @@ bool Ds41XeTier::prefetch_begin(int64_t first, int64_t last, int n_call) {
         XeCard& c = *cp;
         if (c.dense || !c.pbuf_cap) continue;
         const size_t sb = (size_t) (env_d("STRATA_XE_PREFETCH_STREAM_GIB", 0.25) * kGiB) & ~(size_t) 255;
-        if (!grow_stream(c, sb, sb) || !grow_dev(c.cX, c.cX_cap, (size_t) nc * H, c.q) ||
+        if (!grow_stream(c, sb, sb) || !grow_loc(c.cX, c.cX_cap, (size_t) nc * H, c.q) ||
             !grow_dev(c.cOUT, c.cOUT_cap, (size_t) nc * H, c.q))
             std::fprintf(stderr, "xe prefetch: card %d: call buffers not pre-allocated (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
         if (c.cS_cap < (size_t) nc * K) {
@@ -5009,9 +5025,9 @@ void Ds41XeTier::close() {
         if (c.flex) { c.q.wait(); local_free(c.q, c.flex); }
         c.flex = nullptr;
         fr(c.stage_dev); fr(c.stage_host); fr(c.H); fr(c.OUT); fr(c.part_host); fr(c.arm_flag); fr(c.arm_seen); fr(c.arm_src);
-        fr(c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY);
+        local_free(c.q, c.cX); fr(c.cOUT); fr(c.cOUT_host); fr(c.cS); fr(c.cW); fr(c.cjobs); fr(c.cjobs_host); fr(c.dq_host); fr(c.cH); fr(c.cY);
         local_free(c.q, c.stream);   // larry: card-local (grow_stream)
-        fr(c.gscratch); fr(c.cX2); fr(c.cX2h); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
+        local_free(c.q, c.gscratch); fr(c.cX2); fr(c.cX2h); fr(c.bounce); fr(c.dslots); fr(c.rstage); fr(c.xt); fr(c.ht);
         fr(c.hring); fr(c.hchk);
         for (xe::XeQ8* a : {&c.xq, &c.hq, &c.cxq, &c.chq}) { fr(a->q); fr(a->d); fr(a->s); }
     }
