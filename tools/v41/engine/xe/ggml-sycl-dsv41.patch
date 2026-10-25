@@ -3330,6 +3330,48 @@ new file mode 100644
 +void ggml_sycl_op_dsv41_sel_fin(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 +
 +#endif  // GGML_SYCL_DSV41_FUSED_HPP
+diff --git a/ggml/src/ggml-sycl/dsv4-hc.cpp b/ggml/src/ggml-sycl/dsv4-hc.cpp
+--- a/ggml/src/ggml-sycl/dsv4-hc.cpp
++++ b/ggml/src/ggml-sycl/dsv4-hc.cpp
+@@ -147,8 +147,37 @@
+         int64_t sc0, int64_t sc1, int64_t sc2,
+         int64_t sd0, int64_t sd1, int64_t sd2,
+         queue_ptr stream) {
+-    const int64_t nr = n_embd * hc * n_tokens;
+     const int64_t block_size = 256;
++    // larry, GGML_SYCL_HC_POST_V2 (default 0 until measured): one work-item per (dim, token) for all hc outputs - the
++    // per-output form read the residual hc times (a 512-token span: 4 x 42 MB).  The same sums, in the same order.
++    static const bool v2 = std::getenv("GGML_SYCL_HC_POST_V2") && std::atoi(std::getenv("GGML_SYCL_HC_POST_V2")) != 0;
++    if (v2 && hc <= 8) {
++        const int64_t nt = n_embd * n_tokens;
++        stream->parallel_for(
++            sycl::nd_range<1>(sycl::range<1>((nt + block_size - 1) / block_size * block_size), sycl::range<1>(block_size)),
++            [=](sycl::nd_item<1> item) {
++                const int64_t ir = item.get_global_id(0);
++                if (ir >= nt) {
++                    return;
++                }
++                const int64_t i0 = ir % n_embd;
++                const int64_t it = ir / n_embd;
++                const float xv = x[i0*sx0 + it*sx1];
++                float rv[8];
++                for (int64_t isrc = 0; isrc < hc; ++isrc) {
++                    rv[isrc] = residual[i0*sr0 + isrc*sr1 + it*sr2];
++                }
++                for (int64_t idst = 0; idst < hc; ++idst) {
++                    float sum = xv * post[idst*sp0 + it*sp1];
++                    for (int64_t isrc = 0; isrc < hc; ++isrc) {
++                        sum += rv[isrc] * comb[idst*sc0 + isrc*sc1 + it*sc2];
++                    }
++                    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
++                }
++            });
++        return;
++    }
++    const int64_t nr = n_embd * hc * n_tokens;
+     const int64_t num_blocks = (nr + block_size - 1) / block_size;
+ 
+     stream->parallel_for(
 diff --git a/ggml/src/ggml-sycl/fastmv.cpp b/ggml/src/ggml-sycl/fastmv.cpp
 new file mode 100644
 --- /dev/null
@@ -4207,7 +4249,7 @@ diff --git a/ggml/src/ggml-sycl/fattn-dsv4.cpp b/ggml/src/ggml-sycl/fattn-dsv4.c
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fattn-dsv4.cpp
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,217 @@
 +// ggml-sycl/fattn-dsv4.cpp - larry (Strata-DS4 on Intel): flash attention for DeepSeek-V4.1's prompt shape on XMX.
 +//
 +// The DS4 engines (Xolotl tools/v41/engine/ds41_dense.cpp) attend with the QUERY as the batch: every query has its
@@ -4286,8 +4328,21 @@ new file mode 100644
 +    sycl::half * qh = Qh.get();
 +    float * s = S.get();
 +    sycl::half * p = P.get();
++    // larry, GGML_SYCL_DSV4_MQA_V2 (default off): Q four floats a work-item when contiguous, the softmax a sub-group a row
++    static const int v2 = env_int("GGML_SYCL_DSV4_MQA_V2", 0);
++    // larry, patch-glue2: the two halves of _V2 on their own switches
++    static const int qv = env_int("GGML_SYCL_DSV4_MQA_QV", v2), smv = env_int("GGML_SYCL_DSV4_MQA_SM", v2);
++    const bool q_contig = Q->nb[0] == 4 && Q->nb[2] == (size_t) D * 4 && Q->nb[3] == (size_t) NH * D * 4 && D % 4 == 0;
 +    // 1. Q (any strides) -> Qh[b][h][d] = half(scale * Q)
-+    {
++    if (qv && q_contig) {
++        const sycl::float4 * q4 = (const sycl::float4 *) Q->data;
++        sycl::half4 * h4 = (sycl::half4 *) qh;
++        const size_t total4 = (size_t) n * NH * D / 4;
++        stream->parallel_for(sycl::range<1>(total4), [=](sycl::id<1> id) {
++            const sycl::float4 v = q4[id[0]] * scale;
++            h4[id[0]] = sycl::half4((sycl::half) v.x(), (sycl::half) v.y(), (sycl::half) v.z(), (sycl::half) v.w());
++        });
++    } else {
 +        const char * qd = (const char *) Q->data;
 +        const size_t nb0 = Q->nb[0], nb2 = Q->nb[2], nb3 = Q->nb[3];
 +        const size_t total = (size_t) n * NH * D;
@@ -4302,7 +4357,33 @@ new file mode 100644
 +    mkl::blas::row_major::gemm_batch(*stream, mkl::transpose::nontrans, mkl::transpose::trans, NH, M, D, 1.0f, qh, D,
 +                                     NH * D, (const sycl::half *) K->data, D, M * D, 0.0f, s, M, NH * M, n);
 +    // 3. softmax over M with the mask row of the query and the head's sink; P in fp16
-+    {
++    if (smv) {   // larry, GGML_SYCL_DSV4_MQA_SM: a sub-group a row, three passes over it (max, sum, P)
++        const sycl::half * mk = (const sycl::half *) mask->data;
++        const size_t mstride = mask->nb[3] / 2;
++        const float * sk = sinks ? (const float *) sinks->data : nullptr;
++        constexpr int SGW = 8;   // sub-groups (rows) a work-group
++        const size_t rows = (size_t) n * NH;
++        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((rows + SGW - 1) / SGW * SGW * 16), sycl::range<1>(SGW * 16)),
++                             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            const sycl::sub_group sg = it.get_sub_group();
++            const size_t row = (size_t) it.get_group(0) * SGW + sg.get_group_linear_id();   // b * NH + h
++            if (row >= rows) return;
++            const int lane = (int) sg.get_local_linear_id();
++            const int64_t b = (int64_t) (row / NH), h = (int64_t) (row % NH);
++            const float * sr = s + (int64_t) row * M;
++            const sycl::half * mr = mk + b * mstride;
++            float mx = sk ? sk[h] : -1e30f;
++            for (int64_t m = lane; m < M; m += 16) mx = sycl::fmax(mx, sr[m] + (float) mr[m]);
++            mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
++            float sum = 0.0f;
++            for (int64_t m = lane; m < M; m += 16) sum += sycl::exp(sr[m] + (float) mr[m] - mx);
++            sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
++            if (sk) sum += sycl::exp(sk[h] - mx);
++            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
++            sycl::half * pr = p + (int64_t) row * M;
++            for (int64_t m = lane; m < M; m += 16) pr[m] = (sycl::half) (sycl::exp(sr[m] + (float) mr[m] - mx) * inv);
++        });
++    } else {
 +        const sycl::half * mk = (const sycl::half *) mask->data;
 +        const size_t mstride = mask->nb[3] / 2;
 +        const float * sk = sinks ? (const float *) sinks->data : nullptr;
@@ -6232,3 +6313,87 @@ diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
          assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
          const sycl::range<3> block_dims(1, 1, work_group_size);
          stream->submit([&](sycl::handler& cgh) {
+diff --git a/ggml/src/ggml-sycl/rope.cpp b/ggml/src/ggml-sycl/rope.cpp
+--- a/ggml/src/ggml-sycl/rope.cpp
++++ b/ggml/src/ggml-sycl/rope.cpp
+@@ -45,12 +45,14 @@
+                       const float freq_scale, const float ext_factor,
+                       const float attn_factor, const rope_corr_dims corr_dims,
+                       const float theta_scale, const float *freq_factors,
+-                      const int64_t *row_indices, const int set_rows_stride) {
++                      const int64_t *row_indices, const int set_rows_stride,
++                      const int i0_lo, const int i0_end) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-    const int i0 = 2 * (item_ct1.get_local_range(1) * item_ct1.get_group(1) +
+-                        item_ct1.get_local_id(1));
++    // larry: [i0_lo, i0_end) - the whole row, or (in place) only the rotated pairs
++    const int i0 = i0_lo + 2 * (item_ct1.get_local_range(1) * item_ct1.get_group(1) +
++                                item_ct1.get_local_id(1));
+ 
+-    if (i0 >= ne00) {
++    if (i0 >= i0_end) {
+         return;
+     }
+ 
+@@ -305,11 +307,12 @@
+                const float freq_base, const float ext_factor,
+                const float attn_factor, const rope_corr_dims corr_dims,
+                const float *freq_factors, const int64_t *row_indices,
+-               const int set_rows_stride, dpct::queue_ptr stream) {
++               const int set_rows_stride, dpct::queue_ptr stream, const int i0_lo = 0, int i0_end = -1) {
+     GGML_ASSERT(ne00 % 2 == 0);
++    if (i0_end < 0) i0_end = ne00;
+     const dpct::dim3 block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
+     const int n_blocks_x =
+-        (ne00 + 2 * SYCL_ROPE_BLOCK_SIZE - 1) / (2 * SYCL_ROPE_BLOCK_SIZE);
++        (i0_end - i0_lo + 2 * SYCL_ROPE_BLOCK_SIZE - 1) / (2 * SYCL_ROPE_BLOCK_SIZE);
+     const dpct::dim3 block_nums(nr, n_blocks_x, 1);
+ 
+     const float theta_scale = powf(freq_base, -2.0f / n_dims);
+@@ -322,7 +325,7 @@
+                 rope_norm<forward, false>(
+                     x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims,
+                     n_offs, pos, freq_scale, ext_factor, attn_factor, corr_dims,
+-                    theta_scale, freq_factors, row_indices, set_rows_stride);
++                    theta_scale, freq_factors, row_indices, set_rows_stride, i0_lo, i0_end);
+             });
+     } else {
+         stream->parallel_for(
+@@ -332,7 +335,7 @@
+                 rope_norm<forward, true>(
+                     x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims,
+                     n_offs, pos, freq_scale, ext_factor, attn_factor, corr_dims,
+-                    theta_scale, freq_factors, row_indices, set_rows_stride);
++                    theta_scale, freq_factors, row_indices, set_rows_stride, i0_lo, i0_end);
+             });
+     }
+ }
+@@ -609,12 +612,18 @@
+         }
+     } else {
+         GGML_SYCL_DEBUG("%s: norm path\n", __func__);
++        // larry: in place (same buffer, same strides) with the rotated dims a part of the row (DeepSeek-V4: the last 64
++        // of 512, ggml_rope_set_offset) - only those pairs; the other dims are already where they belong
++        const bool part = src0_d == dst_d && s01 == s1 && s02 == s2 && s03 == s3 && set_rows_stride == 0 &&
++                          src0->type == dst_type && (n_offs > 0 || n_dims < ne00) && n_offs % 2 == 0 && n_dims % 2 == 0 &&
++                          n_offs + n_dims <= ne00;
++        const int i0_lo = part ? n_offs : 0, i0_end = part ? n_offs + n_dims : (int) ne00;
+         if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+             rope_norm_sycl<forward, float, float>(
+                 (const float *)src0_d, (float *)dst_d, ne00, ne01, ne02, s01,
+                 s02, s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
+                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
+-                set_rows_stride, stream);
++                set_rows_stride, stream, i0_lo, i0_end);
+         } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+             rope_norm_sycl<forward, float, sycl::half>(
+                 (const float *)src0_d, (sycl::half *)dst_d, ne00, ne01, ne02,
+@@ -626,7 +635,7 @@
+                 (const sycl::half *)src0_d, (sycl::half *)dst_d, ne00, ne01,
+                 ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale,
+                 freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
+-                row_indices, set_rows_stride, stream);
++                row_indices, set_rows_stride, stream, i0_lo, i0_end);
+         } else {
+             GGML_ABORT("Fatal error: Tensor type unsupported!");
+         }

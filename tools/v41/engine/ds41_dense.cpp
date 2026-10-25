@@ -686,7 +686,7 @@ struct B {
     }
     // RoPE over the last `nd` dims of each `ne0` row (model.py apply_rotary_emb: adjacent pairs = NORMAL mode).
     // ratio > 0: compress_rope_theta with YaRN; ratio 0: rope_theta, no YaRN (model.py Attention.__init__)
-    ggml_tensor * rope(ggml_tensor * a, ggml_tensor * pos, int64_t ratio, bool back = false) const {
+    ggml_tensor * rope(ggml_tensor * a, ggml_tensor * pos, int64_t ratio, bool back = false, bool inplace = false) const {
         const bool yarn = ratio != 0;
         const float base = (float) (yarn ? g->compress_rope_base : g->rope_base);
         const float fscale = yarn ? (float) (1.0 / g->rope_factor) : 1.0f;
@@ -696,8 +696,14 @@ struct B {
         const float bf = yarn ? (float) g->beta_fast : 0.0f, bsl = yarn ? (float) g->beta_slow : 0.0f;
         const int n_ctx = yarn ? (int) g->orig_ctx : 0;
         const int nd = (int) g->d_rope;
-        ggml_tensor * r = back ? ggml_rope_ext_back(c, a, pos, nullptr, nd, GGML_ROPE_TYPE_NORMAL, n_ctx, base, fscale, ext, attn, bf, bsl)
-                               : ggml_rope_ext(c, a, pos, nullptr, nd, GGML_ROPE_TYPE_NORMAL, n_ctx, base, fscale, ext, attn, bf, bsl);
+        ggml_tensor * r = nullptr;
+        if (inplace) {   // larry, STRATA_ROPE_INPLACE: a view of a (ggml_rope_ext_back is ggml_rope_ext with the op swapped)
+            r = ggml_rope_ext_inplace(c, a, pos, nullptr, nd, GGML_ROPE_TYPE_NORMAL, n_ctx, base, fscale, ext, attn, bf, bsl);
+            if (back) r->op = GGML_OP_ROPE_BACK;
+        } else {
+            r = back ? ggml_rope_ext_back(c, a, pos, nullptr, nd, GGML_ROPE_TYPE_NORMAL, n_ctx, base, fscale, ext, attn, bf, bsl)
+                     : ggml_rope_ext(c, a, pos, nullptr, nd, GGML_ROPE_TYPE_NORMAL, n_ctx, base, fscale, ext, attn, bf, bsl);
+        }
         return ggml_rope_set_offset(r, (int) (a->ne[0] - nd));
     }
     // the same RoPE as the fused decode ops take it (ggml_dsv41_kv_fin / _attn_dec)
@@ -947,7 +953,9 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         qr = b.rms_w(qa_y, im.BL(il, "attn_q_a_norm.weight"));
         q = ggml_reshape_3d(gc, ggml_mul_mat(gc, im.BL(il, "attn_q_b.weight"), qr), DH, NH, n);
     }
-    if (!afuse) q = b.rope(q, pos, r);
+    // larry, STRATA_ROPE_INPLACE (default 0): in place - ggml-sycl then rotates only the 64 rope dims (q is read rotated only)
+    static const bool rope_ip = env_on("STRATA_ROPE_INPLACE", false);
+    if (!afuse) q = b.rope(q, pos, r, false, rope_ip && im.sycl);
 
     // ---- window K (= V): [ring | this pass's rows] -> each query's SWA rows; the ring keeps the last RAW
     ggml_tensor * widx_v = b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4);
@@ -1180,7 +1188,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     o = ggml_reshape_3d(gc, o, DH, NH, n);
-    o = b.rope(o, pos, r, true);                                                               // de-RoPE the output
+    o = b.rope(o, pos, r, true, rope_ip && im.sycl);                                           // de-RoPE the output
     }
     if (part == 1) {
         outs.push_back(ggml_cpy(gc, o, b.cols2(im.o_att, im.OGD * im.OG, n, 0)));
