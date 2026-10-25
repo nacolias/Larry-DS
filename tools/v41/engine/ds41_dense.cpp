@@ -1167,6 +1167,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // no padding, no key cast (GGML_SYCL_DSV4_DEC=0: the generic path)
     const char * dec_env = std::getenv("GGML_SYCL_DSV4_DEC");
     const bool sycl_dec = im.sycl && !sycl_mqa && DH == 512 && NH % 32 == 0 && !(dec_env && dec_env[0] == '0');
+    // larry, STRATA_ATTN_SDPA (patch-sdpa-dense.py): a fixed key count's span as one oneDNN SDPA (keys 576 wide + the sink)
+    static const bool attn_sdpa = env_on("STRATA_ATTN_SDPA", false);
+    static const int sdpa_dp = std::getenv("STRATA_ATTN_SDPA_DP") ? std::atoi(std::getenv("STRATA_ATTN_SDPA_DP")) : 576;
+    if (attn_sdpa && sycl_mqa && DH == 512 && (M == SWA || (Kc && M == SWA + 512))) {
+        ggml_tensor * kp = ggml_dsv41_kgather_pad(gc, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, (int) SWA, sdpa_dp);
+        o = ggml_dsv41_attn_sdpa(gc, q, kp, Mall, im.BL(il, "attn_sinks.weight"), 1.0f / std::sqrt((float) DH));   // [DH, NH, n]
+        o = b.rope(o, pos, r, true, rope_ip && im.sycl);                                       // de-RoPE the output
+    } else {
     if (!im.cpu && !sycl_mqa && !sycl_dec && M % 256) {
         const int64_t pad = 256 - M % 256;
         Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
@@ -1197,6 +1205,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     o = ggml_reshape_3d(gc, o, DH, NH, n);
     o = b.rope(o, pos, r, true, rope_ip && im.sycl);                                           // de-RoPE the output
+    }   // larry, STRATA_ATTN_SDPA's else
     }
     if (part == 1) {
         outs.push_back(ggml_cpy(gc, o, b.cols2(im.o_att, im.OGD * im.OG, n, 0)));
