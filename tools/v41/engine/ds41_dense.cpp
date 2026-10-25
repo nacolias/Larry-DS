@@ -22,6 +22,8 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <spawn.h>
+#include <dirent.h>
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
@@ -2868,6 +2870,18 @@ struct StallWatch {
         th = std::thread([this] {
             std::unique_lock<std::mutex> lk(mu);
             if (cv.wait_for(lk, std::chrono::milliseconds(300), [this] { return done; })) return;
+            // larry, STRATA_STALL_PERF (patch-stallwatch3): a perf sample of this thread's user + kernel stacks
+            static const bool perf_on = std::getenv("STRATA_STALL_PERF") && std::getenv("STRATA_STALL_PERF")[0] == '1';
+            static int perf_n = 0;
+            if (perf_on && perf_n < 4) {   // posix_spawn (vfork-like): no fork() of a process holding GiBs of DMA-pinned memory
+                char ts[16], out[160];
+                std::snprintf(ts, sizeof ts, "%d", (int) tid);
+                std::snprintf(out, sizeof out, "/opt/ai/dsv41/logs/stall.%d.%d.perf", (int) getpid(), perf_n++);
+                const char * av[] = { "perf", "record", "-q", "-F", "499", "--call-graph", "dwarf,32768", "-t", ts, "-o", out, "--", "sleep", "0.8", nullptr };
+                pid_t pp = 0;
+                if (posix_spawnp(&pp, "perf", nullptr, nullptr, const_cast<char * const *>(av), ::environ) == 0)
+                    std::fprintf(stderr, "stall watch (%s): perf sampling thread %d -> %s\n", what, (int) tid, out);
+            }
             while (!done) {
                 char path[64];
                 std::snprintf(path, sizeof path, "/proc/self/task/%d/stack", (int) tid);
@@ -2879,6 +2893,27 @@ struct StallWatch {
                 std::string wc;
                 std::getline(g, wc);
                 ++stacks["wchan " + wc + "\n" + ss.str()];
+                // larry, patch-stallwatch2: every other thread inside the GPU driver (the lock holder)
+                if (DIR * d = opendir("/proc/self/task")) {
+                    while (dirent * de = readdir(d)) {
+                        if (de->d_name[0] == '.' || std::atoi(de->d_name) == (int) tid) continue;
+                        const std::string base = std::string("/proc/self/task/") + de->d_name;
+                        std::ifstream gw(base + "/wchan");
+                        std::string w2;
+                        std::getline(gw, w2);
+                        std::ifstream gs(base + "/stack");
+                        std::stringstream s2;
+                        s2 << gs.rdbuf();
+                        const std::string st = s2.str();
+                        auto has = [&](const char * k) { return st.find(k) != std::string::npos || w2.find(k) != std::string::npos; };
+                        if (!(has("xe_") || has("drm_") || has("ttm_") || has("dma_fence") || has("rwsem") || has("i915"))) continue;
+                        std::ifstream gc(base + "/comm");
+                        std::string cm;
+                        std::getline(gc, cm);
+                        ++stacks["  other thread " + std::string(de->d_name) + " (" + cm + ") wchan " + w2 + "\n" + st];
+                    }
+                    closedir(d);
+                }
                 cv.wait_for(lk, std::chrono::milliseconds(100), [this] { return done; });
             }
         });

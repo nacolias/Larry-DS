@@ -4496,6 +4496,37 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             size_t done = 0;
             while (light_ok && done < light.size()) {
                 const size_t nb = std::min<size_t>(light.size() - done, (size_t) cpu::ExpertPool::kMaxSplitMulti);
+                // larry, STRATA_XE_LT_QUANT_THREADS (patch-ltquant.py): this batch's activations quantised first, on
+                // helper threads (each (token, format) once; the job setup below then finds them done)
+                static const int lq_thr = std::max(0, std::min(16, env_i("STRATA_XE_LT_QUANT_THREADS", 0)));
+                if (lq_thr > 0) {
+                    struct LQ { int t; int fs; const cpu::NativeFmt* f; };
+                    std::vector<LQ> lq;
+                    for (size_t i = 0; i < nb; ++i) {
+                        const int32_t e = light[done + i];
+                        const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
+                        int fs = -1;
+                        if (!cpu::q2_native_kernels(f.gu_type))
+                            for (size_t b = 0; b < nf; ++b) if (im.nact_fmt[b] == f.gu_act) fs = (int) b;
+                        for (int32_t sk : by_e[(size_t) e]) {
+                            const int t = sk / K;
+                            uint8_t& hv = im.lt_have[(size_t) t * (1 + nf) + (size_t) (fs + 1)];
+                            if (!hv) { hv = 1; lq.push_back({t, fs, &f}); }
+                        }
+                    }
+                    auto work = [&](size_t k0, size_t step) {
+                        for (size_t k = k0; k < lq.size(); k += step) {
+                            const LQ& q = lq[k];
+                            if (q.fs < 0) cpu::act_quant_any(xrow(q.t), (int) H, im.lt_actq[(size_t) q.t]);
+                            else cpu::native_quant_act(*q.f, xrow(q.t), im.lt_nact.data() + ((size_t) q.t * nf + (size_t) q.fs) * cpu::kNativeActBytes);
+                        }
+                    };
+                    const size_t nh = std::min<size_t>((size_t) lq_thr, lq.size() / 16);
+                    std::vector<std::thread> th;
+                    for (size_t k = 1; k <= nh; ++k) th.emplace_back(work, k, nh + 1);
+                    work(0, nh + 1);
+                    for (auto& t : th) t.join();
+                }
                 for (size_t i = 0; i < nb; ++i) {
                     const int32_t e = light[done + i];
                     const cpu::NativeFmt& f = im.fl[(size_t) im.cls(l, e)];
