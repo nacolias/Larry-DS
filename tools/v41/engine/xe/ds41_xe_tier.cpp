@@ -3654,21 +3654,26 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         const bool nowait = lite && c.dense && cmb > 0 && streamed[(size_t) c.idx].empty() && kept[(size_t) c.idx].empty();
         // larry, STRATA_XE_ZCOPY (patch-zcopy.py): an expert card's uploads from pinned per-call copies too (no host waits);
         // single-round calls only (the staging below is sized for one pass: nothing streamed in the call)
-        const bool zc = zcopy_on() && !c.dense && streamed[(size_t) c.idx].empty() && kept[(size_t) c.idx].empty();
+        // larry, STRATA_XE_ZCOPY=2 (patch-zcopy2.py): every call (rounds included), the staging sized for them
+        static const int zcopy_mode = env_i("STRATA_XE_ZCOPY", 0);
+        const bool zc = zcopy_on() && !c.dense &&
+                        (zcopy_mode >= 2 || (streamed[(size_t) c.idx].empty() && kept[(size_t) c.idx].empty()));
+        const size_t zc_rounds = zc ? 2 + std::min<size_t>(streamed[(size_t) c.idx].size(), 64) : 1;
         const bool stg = nowait || zc;
         size_t nw_off = 0;
         bool out_init = !gather_init;   // larry, STRATA_XE_GATHER_INIT: false = the next gather writes the part
         if (stg) {
-            int64_t rg = 0, njp = 0, njr = 0;
+            int64_t rg = 0, njp = 0, njr = 0, ng_all = 0, nt_all = 0;   // larry, patch-zcopy3: GEMM experts, their tiles
             for (int32_t e : cl[(size_t) c.idx]) {
                 const int64_t m = (int64_t) by_e[(size_t) e].size();
-                if (m >= gemm_min) rg += (m + 7) & ~(int64_t) 7;
+                if (m >= gemm_min) { rg += (m + 7) & ~(int64_t) 7; ++ng_all; nt_all += (m + 127) / 128 * (2 * F / 128 + H / 128); }
                 else if (im.planar && im.card_of[(size_t) im.key(l, e)] >= 0) njp += (m + kMaxJobTok - 1) / kMaxJobTok;
                 else njr += (m + kMaxJobTok - 1) / kMaxJobTok;
             }
             const int64_t nbat = (njp + BJ - 1) / BJ + (njr + BJ - 1) / BJ;
-            const size_t need = 4 * 256 + (size_t) rg * 4 + (size_t) n * K * 4 +
-                                (size_t) nbat * ((size_t) BJ * sizeof(XeJob) + (size_t) n * K * 4 + 512);
+            const size_t need = 4 * 256 + (size_t) rg * 4 + zc_rounds * ((size_t) n * K * 4 + 512) +
+                                ((size_t) nbat + zc_rounds) * ((size_t) BJ * sizeof(XeJob) + (size_t) n * K * 4 + 512) +
+                                (zc ? (size_t) 3 * ng_all * sizeof(xe::DqJob) + (size_t) nt_all * sizeof(xe::DqTile) + zc_rounds * 1024 : 0);
             if (c.nw_cap < need) {
                 std::lock_guard<PrioMutex> lk(g_submit);
                 c.q.wait();   // nothing of this call reads the old staging yet; the previous call's combine waited
@@ -3898,8 +3903,10 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
                 int32_t* dtok = (int32_t*) take((size_t) R * 4);
                 xe::DqJob* djobs = (xe::DqJob*) take(jbytes);
                 xe::DqTile* dtiles = (xe::DqTile*) take(tbytes);
-                xe::DqJob* hjobs = (xe::DqJob*) c.dq_host;
-                xe::DqTile* htiles = (xe::DqTile*) (c.dq_host + jbytes);
+                // larry, patch-zcopy3: under ZCOPY each round's tables in fresh per-call staging (round 0 must not
+                // overwrite what round -1's table copies have yet to read: no host wait between them any more)
+                xe::DqJob* hjobs = zc ? (xe::DqJob*) nw_take(jbytes) : (xe::DqJob*) c.dq_host;
+                xe::DqTile* htiles = zc ? (xe::DqTile*) nw_take(tbytes) : (xe::DqTile*) (c.dq_host + jbytes);
                 ptok.assign((size_t) R, 0);
                 std::fill(S.begin(), S.end(), -1);
                 for (size_t i = 0; i < NG; ++i) {
