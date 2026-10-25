@@ -22,6 +22,7 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <fcntl.h>
 #include <spawn.h>
 #include <dirent.h>
 #include <sstream>
@@ -2881,6 +2882,23 @@ struct StallWatch {
                 pid_t pp = 0;
                 if (posix_spawnp(&pp, "perf", nullptr, nullptr, const_cast<char * const *>(av), ::environ) == 0)
                     std::fprintf(stderr, "stall watch (%s): perf sampling thread %d -> %s\n", what, (int) tid, out);
+            }
+            // larry, STRATA_STALL_GDB (patch-stallwatch4): every thread's backtrace, once the stall is 400 ms old
+            static const bool gdb_on = std::getenv("STRATA_STALL_GDB") && std::getenv("STRATA_STALL_GDB")[0] == '1';
+            static int gdb_n = 0;
+            if (gdb_on && gdb_n < 3 && !cv.wait_for(lk, std::chrono::milliseconds(100), [this] { return done; })) {
+                char pidb[16], out[160];
+                std::snprintf(pidb, sizeof pidb, "%d", (int) getpid());
+                std::snprintf(out, sizeof out, "/opt/ai/dsv41/logs/stall.%d.%d.gdb", (int) getpid(), gdb_n++);
+                posix_spawn_file_actions_t fa;
+                posix_spawn_file_actions_init(&fa);
+                posix_spawn_file_actions_addopen(&fa, 1, out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                posix_spawn_file_actions_adddup2(&fa, 1, 2);
+                const char * av[] = { "gdb", "-p", pidb, "-batch", "-nx", "-ex", "set pagination off", "-ex", "thread apply all bt 40", nullptr };
+                pid_t pp = 0;
+                if (posix_spawnp(&pp, "gdb", &fa, nullptr, const_cast<char * const *>(av), ::environ) == 0)
+                    std::fprintf(stderr, "stall watch (%s): gdb backtraces -> %s\n", what, out);
+                posix_spawn_file_actions_destroy(&fa);
             }
             while (!done) {
                 char path[64];
