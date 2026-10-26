@@ -1,0 +1,5 @@
+== bd_q1 [q: --route-bias 0.25 --route-bias-file 0.15] = 46.39 tok/s experts 104144 hit / 4313 cpu 96.0% VRAM hits  | 2.151 tokens/pass verify 41.4 ms/pass  rc=0
+== bd_q2 [q: --route-bias 0.25 --route-bias-file 0.15] = 47.01 tok/s experts 105006 hit / 4474 cpu 95.9% VRAM hits  | 2.306 tokens/pass verify 44.2 ms/pass  rc=0
+[qb_q1 q] PPL 2.0091  mean NLL 0.6977 over 2047 tokens, top-1 0.843 | experts 484360 hit / 7160 cpu rc=0
+KL qb_x1 || qb_q1: 2048 rows: KL mean 1.451e-02  p99 1.131e-01  max 1.308e+01;  top-1 agreement 0.9775 ppl A 2.0103  ppl B 2.0091  (2047 tokens) 
+TBIAS2 done 08:47:29

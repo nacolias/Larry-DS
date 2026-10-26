@@ -1,0 +1,548 @@
+{
+ "summary": {
+  "ds/ALL": {
+   "rows": 20470,
+   "kl_mean": 0.3177647210460039,
+   "kl_median": 0.04010471505250643,
+   "kl_p99": 4.0246360789018505,
+   "top1_agree": 0.8296042989741085,
+   "ppl_teacher": 3.878096915136521,
+   "ppl_engine": 4.501877658377535
+  },
+  "ds/agent": {
+   "rows": 4094,
+   "kl_mean": 0.31823403558910013,
+   "kl_median": 0.012631589296566832,
+   "kl_p99": 3.9338638078157424,
+   "top1_agree": 0.8549096238397655,
+   "ppl_teacher": 3.136021836522653,
+   "ppl_engine": 3.3283568108625534
+  },
+  "ds/code": {
+   "rows": 4094,
+   "kl_mean": 0.1356222445611867,
+   "kl_median": 0.0133750996391521,
+   "kl_p99": 1.668705061621754,
+   "top1_agree": 0.8937469467513435,
+   "ppl_teacher": 2.6693939041200765,
+   "ppl_engine": 2.8752513813781775
+  },
+  "ds/en": {
+   "rows": 4094,
+   "kl_mean": 0.3002936853365621,
+   "kl_median": 0.15574464878650335,
+   "kl_p99": 3.0206247386367435,
+   "top1_agree": 0.765266243282853,
+   "ppl_teacher": 10.301797769211312,
+   "ppl_engine": 12.1169554189992
+  },
+  "ds/math": {
+   "rows": 4094,
+   "kl_mean": 0.16088790881712542,
+   "kl_median": 0.0046731850884883675,
+   "kl_p99": 2.548561465640007,
+   "top1_agree": 0.9145090376160234,
+   "ppl_teacher": 1.6627003782580143,
+   "ppl_engine": 1.7856387756091436
+  },
+  "ds/zh": {
+   "rows": 4094,
+   "kl_mean": 0.6737857309260454,
+   "kl_median": 0.15959657654379955,
+   "kl_p99": 5.93004138213797,
+   "top1_agree": 0.7195896433805569,
+   "ppl_teacher": 6.117507805374729,
+   "ppl_engine": 8.930496939454864
+  },
+  "dx/ALL": {
+   "rows": 20470,
+   "kl_mean": 0.27301485065576664,
+   "kl_median": 0.03270443588559758,
+   "kl_p99": 3.678190305213615,
+   "top1_agree": 0.8413776257938447,
+   "ppl_teacher": 3.878096915136521,
+   "ppl_engine": 4.354174421575724
+  },
+  "dx/agent": {
+   "rows": 4094,
+   "kl_mean": 0.30365313281835177,
+   "kl_median": 0.010832949407293558,
+   "kl_p99": 4.177538610202377,
+   "top1_agree": 0.8607718612603811,
+   "ppl_teacher": 3.136021836522653,
+   "ppl_engine": 3.2887926994720056
+  },
+  "dx/code": {
+   "rows": 4094,
+   "kl_mean": 0.13190629020657943,
+   "kl_median": 0.01295948548218244,
+   "kl_p99": 1.5717559135480725,
+   "top1_agree": 0.8927699071812408,
+   "ppl_teacher": 2.6693939041200765,
+   "ppl_engine": 2.8754140608665453
+  },
+  "dx/en": {
+   "rows": 4094,
+   "kl_mean": 0.252287645878131,
+   "kl_median": 0.1296575408161249,
+   "kl_p99": 2.6667416353791773,
+   "top1_agree": 0.7806546165119688,
+   "ppl_teacher": 10.301797769211312,
+   "ppl_engine": 11.68189687596486
+  },
+  "dx/math": {
+   "rows": 4094,
+   "kl_mean": 0.14588782736731878,
+   "kl_median": 0.003787868109617309,
+   "kl_p99": 2.6462808308562384,
+   "top1_agree": 0.9218368343917929,
+   "ppl_teacher": 1.6627003782580143,
+   "ppl_engine": 1.7777193943513063
+  },
+  "dx/zh": {
+   "rows": 4094,
+   "kl_mean": 0.5313393570084521,
+   "kl_median": 0.11419106767947715,
+   "kl_p99": 5.351017713887922,
+   "top1_agree": 0.7508549096238397,
+   "ppl_teacher": 6.117507805374729,
+   "ppl_engine": 7.96921677983494
+  },
+  "pp/ALL": {
+   "rows": 36846,
+   "kl_mean": 0.29102290775372625,
+   "kl_median": 0.021854875724841218,
+   "kl_p99": 4.118243603747692,
+   "top1_agree": 0.8498344460728438,
+   "ppl_teacher": 3.15627301627189,
+   "ppl_engine": 3.633615869556878
+  },
+  "pp/agent": {
+   "rows": 8188,
+   "kl_mean": 0.31649519676565124,
+   "kl_median": 0.010757215855267885,
+   "kl_p99": 4.732207416057948,
+   "top1_agree": 0.8672447484123107,
+   "ppl_teacher": 2.84949009691006,
+   "ppl_engine": 3.1691823187844474
+  },
+  "pp/code": {
+   "rows": 8188,
+   "kl_mean": 0.10331385671671166,
+   "kl_median": 0.0021535780356299007,
+   "kl_p99": 1.5319722996003842,
+   "top1_agree": 0.9202491450903761,
+   "ppl_teacher": 1.932608663926672,
+   "ppl_engine": 2.0498879324673007
+  },
+  "pp/en": {
+   "rows": 8188,
+   "kl_mean": 0.31475432750484394,
+   "kl_median": 0.12927329780168945,
+   "kl_p99": 3.183459741274474,
+   "top1_agree": 0.7817537860283341,
+   "ppl_teacher": 7.080316770472689,
+   "ppl_engine": 8.124384462285647
+  },
+  "pp/math": {
+   "rows": 6141,
+   "kl_mean": 0.1648157966470408,
+   "kl_median": 0.0035036516894138723,
+   "kl_p99": 3.041215411822241,
+   "top1_agree": 0.9197199153232373,
+   "ppl_teacher": 1.6569448996112512,
+   "ppl_engine": 1.785357994990227
+  },
+  "pp/zh": {
+   "rows": 6141,
+   "kl_mean": 0.6019038085590408,
+   "kl_median": 0.07826345258390903,
+   "kl_p99": 6.106828339073876,
+   "top1_agree": 0.7536231884057971,
+   "ppl_teacher": 4.512885258728763,
+   "ppl_engine": 6.511559636648203
+  }
+ },
+ "per_seq": [
+  {
+   "tag": "ds",
+   "seq": 0,
+   "domain": "en",
+   "name": "en0:'Your Favourite London Sounds\\n\\nYour Favou'",
+   "kl": 0.33187540887647243,
+   "top1": 0.7547630679042501,
+   "ppl_teacher": 12.950659414412371,
+   "ppl_engine": 14.673212508870524
+  },
+  {
+   "tag": "ds",
+   "seq": 1,
+   "domain": "en",
+   "name": "en1:'Misteryo sa Tuwa\\n\\nMisteryo sa Tuwa (Engl'",
+   "kl": 0.26871196179665174,
+   "top1": 0.7757694186614558,
+   "ppl_teacher": 8.194720738283158,
+   "ppl_engine": 10.006030277095446
+  },
+  {
+   "tag": "ds",
+   "seq": 4,
+   "domain": "zh",
+   "name": "zh0:'\u7d0d\u74e6\u8377\u8a9e\\n\\n\u7d0d\u74e6\u8377\u8a9e\uff0c\u53c8\u79f0-{zh-hans:\u7eb3\u74e6\u8377\u8bed;zh-hant:\u7d0d\u74e6\u970d\u8a9e'",
+   "kl": 0.6018082880530052,
+   "top1": 0.794333170493405,
+   "ppl_teacher": 2.994005730785488,
+   "ppl_engine": 4.225590816430845
+  },
+  {
+   "tag": "ds",
+   "seq": 5,
+   "domain": "zh",
+   "name": "zh1:'\u795e\u8c37\u6d69\u53f2\\n\\n\u795e\u8c37\u6d69\u53f2\uff08\uff1b\uff09\uff0c\u65e5\u672c\u7537\u6027\u8072\u512a\u517c\u6b4c\u624b\uff0c\u6240\u5c6c\u7d93\u7d00\u516c\u53f8\u70ba\u9752\u4e8c\u88fd\u4f5c\uff0c\u5531\u7247\u516c\u53f8'",
+   "kl": 0.7457631737990855,
+   "top1": 0.6448461162677088,
+   "ppl_teacher": 12.499609257261657,
+   "ppl_engine": 18.873993969197638
+  },
+  {
+   "tag": "ds",
+   "seq": 7,
+   "domain": "math",
+   "name": "math0:'Problem: Find the number of ordered pair'",
+   "kl": 0.12731699258368975,
+   "top1": 0.9193942354665364,
+   "ppl_teacher": 1.6343402353870617,
+   "ppl_engine": 1.7479348651067197
+  },
+  {
+   "tag": "ds",
+   "seq": 8,
+   "domain": "math",
+   "name": "math1:'Problem: You have 5 shirts, 6 pairs of p'",
+   "kl": 0.19445882505056108,
+   "top1": 0.9096238397655105,
+   "ppl_teacher": 1.6915526449146059,
+   "ppl_engine": 1.8241559800709441
+  },
+  {
+   "tag": "ds",
+   "seq": 10,
+   "domain": "agent",
+   "name": "iterative__dvc-3711",
+   "kl": 0.377428113618972,
+   "top1": 0.8207132388861749,
+   "ppl_teacher": 4.42869144736262,
+   "ppl_engine": 4.545520814549303
+  },
+  {
+   "tag": "ds",
+   "seq": 11,
+   "domain": "agent",
+   "name": "alanmcruickshank__sqlfluff-336",
+   "kl": 0.25903995755922826,
+   "top1": 0.8891060087933561,
+   "ppl_teacher": 2.2206633891831964,
+   "ppl_engine": 2.4371154620955235
+  },
+  {
+   "tag": "ds",
+   "seq": 14,
+   "domain": "code",
+   "name": "xe_tier_groute",
+   "kl": 0.11552693745112966,
+   "top1": 0.885686370297997,
+   "ppl_teacher": 3.663982491650982,
+   "ppl_engine": 3.9004531684554835
+  },
+  {
+   "tag": "ds",
+   "seq": 16,
+   "domain": "code",
+   "name": "ds_model_py",
+   "kl": 0.15571755167124376,
+   "top1": 0.9018075232046898,
+   "ppl_teacher": 1.9447865353042713,
+   "ppl_engine": 2.1195153868212566
+  },
+  {
+   "tag": "dx",
+   "seq": 0,
+   "domain": "en",
+   "name": "en0:'Your Favourite London Sounds\\n\\nYour Favou'",
+   "kl": 0.2774561990737509,
+   "top1": 0.7791890571568149,
+   "ppl_teacher": 12.950659414412371,
+   "ppl_engine": 14.145764946890358
+  },
+  {
+   "tag": "dx",
+   "seq": 1,
+   "domain": "en",
+   "name": "en1:'Misteryo sa Tuwa\\n\\nMisteryo sa Tuwa (Engl'",
+   "kl": 0.22711909268251107,
+   "top1": 0.7821201758671226,
+   "ppl_teacher": 8.194720738283158,
+   "ppl_engine": 9.647178157776247
+  },
+  {
+   "tag": "dx",
+   "seq": 4,
+   "domain": "zh",
+   "name": "zh0:'\u7d0d\u74e6\u8377\u8a9e\\n\\n\u7d0d\u74e6\u8377\u8a9e\uff0c\u53c8\u79f0-{zh-hans:\u7eb3\u74e6\u8377\u8bed;zh-hant:\u7d0d\u74e6\u970d\u8a9e'",
+   "kl": 0.4961281439199147,
+   "top1": 0.8138739618954568,
+   "ppl_teacher": 2.994005730785488,
+   "ppl_engine": 3.841708185367441
+  },
+  {
+   "tag": "dx",
+   "seq": 5,
+   "domain": "zh",
+   "name": "zh1:'\u795e\u8c37\u6d69\u53f2\\n\\n\u795e\u8c37\u6d69\u53f2\uff08\uff1b\uff09\uff0c\u65e5\u672c\u7537\u6027\u8072\u512a\u517c\u6b4c\u624b\uff0c\u6240\u5c6c\u7d93\u7d00\u516c\u53f8\u70ba\u9752\u4e8c\u88fd\u4f5c\uff0c\u5531\u7247\u516c\u53f8'",
+   "kl": 0.5665505700969896,
+   "top1": 0.6878358573522227,
+   "ppl_teacher": 12.499609257261657,
+   "ppl_engine": 16.53129624105702
+  },
+  {
+   "tag": "dx",
+   "seq": 7,
+   "domain": "math",
+   "name": "math0:'Problem: Find the number of ordered pair'",
+   "kl": 0.11028846100807493,
+   "top1": 0.9325842696629213,
+   "ppl_teacher": 1.6343402353870617,
+   "ppl_engine": 1.731679700029462
+  },
+  {
+   "tag": "dx",
+   "seq": 8,
+   "domain": "math",
+   "name": "math1:'Problem: You have 5 shirts, 6 pairs of p'",
+   "kl": 0.18148719372656263,
+   "top1": 0.9110893991206643,
+   "ppl_teacher": 1.6915526449146059,
+   "ppl_engine": 1.8249831334276239
+  },
+  {
+   "tag": "dx",
+   "seq": 10,
+   "domain": "agent",
+   "name": "iterative__dvc-3711",
+   "kl": 0.37719842384081426,
+   "top1": 0.8236443575964827,
+   "ppl_teacher": 4.42869144736262,
+   "ppl_engine": 4.51502263033498
+  },
+  {
+   "tag": "dx",
+   "seq": 11,
+   "domain": "agent",
+   "name": "alanmcruickshank__sqlfluff-336",
+   "kl": 0.23010784179588922,
+   "top1": 0.8978993649242795,
+   "ppl_teacher": 2.2206633891831964,
+   "ppl_engine": 2.395593179850328
+  },
+  {
+   "tag": "dx",
+   "seq": 14,
+   "domain": "code",
+   "name": "xe_tier_groute",
+   "kl": 0.11257919087896893,
+   "top1": 0.8842208109428432,
+   "ppl_teacher": 3.663982491650982,
+   "ppl_engine": 3.895606898179168
+  },
+  {
+   "tag": "dx",
+   "seq": 16,
+   "domain": "code",
+   "name": "ds_model_py",
+   "kl": 0.1512333895341899,
+   "top1": 0.9013190034196384,
+   "ppl_teacher": 1.9447865353042713,
+   "ppl_engine": 2.122392283803984
+  },
+  {
+   "tag": "pp",
+   "seq": 0,
+   "domain": "en",
+   "name": "en0:'Your Favourite London Sounds\\n\\nYour Favou'",
+   "kl": 0.2759313363968377,
+   "top1": 0.7879824132877381,
+   "ppl_teacher": 12.950659414412371,
+   "ppl_engine": 14.22734635887909
+  },
+  {
+   "tag": "pp",
+   "seq": 1,
+   "domain": "en",
+   "name": "en1:'Misteryo sa Tuwa\\n\\nMisteryo sa Tuwa (Engl'",
+   "kl": 0.22814632604453355,
+   "top1": 0.78114313629702,
+   "ppl_teacher": 8.194720738283158,
+   "ppl_engine": 9.68136770657151
+  },
+  {
+   "tag": "pp",
+   "seq": 2,
+   "domain": "en",
+   "name": "en2:\"Kostas Fortounis\\n\\nKonstantinos 'Kostas' \"",
+   "kl": 0.3634215349416698,
+   "top1": 0.7787005373717636,
+   "ppl_teacher": 4.473153359897481,
+   "ppl_engine": 4.928724770756634
+  },
+  {
+   "tag": "pp",
+   "seq": 3,
+   "domain": "en",
+   "name": "en3:'List of Pixar film references\\n\\nBeginning'",
+   "kl": 0.3915181126363348,
+   "top1": 0.7791890571568149,
+   "ppl_teacher": 5.293841385761046,
+   "ppl_engine": 6.417511874966617
+  },
+  {
+   "tag": "pp",
+   "seq": 4,
+   "domain": "zh",
+   "name": "zh0:'\u7d0d\u74e6\u8377\u8a9e\\n\\n\u7d0d\u74e6\u8377\u8a9e\uff0c\u53c8\u79f0-{zh-hans:\u7eb3\u74e6\u8377\u8bed;zh-hant:\u7d0d\u74e6\u970d\u8a9e'",
+   "kl": 0.49778687895621987,
+   "top1": 0.8114313629702002,
+   "ppl_teacher": 2.994005730785488,
+   "ppl_engine": 3.852994361596997
+  },
+  {
+   "tag": "pp",
+   "seq": 5,
+   "domain": "zh",
+   "name": "zh1:'\u795e\u8c37\u6d69\u53f2\\n\\n\u795e\u8c37\u6d69\u53f2\uff08\uff1b\uff09\uff0c\u65e5\u672c\u7537\u6027\u8072\u512a\u517c\u6b4c\u624b\uff0c\u6240\u5c6c\u7d93\u7d00\u516c\u53f8\u70ba\u9752\u4e8c\u88fd\u4f5c\uff0c\u5531\u7247\u516c\u53f8'",
+   "kl": 0.5693632785835033,
+   "top1": 0.6888128969223254,
+   "ppl_teacher": 12.499609257261657,
+   "ppl_engine": 16.59507988243301
+  },
+  {
+   "tag": "pp",
+   "seq": 6,
+   "domain": "zh",
+   "name": "zh2:'\u4e2d\u83ef\u53f0\u5317\u7537\u5b50\u7c43\u7403\u4ee3\u8868\u968a\\n\\n\u4e2d\u83ef\u81fa\u5317\u7537\u5b50\u7c43\u7403\u4ee3\u8868\u968a\u70ba\u4e2d\u83ef\u6c11\u570b\u53c3\u52a0\u570b\u969b\u7537\u5b50\u7c43\u7403\u8cfd\u4e8b\u7684'",
+   "kl": 0.738561268137399,
+   "top1": 0.7606253053248656,
+   "ppl_teacher": 2.455917708087599,
+   "ppl_engine": 4.317947389747715
+  },
+  {
+   "tag": "pp",
+   "seq": 7,
+   "domain": "math",
+   "name": "math0:'Problem: Find the number of ordered pair'",
+   "kl": 0.10985512126467215,
+   "top1": 0.9291646311675623,
+   "ppl_teacher": 1.6343402353870617,
+   "ppl_engine": 1.7305013733493542
+  },
+  {
+   "tag": "pp",
+   "seq": 8,
+   "domain": "math",
+   "name": "math1:'Problem: You have 5 shirts, 6 pairs of p'",
+   "kl": 0.1827283287271963,
+   "top1": 0.9130434782608695,
+   "ppl_teacher": 1.6915526449146059,
+   "ppl_engine": 1.8196583091093719
+  },
+  {
+   "tag": "pp",
+   "seq": 9,
+   "domain": "math",
+   "name": "math2:'Question: Kimberly bought 8 packages of '",
+   "kl": 0.201863939949254,
+   "top1": 0.9169516365412799,
+   "ppl_teacher": 1.6454936415514523,
+   "ppl_engine": 1.8072329862666097
+  },
+  {
+   "tag": "pp",
+   "seq": 10,
+   "domain": "agent",
+   "name": "iterative__dvc-3711",
+   "kl": 0.3867101310672474,
+   "top1": 0.8177821201758672,
+   "ppl_teacher": 4.42869144736262,
+   "ppl_engine": 4.676530557245788
+  },
+  {
+   "tag": "pp",
+   "seq": 11,
+   "domain": "agent",
+   "name": "alanmcruickshank__sqlfluff-336",
+   "kl": 0.2340746349670708,
+   "top1": 0.8978993649242795,
+   "ppl_teacher": 2.2206633891831964,
+   "ppl_engine": 2.3945384077937675
+  },
+  {
+   "tag": "pp",
+   "seq": 12,
+   "domain": "agent",
+   "name": "zalando-stups__pierone-cli-33",
+   "kl": 0.27649154479795157,
+   "top1": 0.8876404494382022,
+   "ppl_teacher": 2.6437495198448837,
+   "ppl_engine": 2.8449426919826517
+  },
+  {
+   "tag": "pp",
+   "seq": 13,
+   "domain": "agent",
+   "name": "Backblaze__b2-sdk-python-305",
+   "kl": 0.36870447623033525,
+   "top1": 0.865657059110894,
+   "ppl_teacher": 2.5356548981906744,
+   "ppl_engine": 3.166429265498953
+  },
+  {
+   "tag": "pp",
+   "seq": 14,
+   "domain": "code",
+   "name": "xe_tier_groute",
+   "kl": 0.1137742377564254,
+   "top1": 0.8827552515876893,
+   "ppl_teacher": 3.663982491650982,
+   "ppl_engine": 3.9096055550993505
+  },
+  {
+   "tag": "pp",
+   "seq": 15,
+   "domain": "code",
+   "name": "li_xmx",
+   "kl": 0.09186461708898476,
+   "top1": 0.9276990718124084,
+   "ppl_teacher": 1.6759421844620006,
+   "ppl_engine": 1.744687527763909
+  },
+  {
+   "tag": "pp",
+   "seq": 16,
+   "domain": "code",
+   "name": "ds_model_py",
+   "kl": 0.1532616861856172,
+   "top1": 0.8944797264289204,
+   "ppl_teacher": 1.9447865353042713,
+   "ppl_engine": 2.1234077267956524
+  },
+  {
+   "tag": "pp",
+   "seq": 17,
+   "domain": "code",
+   "name": "argparse_py",
+   "kl": 0.054354885835819294,
+   "top1": 0.9760625305324866,
+   "ppl_teacher": 1.1681304026247392,
+   "ppl_engine": 1.2190920026245224
+  }
+ ]
+}

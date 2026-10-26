@@ -1,0 +1,37 @@
+{
+  "exe": "@DS41_HOME@/ds41-xe-engine.sh",
+  "args": [
+    "-m",
+    "@DS41_HOME@/models/gsq1017/V41-GSQ-1017.gguf",
+    "--backend",
+    "gpu",
+    "--experts",
+    "gpu",
+    "--engram",
+    "@DS41_SRV@/engram-epg:@DS41_HOME@/models/gsq1017/engram-layers.1:@DS41_SRV@/gsq1017/engram-layers.14",
+    "--rank",
+    "@DS41_HOME@/models/gsq1017/rank.bin",
+    "--ctx",
+    "1048576",
+    "--stop",
+    "1",
+    "--route-bias",
+    "0.5",
+    "--route-bias-file",
+    "0.3",
+    "--prompt-batch",
+    "16384"
+  ],
+  "cwd": "@DS41_HOME@/xolotl",
+  "tokenizer": "@DS41_HOME@/models/gsq1017/tokenizer",
+  "model_name": "deepseek-v4.1-flash-1017",
+  "log": "@DS41_HOME@/logs/engine.log",
+  "port": 18080,
+  "gpu": 0,
+  "sampling": {
+    "temperature": 1,
+    "top_p": 0.95
+  },
+  "api_monitor": false,
+  "reasoning_budget_tokens": 32768
+}

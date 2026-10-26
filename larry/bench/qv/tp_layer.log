@@ -1,0 +1,15 @@
+start 10:25:22
+contexts equal: 1
+gate 8533274 iterations (~250 ms); delay kernel 34.1 iterations/us
+weights up in 1.0 s
+micro: 200 dependent 1-us kernels: eager 1.49 us each, graph replay 1.54 us each (a 2000-us delay took 2011 us)
+micro: all-reduce of 5120 floats over 4 cards (3 copies out + a sum a card): 13.3 us each
+base  unfused: host-free  531.6 us a layer (21.26 ms a token) | host-paced  540.4 us a layer | 63.9 commands a layer on card 0 -> graph replay ~ 534.7 us a layer
+tp4   unfused: host-free  410.2 us a layer (16.41 ms a token) | host-paced  924.9 us a layer | 70.4 commands a layer on card 0 -> graph replay ~ 413.6 us a layer
+base  fused  : host-free  492.2 us a layer (19.69 ms a token) | host-paced  494.1 us a layer | 25.3 commands a layer on card 0 -> graph replay ~ 493.4 us a layer
+tp4   fused  : host-free  365.7 us a layer (14.63 ms a token) | host-paced  425.4 us a layer | 31.8 commands a layer on card 0 -> graph replay ~ 367.3 us a layer
+base  unfused graph replay:  503.8 us a layer (20.15 ms a token, four graph launches a token)
+tp4   unfused graph replay:  378.2 us a layer (15.13 ms a token, four graph launches a token)
+base  fused   graph replay:  474.2 us a layer (18.97 ms a token, four graph launches a token)
+tp4   fused   graph replay:  354.9 us a layer (14.20 ms a token, four graph launches a token)
+rc=0 10:25:36

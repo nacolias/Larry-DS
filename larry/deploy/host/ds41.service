@@ -1,0 +1,31 @@
+# ds41.service - the DeepSeek-V4.1 server on the four cards (larry's larry-ds41.service without its layout glue).
+# Edit User=/Group= (a user in the render group) and the paths, then:
+#   install -m755 larry/deploy/host/gpu-clock.sh /usr/local/sbin/ds41-gpu-clock
+#   install -m755 larry/deploy/host/mem-watch.sh /usr/local/sbin/ds41-mem-watch
+#   cp larry/deploy/host/ds41.service larry/deploy/host/ds41-watch.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl start ds41        # ~80-95 s to the first request; journalctl -u ds41, DS41_HOME/logs/engine.log
+[Unit]
+Description=DeepSeek-V4.1-Flash-1017 GSQ on four Arc Pro B70s (Xolotl ds41 engine + the Intel multi-card expert tier)
+# the memory watchdog runs before and during the model load
+Requires=ds41-watch.service
+After=network-online.target ds41-watch.service
+
+[Service]
+Type=exec
+User=ds41
+Group=ds41
+RuntimeDirectory=ds41
+RuntimeDirectoryMode=0700
+# the expert tier pins host memory (the RAM arena's first 24 GiB, staging buffers)
+LimitMEMLOCK=infinity
+Environment=DS41_HOME=/opt/ai/dsv41
+# larry: Environment=DS41_HOST=172.23.0.1 DS41_KEY_FILE=/opt/docker/vllm/.env DS41_UPLINK_PCI=0000:00:03.1
+# "+" = as root: the cards' clock floor at max while the model runs, restored on stop
+ExecStartPre=+/usr/local/sbin/ds41-gpu-clock pin
+ExecStart=/opt/ai/dsv41/ds41-serve.sh
+ExecStopPost=+/usr/local/sbin/ds41-gpu-clock restore
+TimeoutStartSec=1500
+TimeoutStopSec=120
+KillMode=mixed
+OOMScoreAdjust=1000
+Restart=no

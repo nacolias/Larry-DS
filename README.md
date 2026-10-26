@@ -1,3 +1,7 @@
+> **Larry-DS** (branch `larry-xe`): this fork runs DeepSeek-V4.1-Flash-1017 on **four Intel Arc Pro B70s** (SYCL /
+> Level Zero): an Intel multi-card expert tier, a tensor-parallel decode core and a ggml-sycl patch on Xolotl
+> `f7c561b7`. Start at **[larry/README.md](larry/README.md)**. Everything below is upstream Xolotl's README.
+
 <p align="center"><img src="docs/brand/assets/readme-header-1200.png" alt="Xolotl - frontier MoE models on one gaming PC" width="100%"></p>
 
 <h1 align="center">Xolotl</h1>

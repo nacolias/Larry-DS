@@ -1,0 +1,11 @@
+# ds41-watch.service - kills the ds41 server before host RAM runs out (mem-watch.sh); started with ds41.service
+[Unit]
+Description=DeepSeek-V4.1 memory watchdog (kills the ds41 server before host RAM runs out)
+BindsTo=ds41.service
+Before=ds41.service
+
+[Service]
+Type=exec
+Environment=WATCH_UNIT=ds41.service WATCH_HIDDEN_LIMIT_GIB=54 WATCH_AVAIL_FLOOR_GIB=6
+ExecStart=/usr/local/sbin/ds41-mem-watch
+Restart=no

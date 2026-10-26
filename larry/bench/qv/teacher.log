@@ -1,0 +1,109 @@
+2026-10-22 08:48:09 init
+2026-10-22 08:50:53 layer 0 start
+2026-10-22 08:56:30 layer 0 done: done in 325 s; load CV 0.739, unused 0, out rms 0.092
+2026-10-22 08:56:30 layer 1 start
+2026-10-22 09:06:42 layer 1 done: done in 602 s; load CV 0.907, unused 0, out rms 0.238
+2026-10-22 09:06:42 layer 2 start
+2026-10-22 09:14:31 layer 2 done: done in 462 s; load CV 1.263, unused 1, out rms 0.255
+2026-10-22 09:14:31 layer 3 start
+2026-10-22 09:21:29 layer 3 done: done in 408 s; load CV 1.440, unused 1, out rms 0.281
+2026-10-22 09:21:29 layer 4 start
+2026-10-22 09:27:36 layer 4 done: done in 363 s; load CV 1.073, unused 1, out rms 0.316
+2026-10-22 09:27:36 layer 5 start
+2026-10-22 09:33:28 layer 5 done: done in 348 s; load CV 1.029, unused 0, out rms 0.362
+2026-10-22 09:33:28 layer 6 start
+2026-10-22 09:39:49 layer 6 done: done in 378 s; load CV 1.105, unused 0, out rms 0.373
+2026-10-22 09:39:49 layer 7 start
+2026-10-22 09:45:45 layer 7 done: done in 353 s; load CV 1.292, unused 0, out rms 0.394
+2026-10-22 09:45:45 layer 8 start
+2026-10-22 09:52:07 layer 8 done: done in 378 s; load CV 1.268, unused 0, out rms 0.508
+2026-10-22 09:52:07 layer 9 start
+2026-10-22 09:58:00 layer 9 done: done in 348 s; load CV 1.140, unused 0, out rms 0.508
+2026-10-22 09:58:00 layer 10 start
+2026-10-22 10:04:01 layer 10 done: done in 354 s; load CV 1.074, unused 0, out rms 0.881
+2026-10-22 10:04:01 layer 11 start
+2026-10-22 10:09:45 layer 11 done: done in 341 s; load CV 1.162, unused 0, out rms 0.887
+2026-10-22 10:09:45 layer 12 start
+2026-10-22 10:15:35 layer 12 done: done in 347 s; load CV 1.088, unused 0, out rms 0.893
+2026-10-22 10:15:35 layer 13 start
+2026-10-22 10:21:20 layer 13 done: done in 335 s; load CV 0.929, unused 0, out rms 0.903
+2026-10-22 10:21:20 layer 14 start
+2026-10-22 10:21:25 layer 14 FAILED (logs/L14.log)
+2026-10-22 10:27:52 layer 14 start
+2026-10-22 10:33:48 layer 14 done: done in 353 s; load CV 1.278, unused 0, out rms 1.318
+2026-10-22 10:33:48 layer 15 start
+2026-10-22 10:37:28 layer 15 done: done in 218 s; load CV 1.061, unused 0, out rms 3.840
+2026-10-22 10:37:28 layer 16 start
+2026-10-22 10:40:51 layer 16 done: done in 201 s; load CV 1.391, unused 0, out rms 4.270
+2026-10-22 10:40:51 layer 17 start
+2026-10-22 10:44:17 layer 17 done: done in 204 s; load CV 1.043, unused 0, out rms 4.620
+2026-10-22 10:44:18 layer 18 start
+2026-10-22 10:47:42 layer 18 done: done in 203 s; load CV 1.015, unused 0, out rms 5.227
+2026-10-22 10:47:43 layer 19 start
+2026-10-22 10:51:05 layer 19 done: done in 201 s; load CV 1.023, unused 0, out rms 5.850
+2026-10-22 10:51:05 layer 20 start
+2026-10-22 10:54:59 layer 20 done: done in 232 s; load CV 1.272, unused 0, out rms 25.868
+2026-10-22 10:55:00 layer 21 start
+2026-10-22 10:58:25 layer 21 done: done in 203 s; load CV 1.083, unused 1, out rms 46.516
+2026-10-22 10:58:25 layer 22 start
+2026-10-22 11:01:48 layer 22 done: done in 200 s; load CV 1.151, unused 0, out rms 75.336
+2026-10-22 11:01:48 layer 23 start
+2026-10-22 11:05:13 layer 23 done: done in 203 s; load CV 0.911, unused 0, out rms 104.773
+2026-10-22 11:05:14 layer 24 start
+2026-10-22 11:09:04 layer 24 done: done in 229 s; load CV 1.135, unused 1, out rms 123.226
+2026-10-22 11:09:05 layer 25 start
+2026-10-22 11:12:29 layer 25 done: done in 202 s; load CV 1.317, unused 1, out rms 150.838
+2026-10-22 11:12:29 layer 26 start
+2026-10-22 11:15:52 layer 26 done: done in 201 s; load CV 1.137, unused 1, out rms 167.117
+2026-10-22 11:15:52 layer 27 start
+2026-10-22 11:19:17 layer 27 done: done in 202 s; load CV 1.168, unused 1, out rms 177.696
+2026-10-22 11:19:17 layer 28 start
+2026-10-22 11:23:10 layer 28 done: done in 231 s; load CV 1.312, unused 0, out rms 211.356
+2026-10-22 11:23:10 layer 29 start
+2026-10-22 11:26:35 layer 29 done: done in 203 s; load CV 1.070, unused 0, out rms 243.925
+2026-10-22 11:26:36 layer 30 start
+2026-10-22 11:29:58 layer 30 done: done in 201 s; load CV 1.092, unused 0, out rms 252.684
+2026-10-22 11:29:59 layer 31 start
+2026-10-22 11:33:24 layer 31 done: done in 204 s; load CV 1.166, unused 1, out rms 267.823
+2026-10-22 11:33:25 layer 32 start
+2026-10-22 11:37:14 layer 32 done: done in 227 s; load CV 1.137, unused 0, out rms 266.980
+2026-10-22 11:37:15 layer 33 start
+2026-10-22 11:40:33 layer 33 done: done in 196 s; load CV 1.081, unused 0, out rms 278.652
+2026-10-22 11:40:33 layer 34 start
+2026-10-22 11:43:53 layer 34 done: done in 198 s; load CV 1.057, unused 0, out rms 282.750
+2026-10-22 11:43:54 layer 35 start
+2026-10-22 11:47:11 layer 35 done: done in 196 s; load CV 1.049, unused 0, out rms 282.143
+2026-10-22 11:47:12 layer 36 start
+2026-10-22 11:50:58 layer 36 done: done in 224 s; load CV 1.446, unused 0, out rms 286.598
+2026-10-22 11:50:58 layer 37 start
+2026-10-22 11:54:17 layer 37 done: done in 197 s; load CV 1.133, unused 1, out rms 286.032
+2026-10-22 11:54:18 layer 38 start
+2026-10-22 11:57:36 layer 38 done: done in 196 s; load CV 1.001, unused 0, out rms 285.420
+2026-10-22 11:57:36 layer 39 start
+2026-10-22 12:01:00 layer 39 done: done in 202 s; load CV 0.982, unused 2, out rms 288.205
+2026-10-22 12:01:01 head
+12:01:08 head: s00 en ppl 12.9505 top1 0.477
+12:01:14 head: s01 en ppl 8.1946 top1 0.526
+12:01:20 head: s02 en ppl 4.4731 top1 0.649
+12:01:26 head: s03 en ppl 5.2938 top1 0.621
+12:01:33 head: s04 zh ppl 2.9940 top1 0.778
+12:01:39 head: s05 zh ppl 12.4995 top1 0.516
+12:01:45 head: s06 zh ppl 2.4559 top1 0.800
+12:01:51 head: s07 math ppl 1.6343 top1 0.872
+12:01:58 head: s08 math ppl 1.6916 top1 0.873
+12:02:04 head: s09 math ppl 1.6455 top1 0.897
+12:02:10 head: s10 agent ppl 4.4287 top1 0.724
+12:02:16 head: s11 agent ppl 2.2207 top1 0.835
+12:02:22 head: s12 agent ppl 2.6437 top1 0.814
+12:02:28 head: s13 agent ppl 2.5356 top1 0.812
+12:02:34 head: s14 code ppl 3.6640 top1 0.710
+12:02:41 head: s15 code ppl 1.6759 top1 0.867
+12:02:47 head: s16 code ppl 1.9448 top1 0.843
+12:02:53 head: s17 code ppl 1.1681 top1 0.968
+12:02:53 head: en     ppl 7.0803 top1 0.568 (8188 tokens)
+12:02:53 head: zh     ppl 4.5129 top1 0.698 (6141 tokens)
+12:02:53 head: math   ppl 1.6569 top1 0.881 (6141 tokens)
+12:02:53 head: agent  ppl 2.8495 top1 0.796 (8188 tokens)
+12:02:53 head: code   ppl 1.9326 top1 0.847 (8188 tokens)
+12:02:53 head: ALL    ppl 3.1563 top1 0.755 (36846 tokens)
+2026-10-22 12:02:54 TEACHER DONE
