@@ -68,6 +68,15 @@ morning, abwT112: 39.9), all prompts 59.5 s, decode 127 tok/s (122.9). With the 
 38.78 s - the same - but one server's 22K side request stalled (16.3 s against 8.6): the drop costs this workload
 nothing.
 
+**What bounds an agent turn now** (the same replay's engine log): a follow-up's expert phase is ~1.4-2.2 s whether it
+has 660 or 3,800 new tokens, its dense phase 0.2-1.3 s. A few hundred tokens already touch nearly every expert of
+every layer (top-6 of 384), so the ~40 % that live in the RAM arena (80.3 GiB, 7,753 experts, 10.6 MiB each) cross
+PCIe or run on the CPU pool every turn: a 3,618-token turn 14,855 VRAM hits / 319 CPU / **6,713 streamed** (~70 GiB,
+3.66 s), a 660-token turn 11,755 / **1,646 CPU** / 1,283 streamed (1.86 s). The four cards share one PCIe Gen4 x16
+uplink (~31.5 GB/s) and the CPU pool is DRAM-bound (the 5800X's two DDR4 channels): mid-size turns sit at the box's
+memory bandwidth. What would move it: fewer bytes per arena expert (a lower-bit quant of the cold experts - a quality
+trade) or more VRAM; the exact engine has little left there.
+
 ## Measured (2026-10-26 18:50 - 19:50: a 1M conversation's follow-up turn could run card 0 out of memory - more room the deeper the conversation)
 
 **Long contexts after the page-cache changes** (abwT141, one fresh server): the 131K needle 41.2 s (41.1 before), its
