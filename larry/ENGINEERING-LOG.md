@@ -62,6 +62,12 @@ each, interleaved, the depth allowance (2.0) in both:
 
 -3 to -4 % on prompts from 16K up, 8K even; the 1M turn passed with room to spare.
 
+**The agent replay on the final config** (abwT145, `agentx.py`: a coding session growing to ~43K tokens, 18 follow-ups
+of 17-6,500 new tokens and one 22K side request; two fresh servers each): follow-ups 38.90 / 38.81 s summed (this
+morning, abwT112: 39.9), all prompts 59.5 s, decode 127 tok/s (122.9). With the Engram drop off: follow-ups 39.77 /
+38.78 s - the same - but one server's 22K side request stalled (16.3 s against 8.6): the drop costs this workload
+nothing.
+
 ## Measured (2026-10-26 18:50 - 19:50: a 1M conversation's follow-up turn could run card 0 out of memory - more room the deeper the conversation)
 
 **Long contexts after the page-cache changes** (abwT141, one fresh server): the 131K needle 41.2 s (41.1 before), its
