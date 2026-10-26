@@ -48,6 +48,25 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 18:50 - 19:50: a 1M conversation's follow-up turn could run card 0 out of memory - more room the deeper the conversation)
+
+**Long contexts after the page-cache changes** (abwT141, one fresh server): the 131K needle 41.2 s (41.1 before), its
+turn 6.0 s; the 984K needle 357.0 s (356.6), found - but its 11,684-token follow-up turn **died**:
+`UR_RESULT_ERROR_OUT_OF_RESOURCES` in `DSV4_HC_PRE` on card 0. The same turn had passed in abwT132 (10.0 s).
+`STRATA_VRAM_TRACE=1` (abwT142, twice, both passed: 10.0 / 14.1 s): the keep-cache shrink left 10.27 GiB free on card 0
+and the 11.7K batch took all of it - **0.00 GiB free at its low point**; abwT141's shrink had left 9.85. Neither
+estimate covers a batch at 1M: the calibrated one (3.5 GiB + 0.45 MiB a column + the margin) nor the learned one (the
+last kept batches, depth-scaled); a bigger learned margin (`STRATA_SERVE_KEEP_LEARN_MARGIN_GIB=2.5`) changed nothing,
+the calibrated path sized that shrink. This morning's "the fused hc path dies at 1M" (abwT131, `DSV41_HC_FA`) was
+most likely the same edge, not the fused kernel.
+
+**`STRATA_SERVE_KEEP_LEARN_DEPTH_GIB`** (`patches/patch-keepdepth.py`, engine default 0; the service 2.0,
+`patches/svc-keepdepth.py`, backup `ds41-xe-engine.sh.pre-keepdepth-20261026`): a kept-cache batch gets g * min(1,
+tokens / 1M) GiB more room on card 0 - in the shrink (both estimates) and in the batch width. abwT143 (1.5): the
+shrink left 11.28 GiB, the batch took 10.54, **0.73 GiB free at its low point**, the turn 15.0 s. The service runs 2.0
+(~1.2 GiB to spare at 1M; +0.06 GiB on a 31K conversation). A 1M turn varies 10.0-15.0 s run to run (its experts phase
+2.6-8.1 s).
+
 ## Measured (2026-10-26 17:50 - 19:00: the stalls without touching swap - the load and the Engram reads stop flooding the page cache)
 
 **Where the pressure comes from** (`bench/speed/memtrace3.bt`: page-cache insertions by file, anonymous faults,
@@ -2180,6 +2199,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_HC_NORM_MV_WIDE` / `GGML_SYCL_NORM_MV_WIDE` | 1 (service, since 2026-10-26 10:23; engine 0) / 1 | the prompt path's hc mixes through `ggml_dsv41_norm_mv` / ggml-sycl's wide kernel for it (> 8 tokens; 0 = the per-row one) |
 | `GGML_SYCL_LARRY_SLICES_BATCH` | 0 | `larry_slices_gemm` (wo_a through mul_mat) as one strided gemm_batch into the [OL, n, OG] layout (`STRATA_OPROJ_A` supersedes it) |
 | `GGML_SYCL_OP_PROF_SHAPES` | 0 | with `GGML_SYCL_OP_PROF=1`: each label also carries the node's shape and its first source's name / type |
+| `STRATA_SERVE_KEEP_LEARN_DEPTH_GIB` | 2.0 (service, since 2026-10-26 19:45; engine 0) | a kept-cache prompt batch gets this many GiB * min(1, conversation tokens / 1M) more room on card 0 (shrink and width): a 984K conversation's 11.7K turn needed 10.54 GiB, more than either estimate (abwT141-143) |
 | `STRATA_XE_LOAD_DIRECT` | 1 | the tier's bulk reads at a start (the experts placed in VRAM and the arena, the replicas) through the blob source's O_DIRECT twin: 156-198 GB -> 2-6 GB through the page cache a start (abwT139); 0: the buffered reads |
 | `STRATA_ENGRAM_DROP` | 1 (service, since 2026-10-26 18:50; engine 0) | a prompt batch drops the Engram weight pages it read from the page cache (DONTNEED): no TTM backups / swap-ins from Engram's 12-14 GB a prompt set (abwT140); a repeated big prompt ~4 % slower |
 | `STRATA_DSPARK_CUM` | 0.5 (service, since 2026-10-26 17:30; engine 0 = off) | DSpark: the verify window also stops where the product of the drafts' confidences so far drops below this (besides `STRATA_DSPARK_CONF`'s floor on each; Project Maya's rule): 102.7 -> 106.2 tok/s on the decode tasks (abwT137) |

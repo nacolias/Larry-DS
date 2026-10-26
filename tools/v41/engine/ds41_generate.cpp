@@ -2008,6 +2008,10 @@ int main(int argc, char ** argv) {
             static int kl_end = 0;   // patch-keeplearn2: the learned turn's end position
             static const double kl_col = std::getenv("STRATA_SERVE_KEEP_LEARN_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_LEARN_COL_MIB")) : 0.6;
             static const double kl_margin = std::getenv("STRATA_SERVE_KEEP_LEARN_MARGIN_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_LEARN_MARGIN_GIB")) : 1.5;
+            // larry, STRATA_SERVE_KEEP_LEARN_DEPTH_GIB (patch-keepdepth.py): more room for a kept batch the deeper the
+            // conversation (abwT141 / abwT142: an 11.7K batch at 973K needed all of 10.27 GiB; with 9.85 it died)
+            static const double kl_depth = std::getenv("STRATA_SERVE_KEEP_LEARN_DEPTH_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_LEARN_DEPTH_GIB")) : 0.0;
+            const double kl_dadd = kl_depth * std::min(1.0, (double) total / 1048576.0) * 1073741824.0;   // bytes
             static bool kl_now = false;
             kl_now = false;
             // larry, STRATA_SERVE_KEEP_LEARN_HIST (patch-keephist.py): the last 8 kept batches - width, VRAM taken, end
@@ -2025,7 +2029,7 @@ int main(int argc, char ** argv) {
                     static const double kfix = std::getenv("STRATA_SERVE_BATCH_FIXED_GIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_FIXED_GIB")) : 4.3;
                     static const double kcol = std::getenv("STRATA_SERVE_BATCH_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_COL_MIB")) : 0.95;
                     double need = (kfix * 1073741824.0 + kcol * 1048576.0 * (double) std::min(dh, PB)) +
-                                  a.vram_margin_gib * 1073741824.0;
+                                  a.vram_margin_gib * 1073741824.0 + kl_dadd;
                     // larry, STRATA_SERVE_KEEP_LEARN: the last kept batch's own VRAM, plus the columns it did not have
                     kl_now = false;
                     if (kl_hist_on && !kl_hist.empty()) {   // larry, patch-keephist: the closest batch as wide, depth-scaled
@@ -2042,7 +2046,7 @@ int main(int argc, char ** argv) {
                             for (const KlEnt & e : kl_hist) if (!be || e.B > be->B) be = &e;
                             est = be->used * depth(*be) + kl_col * 1048576.0 * (double) (w - be->B);
                         }
-                        const double nl = est + kl_margin * 1073741824.0;
+                        const double nl = est + kl_margin * 1073741824.0 + kl_dadd;
                         if (nl < need) {
                             std::fprintf(stderr, "serve: keep-cache learned: a %d-token batch ending at %d took %.2f GiB -> %.2f GiB for "
                                          "this one (%d tokens ending at %d; calibrated %.2f)\n", be->B, be->end, be->used / 1073741824.0,
@@ -2054,7 +2058,7 @@ int main(int argc, char ** argv) {
                         }
                     } else if (keep_learn && kl_B > 0 && total <= std::max(kl_end, 16384)) {   // patch-keeplearn2: no deeper
                         const double nl = kl_used + kl_col * 1048576.0 * (double) std::max(0, std::min(dh, PB) - kl_B) +
-                                          kl_margin * 1073741824.0;
+                                          kl_margin * 1073741824.0 + kl_dadd;
                         if (nl < need) {
                             std::fprintf(stderr, "serve: keep-cache learned: the last batch (%d tokens) took %.2f GiB -> %.2f GiB "
                                          "for this one (calibrated %.2f)\n", kl_B, kl_used / 1073741824.0, nl / 1073741824.0,
@@ -2148,10 +2152,11 @@ int main(int argc, char ** argv) {
                 // expert cards: ~0.32 MiB of state a column on the dense card, measured with STRATA_VRAM_TRACE)
                 static const double fit_fixed = std::getenv("STRATA_SERVE_BATCH_FIXED_GIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_FIXED_GIB")) : 4.3;
                 static const double fit_col = std::getenv("STRATA_SERVE_BATCH_COL_MIB") ? std::atof(std::getenv("STRATA_SERVE_BATCH_COL_MIB")) : 0.95;
-                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - fit_fixed * 1073741824.0;
+                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - fit_fixed * 1073741824.0 -
+                                    (kept ? kl_dadd : 0.0);   // larry, patch-keepdepth.py
                 int fit = (int) std::max<int64_t>(2, (int64_t) (room / (fit_col * 1048576.0)));
                 if (kept && kl_now) {   // larry, STRATA_SERVE_KEEP_LEARN: the width from the same model as the shrink
-                    const double lr = (double) frb - kl_margin * 1073741824.0 - kl_sel_used;   // patch-keeplearn2 / keephist
+                    const double lr = (double) frb - kl_margin * 1073741824.0 - kl_sel_used - kl_dadd;   // patch-keeplearn2 / keephist / keepdepth
                     fit = (int) std::max<int64_t>(2, (int64_t) kl_sel_B + (int64_t) (lr / (kl_col * 1048576.0)));
                 }
                 pb_cap = std::min(PB, std::max(SB, fit));

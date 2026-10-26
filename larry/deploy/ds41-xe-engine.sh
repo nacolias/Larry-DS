@@ -175,6 +175,10 @@ export STRATA_SERVE_KEEP_LEARN="${STRATA_SERVE_KEEP_LEARN-1}"
 # after the batch left running while decode starts (published by the first TP pass after its copies): agent replay
 # follow-ups 45.9 -> 45.0 s, fresh prompts and decode even (abwT102)
 export STRATA_SERVE_KEEP_LEARN_HIST="${STRATA_SERVE_KEEP_LEARN_HIST-1}"
+# a kept batch's room on card 0 grows with the conversation: +2.0 GiB at 1M tokens (+0.06 at 31K)
+# abwT143 (1.5): a 984K conversation's 11.7K-token turn took 10.54 GiB, 0.73 GiB free at its low point (without: 0.00, or out of
+# memory - abwT141 / abwT142); 2.0 leaves ~1.2 GiB
+export STRATA_SERVE_KEEP_LEARN_DEPTH_GIB="${STRATA_SERVE_KEEP_LEARN_DEPTH_GIB-2.0}"
 export STRATA_SERVE_REGROW_ASYNC="${STRATA_SERVE_REGROW_ASYNC-1}"
 # the shared expert of a prompt call's parts of >= 4096 columns on the expert cards (card 0 bounds those batches):
 # fresh 16K 7.26 -> 7.00 s, 31K 12.72 -> 12.09 s; KL within the run-to-run floor; smaller parts slower (abwT102)

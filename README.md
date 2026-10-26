@@ -68,14 +68,14 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 ~18:50, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 ~19:50, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,477 then 1,855, 16K 2,402, 31K 3,053 - all four passphrases found |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 107.0 tok/s, 96.3 after the long prompts |
-| essays (3 x 800 tokens) | 78.2 tok/s, 77.8 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,483 then 1,867, 16K 2,404, 31K 3,043 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 102.6 tok/s, 98.9 after the long prompts |
+| essays (3 x 800 tokens) | 79.2 tok/s, 76.2 after the long prompts |
 | tool-call round trip | correct |
 | host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
 
@@ -107,7 +107,7 @@ since turned off; 973K: abwT132, the current config; 490K: Oct 24's build):
 | 131K | 41 s (3,192 tok/s; Oct 24: 80 s) | 86 tok/s |
 | 256K | 74 s (3,466 tok/s) | 82 tok/s |
 | 490K | 393 s (Oct 24) | 81 tok/s |
-| 973K | 357 s (2,729 tok/s; Oct 24: 1,140 s) | 67 tok/s; an 11.7K-token turn on it 10.0 s |
+| 973K | 357 s (2,729 tok/s; Oct 24: 1,140 s) | 67 tok/s; an 11.7K-token turn on it 10-15 s (once out of card 0's memory before `STRATA_SERVE_KEEP_LEARN_DEPTH_GIB`) |
 
 **Fidelity against DeepSeek's own release** (2026-10-22). The original FP8/FP4 model was teacher-forced on Larry's
 CPU with DeepSeek's `inference/model.py`, and compared on 36,846 tokens across 18 x 2,048-token sequences
