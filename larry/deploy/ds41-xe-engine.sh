@@ -73,9 +73,10 @@ export STRATA_HC_NORM_MV_WIDE="${STRATA_HC_NORM_MV_WIDE:-1}"
 # the fused hc ops at prompt widths too (patch-hcwide.py's wide hc_fa: 16 tokens a chunk's work-group, the mixes' rows
 # staged once): the separate hc_post / hc_pre / mixes and their state copies go - abwT124: fresh 16K 6.45 -> 6.23 s,
 # 31K 10.90 / 10.96 -> 10.55 / 10.35 s (here the prompt path's STRATA_HC_NORM_MV_WIDE is then unused)
-# OFF again since 2026-10-26 12:50 (8 = decode widths only): abwT131 - an 11,684-token turn at 973K context failed in
-# DSV41_HC_FA with UR_RESULT_ERROR_OUT_OF_RESOURCES (card 0 nearly full there); with 8 the same turn ran (abwT132)
-export STRATA_HC_FUSE_MAXN="${STRATA_HC_FUSE_MAXN:-8}"
+# (off 12:50-20:10: abwT131's 973K turn died in DSV41_HC_FA with UR OUT_OF_RESOURCES - the kept batch's VRAM edge at 1M,
+# which failed with it off too (abwT141) and STRATA_SERVE_KEEP_LEARN_DEPTH_GIB now covers; abwT144 with it on: fresh
+# 16K / 31K -3-4 %, the 984K needle 357 -> 346 s, its turn passed with 1.66 GiB free at the low point)
+export STRATA_HC_FUSE_MAXN="${STRATA_HC_FUSE_MAXN:-16384}"
 # the prompt attention's output in fp16 straight into wo_a's op (with STRATA_OPROJ_A): no f32 copy of it, no
 # conversion back
 # - abwT129 (two servers each): fresh 16K 6.25 / 6.29 -> 6.17 / 6.16 s, 31K 10.32-10.35 -> 10.16-10.27 s;

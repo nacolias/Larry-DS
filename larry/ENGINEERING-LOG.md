@@ -48,6 +48,20 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 19:50 - 20:15: the fused hc path back on - its 1M failure was the kept batch's VRAM edge)
+
+**`STRATA_HC_FUSE_MAXN=16384` again** (`patches/svc-hcon.py`, backup `ds41-xe-engine.sh.pre-hcon-20261026`): it was off
+since 12:50 because abwT131's 973K turn died in `DSV41_HC_FA` with `UR_RESULT_ERROR_OUT_OF_RESOURCES` - but abwT141's
+turn died the same way with it off, and the VRAM trace showed why (the section below). abwT144, two fresh servers
+each, interleaved, the depth allowance (2.0) in both:
+
+| | 8K first / again | 16K first / again | 31K first / again | 984K needle | its 11.7K turn |
+| --- | --- | --- | --- | --- | --- |
+| off (8) | 5.94, 5.90 / 4.53, 4.53 s | 6.70, 6.59 / 6.48, 6.44 s | 10.78, 10.72 / 10.94, 10.96 s | 357-358 s (abwT141-143) | - |
+| on (16384) | 5.91, 5.91 / 4.57, 4.47 s | **6.43, 6.43 / 6.24, 6.25 s** | **10.33, 10.29 / 10.67, 10.50 s** | **345.7 s**, found | 14.4 s, 1.66 GiB free at its low point |
+
+-3 to -4 % on prompts from 16K up, 8K even; the 1M turn passed with room to spare.
+
 ## Measured (2026-10-26 18:50 - 19:50: a 1M conversation's follow-up turn could run card 0 out of memory - more room the deeper the conversation)
 
 **Long contexts after the page-cache changes** (abwT141, one fresh server): the 131K needle 41.2 s (41.1 before), its
@@ -2184,7 +2198,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_DENSE_REQUANT` | q6_K | empty = keep the dense Q8_0 (slower decode, 1.7 GB more VRAM) |
 | `STRATA_PREREORDER_SLICES` | 1 | wo_a reordered per group slice at load: every prompt span takes the per-slice GEMM |
 | `GGML_SYCL_LARRY_F16CACHE_MB` / `_FREE_MB` | 768 / 3072 | prompt GEMMs keep fp16 copies of their weights across a batch's spans (0 = off) / VRAM kept free |
-| `STRATA_HC_FUSE_MAXN` | 8 | the fused hyper-connection ops for passes of at most this many tokens (prompt spans were slower fused) |
+| `STRATA_HC_FUSE_MAXN` | 16384 (service, since 2026-10-26 20:10; engine 8) | the fused hyper-connection ops for passes of at most this many tokens - prompt spans too since patch-hcwide.py's wide hc_fa (abwT144: fresh 16K / 31K -3-4 %, 984K 357 -> 346 s); 8 = decode widths only |
 | `STRATA_ENG_PIN`, `STRATA_ENG_PREFETCH` | 1 | prompt Engram rows in pinned memory + async upload; the next batch's rows read ahead (`STRATA_ENG_PROF=1` prints the phases) |
 | `GGML_SYCL_LARRY_MMID_Q2K`, `GGML_SYCL_LARRY_ARGMAX` | 1 | DSpark draft: device-side Q2_K experts for 2-8 tokens; argmax of long rows over 64 work-groups (`_CHECK=1` compare) |
 | `STRATA_DSPARK_DENSE_TYPE` | q6_K (service) | the draft's Q8_0 projections requantized on load (engine default: off); `STRATA_DSPARK_PROF=1` the draft's host phases |
