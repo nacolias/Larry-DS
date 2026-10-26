@@ -4097,10 +4097,29 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
         if (!c.busy) continue;
         const double tg0 = prof ? now_ms() : 0;
         uint8_t* const st0 = c.stream;   // a card keeping experts keeps its buffer (no regrow)
-        const size_t sneed = std::min<size_t>(stream_cap, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1));
+        // larry, STRATA_XE_STREAM_FIT (patch-streamfit.py): the buffer grows only into what the card has free beyond the
+        // call's other buffers - a long context's KV rows or the promotion cache must not leave it overcommitted
+        size_t cap_c = stream_cap;
+        static const int stream_fit = env_i("STRATA_XE_STREAM_FIT", 1);
+        static const double fit_margin = env_d("STRATA_XE_STREAM_FIT_MARGIN_GIB", 0.5);
+        if (stream_fit && !c.dense) {
+            const int64_t fr = c.free_vram();
+            if (fr >= 0) {
+                const int64_t room = fr + (int64_t) c.stream_bytes - (int64_t) (fit_margin * kGiB) - (int64_t) n * 100 * 1024;
+                const size_t fit = (size_t) std::max<int64_t>(room, (int64_t) 64 << 20);
+                if (fit < cap_c) {
+                    static int64_t nfit = 0;
+                    if (nfit++ < 20 || nfit % 1000 == 0)
+                        std::fprintf(stderr, "xe tier: card %d: stream buffer capped at %.0f MiB (%.2f GiB free, %d tokens) - more rounds\n",
+                                     c.idx, fit / 1048576.0, fr / kGiB, n);
+                    cap_c = fit;
+                }
+            }
+        }
+        const size_t sneed = std::min<size_t>(cap_c, std::max<size_t>((size_t) sbytes[(size_t) c.idx], 1));
         // with the prefetch on, a regrowth goes straight to the cap (planned into the prefetch's reserve)
-        const size_t sreq = !kept[(size_t) c.idx].empty() ? c.stream_bytes : im.pf_on && sneed > c.stream_bytes ? stream_cap : sneed;
-        if (!grow_stream(c, sreq, stream_cap)) {
+        const size_t sreq = !kept[(size_t) c.idx].empty() ? c.stream_bytes : im.pf_on && sneed > c.stream_bytes ? cap_c : sneed;
+        if (!grow_stream(c, sreq, cap_c)) {
             std::fprintf(stderr, "xe tier: card %d: stream buffer allocation failed (%.2f GiB free)\n", c.idx, c.free_vram() / kGiB);
             return false;
         }
