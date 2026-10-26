@@ -3,7 +3,7 @@
 > `larry-mode`, vllm-a, the studio, NPM and the public endpoint are Larry's own services. Here, `bench/...` and
 > `patches/...` are this directory's `bench/` and `patches/`. `logs/...` stayed on Larry, except `logs/provenance/`
 > (here `bench/provenance/`) and `qv/` (here `bench/qv/`). Commit hashes are this branch's. To set it up elsewhere,
-> start at [README.md](README.md).
+> start at the [top-level README](../README.md).
 
 # DeepSeek-V4.1-Flash-1017 on larry: `larry-mode ds41`
 

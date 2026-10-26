@@ -1,128 +1,241 @@
-> **Larry-DS** (branch `larry-xe`): this fork runs DeepSeek-V4.1-Flash-1017 on **four Intel Arc Pro B70s** (SYCL /
-> Level Zero): an Intel multi-card expert tier, a tensor-parallel decode core and a ggml-sycl patch on Xolotl
-> `f7c561b7`. Start at **[larry/README.md](larry/README.md)**. Everything below is upstream Xolotl's README.
+# Larry-DS: DeepSeek-V4.1-Flash-1017 on four Intel Arc Pro B70s
 
-<p align="center"><img src="docs/brand/assets/readme-header-1200.png" alt="Xolotl - frontier MoE models on one gaming PC" width="100%"></p>
+This repository serves [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) from
+one workstation, **Larry**: four Intel Arc Pro B70 (32 GB) cards, a Ryzen 7 5800X, 121 GiB of DDR4 and two NVMe
+drives. The model has 40 layers of 384 routed experts (top-6), Engram n-gram memory and a 1M-token context. It runs as
+the 163 GiB GSQ quant through an OpenAI- and Anthropic-compatible API.
 
-<h1 align="center">Xolotl</h1>
+It is a fork of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whose `ds41` engine runs this model on one
+NVIDIA card. This fork adds the Intel side: SYCL / Level Zero code that spreads the model over four Arc cards, system
+RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B change at a time, between 2026-10-19 and
+10-26. [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) is that record.
 
-<p align="center"><b>DeepSeek-V4.1-Flash - all 552 billion parameters - on one gaming PC, at 27 tok/s.</b><br>
-Plus GLM-5.3-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B: one engine, one OpenAI / Anthropic-compatible server.<br>
-Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended · Linux · NVIDIA · MIT</p>
+## Headline numbers
 
-> **A Strata fork.** Xolotl keeps [Strata](https://github.com/Niko1221/Strata)'s engine, server and kernels at its
-> core (merged at 0.1.44.1) and adds ~71,000 lines on top: the DeepSeek-V4.1 and V4-Flash engines, the GLM-5.3-Flash
-> engine and the Qwen3.8-27B dense port, each with its own quantisation and expert-tiering work.
->
-> **Starred this as Strata-DSV4.1?** You are in the right place. Strata-DSV4.1 grew into **Xolotl**: the same
-> DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
-> redirect here; nothing DeepSeek-V4.1 was removed.
+| | Larry, 2026-10-26 |
+| --- | --- |
+| fresh 8K-token prompt | 4.66 s |
+| fresh 31K-token prompt | 12.1 s (2,565 tok/s) |
+| follow-up turn of 500 new tokens at 38K context | 1.83 s |
+| chat replies (temperature 1, speculative decoding) | 95-103 tok/s |
+| agent-session replies (greedy) | 121 tok/s |
+| 984K-token prompt (an Oct 24 build) | 19 min, then 62 tok/s |
+| context window | 1,048,576 tokens |
+| perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
-## What one PC can do
+Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 2,589 tok/s on Oct 26. The full tables
+are under [Results](#results).
 
-**One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive.** Every number is measured on that machine,
-through the real server, while it solved real tasks (21 HumanEval problems, 10 tool-call tasks, 3 agentic bug-fix
-loops), greedy, thinking on with a 32K-token thinking budget.
+## How it works
 
-| Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
-| **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
-| **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
-| **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| | holds | runs |
+| --- | --- | --- |
+| card 0 | the dense half (attention, router, shared expert, Engram projection, head; Q8_0 requantized to Q6_K at load), an expert cache of ~19 GiB (~1,800 experts) | the dense half of prompts; its share of every decode pass |
+| cards 1-3 | ~24 GiB of experts each, their share of the dense half and the KV state, a 1 GiB flex region, the draft's share | their experts; their share of every decode pass |
+| RAM | the arena: the other experts, ~80 GiB (24 GiB of it pinned) | a 6-core CPU pool for arena experts |
+| NVMe | the Engram tables, 2 x 95 GiB (one per drive), plus a 98 GiB paged copy of layer 1's | ~48 small random reads a token |
 
-<sub>Decode = generation speed during those tasks. Prefill = a fresh 6K-17K-token prompt through the server
-(`tools/throughput.py`; Qwen3.8-Flash-Next: 3,430 / 3,005 tok/s at 6.5K / 16.7K, Qwen3.8-27B: 1,385 / 1,244 tok/s,
-DeepSeek-V4.1: 178 / 268 tok/s at 6.1K / 16.5K - its prompt batch is sized from free VRAM, ~6-9K tokens per sweep
-on a 24 GB card with the speculative-decode draft loaded).
-DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts (the default since 2026-10-17):
-187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
-(`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
-30K / 44K prompts. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
-[docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).</sub>
+About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
 
-**What that means in practice:**
+- **Decode is speculative and tensor-parallel.**
+  - DSpark (the checkpoint's own MTP heads) drafts up to 4 tokens, plus lookup drafts from the context.
+  - "engine1" (`tools/v41/engine/tp/`) verifies the drafts in one pass of up to 7 tokens over all four cards. The dense
+    half is split by heads and columns, and each card replays a SYCL graph.
+  - Arena experts a pass needs run on the CPU pool. Hot ones are promoted into the flex regions for later passes.
+- **Prompts are pipelined.**
+  - They run layer-major, in batches of up to 16,384 tokens. Card 0 runs the dense half while the expert cards
+    compute the routed experts.
+  - Batches of 3,072 tokens or more (once the context is past 5,000 tokens) get each layer's arena experts staged
+    onto the expert cards ahead of the layer. Pinned ones go by DMA; pageable ones the CPU writes straight into VRAM
+    through the cards' 32 GiB BARs.
+  - Card 0's expert cache lends a batch only the VRAM it needs, sized from the last batches, and refills in the
+    background.
+- **Kernels.** [`ggml-sycl-dsv41.patch`](tools/v41/engine/xe/ggml-sycl-dsv41.patch) is applied to llama.cpp at
+  Xolotl's pin. It adds:
+  - Xolotl's fused DeepSeek-V4 ops on SYCL;
+  - dp4a and XMX mat-vec kernels;
+  - the lightning indexer on XMX;
+  - layers 0-19's prompt attention through oneDNN's fused SDPA;
+  - an AVX2 Q2_0 dot for the CPU pool;
+  - an op profiler (off by default).
 
-- **A 552B frontier model as a local coding agent.** Point Claude Code, Codex, opencode or Open WebUI at it - tool
-  calls, streaming, prefix reuse across agent turns, a thinking budget.
-- **No server farm.** The weights (152 GiB for DeepSeek-V4.1) live across VRAM, pinned RAM and NVMe; the engine
-  carries up the experts each token needs.
-- **Fast where it counts.** The Qwen models run at 100-130 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
-  costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns.
+The multi-card expert tier is [`tools/v41/engine/xe/ds41_xe_tier.cpp`](tools/v41/engine/xe/ds41_xe_tier.cpp), and
+engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN.md).
 
-## Quick start
+## Results
 
-Linux, an NVIDIA GPU with 24 GB, CUDA 12.x/13.x, and RAM for the arena (90 GB was used above).
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 04:30-04:40, the
+current build):
 
-```bash
-git clone https://github.com/Indras-Mirror/Xolotl.git xolotl && cd xolotl
-bash tools/xolotl/fetch-llama.sh   # llama.cpp at the pinned commit + tools/xolotl/ggml/xolotl-ggml.patch -> third_party/llama.cpp
-cmake -S . -B build-xolotl -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
-  -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp -DSTRATA_DSV41_FQ_OP=ON \
-  -DSTRATA_DSV41_HC_MIX=ON
-ninja -C build-xolotl      # strata, strata-dense, glm_generate, ds41_generate, ds4_generate
-```
+| check | result |
+| --- | --- |
+| fresh needle prompts (prompt tok/s) | 8K 1,531 then 1,745, 16K 2,283, 31K 2,589 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 94.6 tok/s, 91.8 after the long prompts |
+| essays (3 x 800 tokens) | 69.7 tok/s, 69.1 after the long prompts |
+| tool-call round trip | correct |
+| host memory held by the GPU driver | 33 GiB at most (the watchdog acts at 54) |
 
-Get a model: DeepSeek-V4.1-Flash is **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
-(152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps). Then serve it
-(edit the model paths in its config first):
+Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 14 checks, the
+first chat pass ran 94.6-102.7 tok/s and the first essay 69.7-81.3 tok/s. In every check the first 8K needle, which
+follows the decode tests, is slower than the second.
 
-```bash
-python3 tools/v41/serve/serve_ds41.py --engine strata --config tools/v41/serve/strata-ds41.json --port 8150           # DeepSeek-V4.1-Flash
-python3 tools/glm/serve/serve_glm.py  --engine strata --config tools/glm/serve/strata-glm-maya-abl-512k.json --port 8144  # GLM-5.3-Flash
-python3 -m serve.server --engine strata --config <your-qwen-flash.json> --port 8130                                    # Qwen3.8-Flash-Next
-python3 -m serve.server --engine strata --config <your-27b.json> --port 8090                                          # Qwen3.8-27B (exe: build-xolotl/strata-dense)
-```
+**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 in the log, 2026-10-25/26: a server with
+the service's settings on a side port, greedy):
 
-Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port>/v1`.
+| prompt tokens | 530 | 1,021 | 2,003 | 3,003 | 4,519 | 8,054 | 16,099 | 31,008 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.66 | 7.00 | 12.09 |
 
-### Will it run on my machine? (DeepSeek-V4.1)
+**Follow-up turns** in a replayed agent session (synthetic, [`larry/bench/speed/agentx.py`](larry/bench/speed/agentx.py);
+context 8K-38K; abwT103):
+- 56 new tokens: 0.47-0.62 s.
+- 500: 1.83 s.
+- 1.4K: 2.66 s.
+- 3.7K: 3.9 s.
+- 6.5K: 4.46 s.
+- Agent replies: 121 tok/s (greedy).
 
-What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. Beyond that:
+**Long contexts** (2026-10-24, an earlier build; prompt then decode):
 
-- **OS:** Linux only for the DeepSeek engine for now (the launcher and the expert/Engram disk reads are Linux-specific).
-  The Strata core runs on Windows, but the DeepSeek side doesn't yet. WSL2 might work but is untested; keep the model
-  files inside WSL's own filesystem, not on a Windows drive.
-- **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
-  `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
-  had prompt-path crashes).
-- **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
-  prefill will be slower. Below 16 GB won't work.
-- **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the
-  NVMe each token and decode is slower. More RAM helps: around 256 GB holds every expert.
-- **Disks:** about 152 GiB for the quant plus ~200 GB for the Engram tables. Both want a fast NVMe on ext4 or NTFS.
-  **Not exFAT** (Linux's exFAT driver serialises parallel reads; expert reads were 5x slower here) and not a hard
-  drive (the Engram lookups are ~48 small random reads per token).
+| context | prompt | decode after it |
+| --- | --- | --- |
+| 129K | 80 s (1,610 tok/s) | 90 tok/s |
+| 490K | 393 s | 81 tok/s |
+| 984K | 1,140 s (863 tok/s) | 61.7 tok/s |
 
-## How it works, in one paragraph
+**Fidelity against DeepSeek's own release** (2026-10-22). The original FP8/FP4 model was teacher-forced on Larry's
+CPU with DeepSeek's `inference/model.py`, and compared on 36,846 tokens across 18 x 2,048-token sequences
+([`larry/bench/qv/`](larry/bench/qv/)):
 
-A mixture-of-experts model only uses a few experts per token. Xolotl keeps every expert somewhere - the hottest in
-VRAM, tens of GiB in a pinned RAM arena the GPU reads by DMA, the rest on NVMe read at the drive's ceiling - and
-moves the ones each token's router asks for, a layer ahead. Each model adds its own tricks: DeepSeek-V4.1 gets a
-calibrated mixed-precision quantisation, speculative decoding with exact sampling, a bit-exact 4-bit KV cache for 512K
-context and an arena that adapts to the conversation; GLM-5.3-Flash gets its abliteration LoRA on every path and soft
-pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up](docs/xolotl/HOW_IT_WORKS.md).**
+| | code | math | agent | English | Chinese | all |
+| --- | --- | --- | --- | --- | --- | --- |
+| perplexity ratio | 1.06 | 1.08 | 1.11 | 1.15 | 1.44 | 1.15 |
+| top-1 = original's | 92 % | 92 % | 87 % | 78 % | 75 % | 85 % |
 
-## Read more
+That is about a 2-2.5-bit quant's loss overall, smallest on code and math.
+
+## What Larry runs
 
 | | |
 | --- | --- |
-| [How Xolotl works](docs/xolotl/HOW_IT_WORKS.md) | the three memory tiers, per-model engines, the server, the agent-loop work |
-| [Benchmarks](docs/xolotl/BENCHMARKS.md) | every measured number, exactness checks, how to measure your own PC |
-| [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
-| [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
-| [Qwen3.8 / upstream Strata](README.strata.md) | the Strata engine this grew from |
-| [Brand kit](docs/brand/XOLOTL_BRAND.md) | logo, banner, palette |
+| GPUs | 4 x Intel Arc Pro B70 32 GB (BMG-G31, `8086:e223`), 32 GiB resizable BARs, behind one PCIe 4.0 x16 switch |
+| host | AMD Ryzen 7 5800X (8 cores), 121 GiB DDR4, NVMe: Sabrent 1 TB (`/opt`) + WD SN850X 1 TB (`/srv`) |
+| OS | Ubuntu 26.04.1 LTS, kernel 7.2.9 (self-built, `-bmg1`), the in-kernel `xe` driver |
+| kernel command line | `xe.force_probe=* i915.force_probe=* pci=realloc=off pci=disable_acs_redir=pci:8086:e2f0;pci:1000:c010` (ACS redirection off on the switch ports, for card-to-card copies) |
+| GPU runtime | `intel-opencl-icd` / `libze-intel-gpu1` / `intel-ocloc` 26.35.39758.17, `libze1` / `libze-dev` 1.32.0 (Launchpad PPA `kobuk-team/intel-graphics-testing`) |
+| oneAPI | DPC++ 2026.1.1, oneMKL 2026.1.0 (SYCL BLAS), oneDNN 2026.0.2 (`intel-oneapi-compiler-dpcpp-cpp-2026.1`, `intel-oneapi-mkl-devel-2026.1`, `intel-oneapi-dnnl-devel`) |
+| build | cmake 4.2, ninja 1.13, Python 3.14 |
+| model | [kaushikvira/DeepSeek-V4.1-Flash-1017-GSQ-agentic-strata](https://huggingface.co/kaushikvira/DeepSeek-V4.1-Flash-1017-GSQ-agentic-strata) at `7aa29158` (see [Provenance](#provenance)) |
 
-## Credits
+## Quickstart
 
-<img src="docs/brand/assets/logo-circle-400.png" alt="Xolotl" width="110" align="right">
+It is built and tuned for exactly this machine: four 32 GB B70s (AOT-compiled for `bmg-g31`), at least 128 GB of
+RAM, and about 360 GiB of NVMe (460 with the paged Engram copy), ideally split over two drives. Other card counts
+and GPUs are untested.
 
-Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 (its engine, server and kernels, merged at
-0.1.44.1) and [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp); the Qwen3.8-27B dense port is
-[perronemirko](https://github.com/perronemirko/Strata)'s. The DeepSeek-V4.1 and GLM-5.3-Flash engines, the GSQ quant
-and the unification are Indras Mirror's. Model weights: DeepSeek, Zhipu AI, Qwen, with quants and fine-tunes by
-peasantsmith, ukisai, d0xin and gcsa-abliterix.
+1. **Prerequisites.** The `xe` driver must bind all four cards with full-size BARs (`lspci -vv` shows `[size=32G]`).
+   Install the GPU runtime and oneAPI packages above, plus `build-essential cmake ninja-build git python3-venv
+   python3-dev`. The serving user needs the `render` group and unlimited locked memory (`LimitMEMLOCK=infinity` in
+   the unit).
+2. **Clone and build.** [`bootstrap.sh`](larry/deploy/bootstrap.sh) does the following:
+   - fetches llama.cpp at Xolotl's pin and applies both ggml patches;
+   - installs the deploy scripts and checks into `DS41_HOME` (default: the checkout's parent, `/opt/ai/dsv41`);
+   - creates the venv and builds `ds41_generate_xe` + `libds41_xe.so`.
 
-*Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
-from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.
+   ```bash
+   git clone -b larry-xe https://github.com/nacolias/Larry-DS.git /opt/ai/dsv41/xolotl
+   /opt/ai/dsv41/xolotl/larry/deploy/bootstrap.sh     # DS41_SRV=/srv/dsv41: the second drive; NINJA_JOBS=N if RAM is short
+   ```
+   On 2026-10-26 a clean clone from GitHub went through this on Larry. Its repo and ggml trees came out identical to
+   the live ones, and it built in under 10 minutes with `NINJA_JOBS=3` at nice 19.
+3. **Download the model** (163 GiB GGUF, 5.3 GiB DSpark sidecar, tokenizer, `rank.bin`, two 95 GiB Engram tables),
+   at the revision Larry runs:
+   ```bash
+   /opt/ai/dsv41/dl.sh main     # -> /opt/ai/dsv41/models/gsq1017 (~263 GiB)
+   /opt/ai/dsv41/dl.sh l14      # -> /srv/dsv41/gsq1017: layer 14's Engram table (~95 GiB); one drive: DS41_SRV=/opt/ai/dsv41/models
+   ```
+4. **Optional: the paged Engram copy** (98 GiB on the faster drive). Each row of layer 1's table becomes one aligned
+   4 KiB read instead of two random ones. The engine uses `engram-L1.epg` from the first `--engram` directory that
+   has it, and otherwise reads the shards:
+   ```bash
+   cd /opt/ai/dsv41 && mkdir -p /srv/dsv41/engram-epg
+   venv/bin/python -I xolotl/larry/bench/engram/engram_epg.py convert models/gsq1017/engram-layers.1/engram-L1.safetensors 1 /srv/dsv41/engram-epg/engram-L1.epg
+   venv/bin/python -I xolotl/larry/bench/engram/engram_epg.py verify  models/gsq1017/engram-layers.1/engram-L1.safetensors 1 /srv/dsv41/engram-epg/engram-L1.epg
+   ```
+5. **Smoke test** (one-shot, as root, with the service stopped):
+   ```bash
+   cd /opt/ai/dsv41
+   venv/bin/python tok.py enc logs/hello.i32 "Write a haiku about GPUs."
+   ./run.sh hello --ids-file logs/hello.i32 -n 64 && venv/bin/python tok.py dec - < logs/hello.out
+   grep -E "^(prompt|decode):" logs/hello.err
+   ```
+6. **Serve.**
+   - By hand: `/opt/ai/dsv41/ds41-serve.sh` (127.0.0.1:18080).
+   - As a service: [`larry/deploy/host/`](larry/deploy/host/) has `ds41.service` and its memory watchdog
+     `ds41-watch.service`, the GPU clock pin (`gpu-clock.sh`: the cards' minimum clock at max while the server runs)
+     and the watchdog script. Install steps are in `ds41.service`'s header.
+   - The first start writes the TP shard cache (`/srv/dsv41/tpcache`, 6 GiB). A normal start takes 80-95 s to the
+     first request.
+7. **Check it**: `/opt/ai/dsv41/tsvc2.sh` (as in Results; a few minutes). The checks read `DS41_URL` and
+   `DS41_API_KEY` / `DS41_KEY_FILE` ([`larry/checks/ds41api.py`](larry/checks/ds41api.py)).
+
+## Settings
+
+- **[`ds41-xe-engine.sh`](larry/deploy/ds41-xe-engine.sh)** holds every setting the service runs with, as
+  environment defaults. A variable already set wins. Each comment gives the A/B result that set the value.
+- **[`larry-ds41.json.in`](larry/deploy/larry-ds41.json.in)** holds the engine flags (`--ctx 1048576
+  --prompt-batch 16384 --route-bias 0.5 --route-bias-file 0.3`), the sampling defaults (temperature 1.0, top-p
+  0.95), and the model paths. `bootstrap.sh` renders it as `larry-ds41.json`.
+- [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) ("Knobs") lists the tier's knobs.
+
+The Larry-specific ones:
+- `STRATA_HOST_CPUS`, `STRATA_XE_POOL_WORKERS` and `STRATA_XE_HELPER_CPUS` follow the 5800X's core layout.
+- `STRATA_XE_PINNED_GIB=24` stays under the xe driver's TTM limit on GPU-driver host memory (~60.7 GiB on Larry). Never
+  pin past it: Larry hung once that way.
+- The VRAM budgets (`STRATA_XE_DENSE_GIB`, `_RESERVE_GIB`, `_FLEX_GIB`) assume 32 GB cards.
+- Larry also binds the server to its docker bridge (`DS41_HOST=172.23.0.1`), reads its key from a shared env file
+  (`DS41_KEY_FILE`), checks the switch's uplink (`DS41_UPLINK_PCI=0000:00:03.1`), and keeps `"api_monitor": true`.
+  `api_monitor` keeps the last 100 prompts and answers in memory for `/api-monitor`, so the template ships it off.
+
+## Known limits
+
+- **One request at a time** (first in, first out). A side request can park one long conversation.
+- **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
+  start beside it.
+- **The first prompts after a start are slower.** Their first calls load oneMKL's kernels and compile oneDNN's
+  attention partitions.
+- **Runs are not bit-reproducible.** Split sums, sampling and the cache state vary.
+- **Based on Xolotl `f7c561b7` (2026-10-18).** Upstream has moved on since, and those commits are not merged here.
+- **Four cards only.** A split for any card count is planned, not built.
+
+## Provenance
+
+The GGUF's metadata calls it "DeepSeek V4.1 Flash UNCENSORED" and names dealignai's abliterated FP8 repo as its
+source. The weights say otherwise. All 40 layers' router weights are bit-identical to `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+The token embeddings match. The attention-output and shared-expert projections differ only by Q8_0 rounding (0.54-0.64 %).
+There is no rank-1 edit: the difference's top singular value is 0.13 or less, against 12.0 for dealignai's. So this is
+DeepSeek's official 1017 release, and the metadata is mislabeled. The scripts are in
+[`larry/bench/provenance/`](larry/bench/provenance/), and the details are in the log ("Model provenance").
+
+## Layout
+
+| path | what |
+| --- | --- |
+| [`tools/v41/engine/xe/`](tools/v41/engine/xe/) | the Intel expert tier (`ds41_xe_tier.cpp`), its kernels, `xe.cmake`, the ggml patch, tests |
+| [`tools/v41/engine/tp/`](tools/v41/engine/tp/) | engine1, the tensor-parallel decode core, and its `DESIGN.md` |
+| `tools/v41/engine/ds41_*.cpp` | the engine: prompt pipeline, keep-cache, Engram reader, serve-path changes |
+| [`larry/deploy/`](larry/deploy/) | bootstrap, build, download, the engine and server launchers, config template, `host/` units |
+| [`larry/checks/`](larry/checks/) | the service check (`tsvc2.sh`) and its pieces (needle, decode, essay, tool call), `tok.py` |
+| [`larry/bench/`](larry/bench/) | the A/B harness (`speed/`), microbenchmarks, quality and provenance scripts |
+| [`larry/patches/`](larry/patches/) | the scripts each change was made with: a record, not a build step |
+| [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) | the log |
+| everything else | upstream Xolotl at `f7c561b7`; its README is [`README.xolotl.md`](README.xolotl.md) |
+
+## Credits and license
+
+- [Xolotl](https://github.com/Indras-Mirror/Xolotl) and [Strata](https://github.com/Niko1221/Strata) (MIT) provide the
+  engine, the server and the DeepSeek-V4.1 support this builds on.
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT) provides the SYCL backend.
+- DeepSeek made the model.
+- kaushikvira made the GSQ quant.
+- This fork's changes are under the same [MIT license](LICENSE).

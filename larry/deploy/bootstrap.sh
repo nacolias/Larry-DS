@@ -5,7 +5,7 @@
 # (larry: /opt/ai/dsv41, the checkout at /opt/ai/dsv41/xolotl):
 #   git clone -b larry-xe https://github.com/nacolias/Larry-DS.git /opt/ai/dsv41/xolotl
 #   /opt/ai/dsv41/xolotl/larry/deploy/bootstrap.sh
-# Needs oneAPI 2026.1 (ONEAPI_VARS) and intel-ocloc; the model download is separate (dl.sh, larry/README.md).
+# Needs oneAPI 2026.1 (ONEAPI_VARS) and intel-ocloc; the model download is separate (dl.sh, the top-level README.md).
 #   DS41_SRV (/srv/dsv41): the second NVMe drive - layer 14's Engram table, the paged Engram copy, the TP cache
 #   BUILD=0: install only, no build
 set -euo pipefail
