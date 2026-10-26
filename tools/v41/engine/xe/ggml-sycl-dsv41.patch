@@ -1049,6 +1049,115 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
+diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
+--- a/ggml/src/ggml-cpu/arch-fallback.h
++++ b/ggml/src/ggml-cpu/arch-fallback.h
+@@ -83,7 +83,7 @@
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
+ #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+ // quants.c
+-#define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
++// (larry, patch-q20avx2: ggml_vec_dot_q2_0_q8_0 has an x86 form in arch/x86/quants.c)
+ // repack.cpp
+ #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
+ #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -552,6 +552,93 @@
+ }
+ #endif
+ 
++// larry, patch-q20avx2: Q2_0 (64 weights a block, four 2-bit codes a byte in order, {0..3} -> {-1..2}) x Q8_0.  Per
++// 32-weight half: its 8 bytes shuffled to 32 (each byte four times), masked to its own two bits, both nibbles looked up
++// to 0..3, then sum(q * y) - sum(y) by maddubs / madd - the generic's integer sums exactly; the float steps are the
++// generic's own, in its order, so the result is the same bits.
++void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    const int qk = QK2_0;
++    const int nb = n / qk;
++
++    assert(n % qk == 0);
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++
++#if defined(__AVX2__)
++    const block_q2_0 * GGML_RESTRICT x = vx;
++    const block_q8_0 * GGML_RESTRICT y = vy;
++    const __m256i rep = _mm256_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
++                                         4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
++    const __m256i msk = _mm256_setr_epi8(0x03, 0x0C, 0x30, (char) 0xC0, 0x03, 0x0C, 0x30, (char) 0xC0,
++                                         0x03, 0x0C, 0x30, (char) 0xC0, 0x03, 0x0C, 0x30, (char) 0xC0,
++                                         0x03, 0x0C, 0x30, (char) 0xC0, 0x03, 0x0C, 0x30, (char) 0xC0,
++                                         0x03, 0x0C, 0x30, (char) 0xC0, 0x03, 0x0C, 0x30, (char) 0xC0);
++    // a nibble holding a code at bits 0-1 or 2-3 -> the code: 1, 2, 3 -> 1, 2, 3 and 4, 8, 12 -> 1, 2, 3
++    const __m256i lut = _mm256_setr_epi8(0, 1, 2, 3, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0,
++                                         0, 1, 2, 3, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0);
++    const __m256i lo4 = _mm256_set1_epi8(0x0F);
++    const __m256i ones8 = _mm256_set1_epi8(1);
++    const __m256i ones16 = _mm256_set1_epi16(1);
++
++    // larry: GGML_Q20_GENERIC=1 - the scalar generic (an A/B switch; the same bits either way)
++    static int force_generic = -1;
++    if (force_generic < 0) force_generic = getenv("GGML_Q20_GENERIC") != NULL;
++    if (force_generic) { ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc); return; }
++
++    // one 32-weight half: the code bytes (0..3) dotted with its Q8_0 block as sum((q - 1) * y), 8 int32 partials
++    #define Q20_HALF(QS8, YB) ({ \
++        const __m256i r_ = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadl_epi64((const __m128i *) (QS8))), rep), msk); \
++        const __m256i q_ = _mm256_add_epi8(_mm256_shuffle_epi8(lut, _mm256_and_si256(r_, lo4)), \
++                                           _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(r_, 4), lo4))); \
++        const __m256i y_ = _mm256_loadu_si256((const __m256i *) (YB)->qs); \
++        _mm256_madd_epi16(_mm256_sub_epi16(_mm256_maddubs_epi16(q_, y_), _mm256_maddubs_epi16(ones8, y_)), ones16); })
++
++    float sumf = 0.0f;
++
++    int i = 0;
++    for (; i + 1 < nb; i += 2) {   // two blocks: their four halves reduced together, then the generic's float steps
++        const __m256i v0 = Q20_HALF(&x[i].qs[0], &y[i * 2 + 0]);
++        const __m256i v1 = Q20_HALF(&x[i].qs[8], &y[i * 2 + 1]);
++        const __m256i v2 = Q20_HALF(&x[i + 1].qs[0], &y[i * 2 + 2]);
++        const __m256i v3 = Q20_HALF(&x[i + 1].qs[8], &y[i * 2 + 3]);
++        const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(v0, v1), _mm256_hadd_epi32(v2, v3));
++        const __m128i t = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));   // the four sums
++        const int sb0 = _mm_cvtsi128_si32(t), sb1 = _mm_extract_epi32(t, 1), sb2 = _mm_extract_epi32(t, 2), sb3 = _mm_extract_epi32(t, 3);
++        {
++            const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++            float sumi = 0.0f;
++            sumi += GGML_CPU_FP16_TO_FP32(y[i * 2 + 0].d) * sb0;
++            sumi += GGML_CPU_FP16_TO_FP32(y[i * 2 + 1].d) * sb1;
++            sumf += d0 * sumi;
++        }
++        {
++            const float d0 = GGML_CPU_FP16_TO_FP32(x[i + 1].d);
++            float sumi = 0.0f;
++            sumi += GGML_CPU_FP16_TO_FP32(y[i * 2 + 2].d) * sb2;
++            sumi += GGML_CPU_FP16_TO_FP32(y[i * 2 + 3].d) * sb3;
++            sumf += d0 * sumi;
++        }
++    }
++    for (; i < nb; i++) {
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        float sumi = 0.0f;
++        for (int k = 0; k < 2; k++) {
++            const int sumi_block = hsum_i32_8(Q20_HALF(&x[i].qs[k * 8], &y[i * 2 + k]));
++            sumi += GGML_CPU_FP16_TO_FP32(y[i * 2 + k].d) * sumi_block;
++        }
++        sumf += d0 * sumi;
++    }
++    #undef Q20_HALF
++
++    *s = sumf;
++#else
++    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
++#endif
++}
++
+ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+     const int qk = QK1_0;
+     const int nb = n / qk;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
@@ -1452,7 +1561,20 @@ diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
  void ggml_sycl_free_device(void *ptr, sycl::queue &q);
  
  void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
-@@ -442,6 +446,14 @@
+@@ -333,6 +337,12 @@
+ };
+ 
+ namespace sycl_ex = sycl::ext::oneapi::experimental;
++// larry, GGML_SYCL_OP_PROF (patch-opprof3.py): ggml-sycl.cpp's op profiler, a mark from any source
++namespace larry_opprof {
++bool on();
++void mark(sycl::queue & q, int device, const char * label);
++}
++
+ struct ggml_backend_sycl_context {
+     int device;
+     std::string name;
+@@ -442,6 +452,14 @@
  
  #ifdef GGML_SYCL_GRAPH
      std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
@@ -4374,7 +4496,7 @@ diff --git a/ggml/src/ggml-sycl/fattn-dsv4.cpp b/ggml/src/ggml-sycl/fattn-dsv4.c
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fattn-dsv4.cpp
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,448 @@
 +// ggml-sycl/fattn-dsv4.cpp - larry (Strata-DS4 on Intel): flash attention for DeepSeek-V4.1's prompt shape on XMX.
 +//
 +// The DS4 engines (Xolotl tools/v41/engine/ds41_dense.cpp) attend with the QUERY as the batch: every query has its
@@ -4611,8 +4733,22 @@ new file mode 100644
 +}  // namespace
 +#endif
 +
++// larry, GGML_SYCL_SDPA_PROF (patch-sdpaprof.py): host ms per step, summed
++static const bool g_sdpa_prof = std::getenv("GGML_SYCL_SDPA_PROF") != nullptr;
++static double g_sdpa_t[8] = {};
++static long g_sdpa_n = 0;
++static double g_sdpa_last = 0;
++static double sdpa_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++static void sdpa_lap(int i) {
++    if (!g_sdpa_prof) return;
++    const double t = sdpa_now();
++    g_sdpa_t[i] += t - g_sdpa_last;
++    g_sdpa_last = t;
++}
++
 +void ggml_sycl_op_dsv41_attn_sdpa(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 +    namespace mkl = oneapi::mkl;
++    if (g_sdpa_prof) g_sdpa_last = sdpa_now();
 +    const ggml_tensor * Q = dst->src[0];
 +    const ggml_tensor * KP = dst->src[1];
 +    const ggml_tensor * MK = dst->src[2];
@@ -4645,6 +4781,7 @@ new file mode 100644
 +    const bool m16 = MK->type == GGML_TYPE_F16;
 +    const size_t mstride = MK->nb[1] / ggml_type_size(MK->type);
 +    const void * mkd = MK->data;
++    sdpa_lap(0);   // Q' alloc + its kernel
 +#if GGML_SYCL_DNNL
 +    static const int sdpa_n = env_int("GGML_SYCL_DSV4_SDPA_N", 512);
 +    if (n == sdpa_n && D % 4 == 0 && Dp % 4 == 0) {
@@ -4666,6 +4803,7 @@ new file mode 100644
 +            }
 +            P = &it->second;
 +        }
++        sdpa_lap(1);   // the engine / stream / partition lookups
 +        if (P->ok) {
 +            ggml_sycl_pool_alloc<sycl::half> Ms(pool, (size_t) n * Mp);
 +            ggml_sycl_pool_alloc<sycl::half> Op(pool, (size_t) n * NH * Dp);
@@ -4681,6 +4819,7 @@ new file mode 100644
 +                ms[i] = (sycl::half) x;
 +                if (i == 0) *onep = 1.0f;   // Q' carries the scale: the graph divides by 1
 +            });
++            sdpa_lap(2);   // the mask's allocs + kernel
 +            std::vector<dnnl::graph::tensor> tin;
 +            tin.reserve(P->ins.size());
 +            for (auto & lt : P->ins) {
@@ -4690,7 +4829,11 @@ new file mode 100644
 +                tin.emplace_back(lt, eng, ptr);
 +            }
 +            dnnl::graph::tensor tout(P->out, eng, Op.get());
++            sdpa_lap(3);   // the oneDNN tensors
++            if (larry_opprof::on()) larry_opprof::mark(*stream, ctx.device, "SDPA: Q' + mask kernels, tensors");   // patch-opprof3
 +            P->cp.execute(strm, tin, {tout});
++            if (larry_opprof::on()) larry_opprof::mark(*stream, ctx.device, "SDPA: oneDNN execute");
++            sdpa_lap(4);   // execute (+ the profiler's marks)
 +            // O' f16 [n][NH][Dp] -> dst f32 [n][NH][D]
 +            const sycl::half * op = Op.get();
 +            float * o = (float *) dst->data;
@@ -4700,6 +4843,12 @@ new file mode 100644
 +                const sycl::half4 h = *(const sycl::half4 *) (op + bh * Dp + v * 4);
 +                *(sycl::float4 *) (o + bh * D + v * 4) = sycl::float4((float) h[0], (float) h[1], (float) h[2], (float) h[3]);
 +            });
++            sdpa_lap(5);   // the output kernel
++            if (g_sdpa_prof && ++g_sdpa_n % 400 == 0) {
++                fprintf(stderr, "larry sdpa prof (%ld calls): host ms a call: Q' %.3f, lookups %.3f, mask %.3f, tensors %.3f, execute %.3f, out %.3f\n",
++                        g_sdpa_n, g_sdpa_t[0] / g_sdpa_n, g_sdpa_t[1] / g_sdpa_n, g_sdpa_t[2] / g_sdpa_n, g_sdpa_t[3] / g_sdpa_n,
++                        g_sdpa_t[4] / g_sdpa_n, g_sdpa_t[5] / g_sdpa_n);
++            }
 +            return;
 +        }
 +    }
@@ -5232,7 +5381,134 @@ new file mode 100644
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -70,6 +70,10 @@
+@@ -55,6 +55,126 @@
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
++#include <chrono>
++#include <map>
++#include <mutex>
++#include <set>
++#include <string>
++#include <thread>
++
++// larry, GGML_SYCL_OP_PROF=1 (patch-opprof.py): see larry_opprof::mark
++namespace larry_opprof {
++bool on() { static const bool v = std::getenv("GGML_SYCL_OP_PROF") != nullptr; return v; }   // (extern: patch-opprof3)
++constexpr uint32_t kCap = 1u << 16;
++struct State {
++    volatile uint32_t * flags = nullptr;            // pinned host memory, a slot a mark
++    std::atomic<const char *> labels[kCap];         // the interval each mark ends
++    std::atomic<uint32_t> issued{0};
++    std::atomic<uint32_t> seen{0};                  // the poller's position (marks consumed)
++    std::atomic<bool> stop{false};
++    std::thread poller;
++    int device = -1;
++    int64_t dropped = 0;                            // marks skipped with the ring full
++    std::mutex mu;                                  // acc (the poller adds, the dump reads)
++    std::map<std::string, std::pair<double, int64_t>> acc;
++    std::map<std::string, double> host;             // larry, patch-opprof2: host ms a label (its dispatch)
++    double last_host = -1;                          // the submitting thread's time after its last mark
++    std::set<std::string> names;                    // interned labels (the submitting thread only)
++};
++static State & st() { static State s; return s; }
++static double now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++static void dump(const char * why) {
++    State & S = st();
++    static const int top = std::getenv("GGML_SYCL_OP_PROF_TOP") ? std::atoi(std::getenv("GGML_SYCL_OP_PROF_TOP")) : 40;
++    std::vector<std::pair<std::string, std::pair<double, int64_t>>> v;
++    std::map<std::string, double> hv;
++    {
++        std::lock_guard<std::mutex> lk(S.mu);
++        v.assign(S.acc.begin(), S.acc.end());
++        hv = S.host;
++    }
++    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
++    double tot = 0;
++    for (const auto & e : v) tot += e.second.first;
++    fprintf(stderr, "larry op prof (%s): %.1f ms over %zu labels, %lld marks dropped\n", why, tot, v.size(), (long long) S.dropped);
++    for (size_t i = 0; i < v.size() && (int) i < top; ++i)
++        fprintf(stderr, "  %-44.44s %10.1f ms %5.1f %%  %8lld x  %8.1f us  host %8.1f us\n", v[i].first.c_str(), v[i].second.first,
++                100.0 * v[i].second.first / std::max(tot, 1e-9), (long long) v[i].second.second,
++                1e3 * v[i].second.first / std::max<int64_t>(v[i].second.second, 1),
++                1e3 * hv[v[i].first] / std::max<int64_t>(v[i].second.second, 1));
++}
++static void start(sycl::queue & q, int device) {
++    State & S = st();
++    S.device = device;
++    S.flags = sycl::malloc_host<uint32_t>(kCap, q.get_context());
++    for (uint32_t i = 0; i < kCap; ++i) { S.flags[i] = 0; S.labels[i].store(nullptr); }
++    S.poller = std::thread([] {
++        State & S = st();
++        static const int64_t every = std::getenv("GGML_SYCL_OP_PROF_EVERY") ? std::atoll(std::getenv("GGML_SYCL_OP_PROF_EVERY")) : 200000;
++        uint32_t seen = 0;
++        double last = -1;
++        while (!S.stop.load(std::memory_order_relaxed)) {
++            if (seen == S.issued.load(std::memory_order_acquire)) { std::this_thread::yield(); continue; }
++            const uint32_t k = seen % kCap;
++            if (S.flags[k] != seen + 1) { __builtin_ia32_pause(); continue; }   // its kernel has not run yet
++            const double t = now_ms();
++            const char * lab = S.labels[k].load(std::memory_order_acquire);
++            static const int64_t skip = std::getenv("GGML_SYCL_OP_PROF_SKIP") ? std::atoll(std::getenv("GGML_SYCL_OP_PROF_SKIP")) : 0;
++            if (last >= 0 && lab && (int64_t) seen >= skip) {   // larry, patch-opprof4: the first `skip` marks uncounted
++                std::lock_guard<std::mutex> lk(S.mu);
++                auto & e = S.acc[lab];
++                e.first += t - last;
++                ++e.second;
++            }
++            last = t;
++            ++seen;
++            S.seen.store(seen, std::memory_order_release);
++            if (every > 0 && seen % (uint32_t) every == 0) dump("periodic");
++        }
++    });
++    std::atexit([] {
++        State & S = st();
++        S.stop.store(true);
++        if (S.poller.joinable()) S.poller.join();
++        dump("exit");
++    });
++}
++/// the interval `label` ends here: a mark behind everything queued on `q` so far
++void mark(sycl::queue & q, int device, const char * label) {   // (extern: patch-opprof3)
++    State & S = st();
++    if (S.device < 0) start(q, device);
++    if (device != S.device || !S.flags) return;
++    const uint32_t i = S.issued.load(std::memory_order_relaxed);
++    const uint32_t k = i % kCap;
++    if (i - S.seen.load(std::memory_order_acquire) >= kCap) { ++S.dropped; return; }   // the ring is full
++    const double th = now_ms();   // larry, patch-opprof2: the interval's host side (since the last mark)
++    if (S.last_host >= 0 && label) {
++        static const int64_t skip_h = std::getenv("GGML_SYCL_OP_PROF_SKIP") ? std::atoll(std::getenv("GGML_SYCL_OP_PROF_SKIP")) : 0;
++        std::lock_guard<std::mutex> lk(S.mu);
++        if ((int64_t) i >= skip_h) S.host[label] += th - S.last_host;
++    }
++    S.labels[k].store(label, std::memory_order_release);
++    volatile uint32_t * f = S.flags + k;
++    const uint32_t seq = i + 1;
++    q.single_task([=] { *f = seq; });
++    S.issued.store(i + 1, std::memory_order_release);
++    S.last_host = now_ms();
++}
++/// a node's label: the op (a unary / glu op by its own name) + the node's name without digits
++static const char * label(const ggml_tensor * t) {
++    std::string l = ggml_op_name(t->op);
++    if (t->op == GGML_OP_UNARY) l = ggml_unary_op_name(ggml_get_unary_op(t));
++    if (t->op == GGML_OP_GLU) l = ggml_glu_op_name(ggml_get_glu_op(t));
++    std::string n;
++    for (const char * p = t->name; *p && n.size() < 24; ++p) if (!(*p >= '0' && *p <= '9')) n += *p;
++    if (!n.empty()) l += " " + n;
++    auto it = st().names.insert(l).first;
++    return it->c_str();
++}
++}  // namespace larry_opprof
++
+ #include "ggml-sycl/add-id.hpp"
+ #include "ggml-sycl/backend.hpp"
+ #include "ggml-sycl/common.hpp"
+@@ -70,6 +190,10 @@
  #include "ggml-sycl/set_rows.hpp"
  #include "ggml-sycl/set.hpp"
  #include "ggml-sycl/dsv4-hc.hpp"
@@ -5243,7 +5519,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #include "ggml-sycl/lightning-indexer.hpp"
  #include "ggml-sycl/conv2d.hpp"
  #include "ggml-sycl/conv2d-dw.hpp"
-@@ -584,6 +588,7 @@
+@@ -584,6 +708,7 @@
      optimize_feature opt_feature;
      std::vector<ggml_tensor_extra_gpu *> tensor_extras;
      bool is_usm_system;
@@ -5251,7 +5527,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
          device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
-@@ -593,7 +598,7 @@
+@@ -593,7 +718,7 @@
          }
  
      ~ggml_backend_sycl_buffer_context() {
@@ -5260,7 +5536,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
              ggml_sycl_set_device(device);
              if (is_usm_system)
                  free_aligned_mem_host(dev_ptr);
-@@ -1061,6 +1066,24 @@
+@@ -1061,6 +1186,24 @@
      /* .is_host          = */ NULL,
  };
  
@@ -5285,7 +5561,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
      static std::mutex mutex;
      std::lock_guard<std::mutex> lock(mutex);
-@@ -1835,9 +1858,15 @@
+@@ -1835,9 +1978,15 @@
                  ggml_sycl_memtrace_report("before pool_vmm commit");
              }
  
@@ -5303,7 +5579,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
              // reserve virtual address space (if not already reserved)
              if (pool_addr == 0) {
-@@ -2888,6 +2917,73 @@
+@@ -2888,6 +3037,73 @@
    std::exit(1);
  }
  
@@ -5377,7 +5653,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  inline void ggml_sycl_op_mul_mat_sycl(
      ggml_backend_sycl_context & ctx,
      const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
-@@ -2918,7 +3014,11 @@
+@@ -2918,7 +3134,11 @@
  #ifdef GGML_SYCL_F16
      bool use_fp16 = true;  // TODO(Yu) SYCL capability check
  #else
@@ -5390,7 +5666,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #endif
  
  #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
-@@ -2948,18 +3048,22 @@
+@@ -2948,18 +3168,22 @@
      if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
          row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
          ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
@@ -5416,7 +5692,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
          ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
          if (src1->type != GGML_TYPE_F16) {
-@@ -3144,6 +3248,84 @@
+@@ -3144,6 +3368,84 @@
      }
  }
  
@@ -5501,7 +5777,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
      GGML_ASSERT( dst->type == GGML_TYPE_I32);
-@@ -3156,6 +3338,25 @@
+@@ -3156,6 +3458,25 @@
      const int64_t ncols = dst->src[0]->ne[0];
      const int64_t nrows = ggml_nrows(dst->src[0]);
  
@@ -5527,7 +5803,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
      argmax_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
  }
  
-@@ -4661,12 +4862,24 @@
+@@ -4661,12 +4982,24 @@
  static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
@@ -5553,7 +5829,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                              ggml_tensor * dst, mul_mat_algo mm_algorithm) {
      if (!should_reorder_tensor(*ctx, dst)) {
-@@ -4734,6 +4947,359 @@
+@@ -4734,6 +5067,359 @@
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -5913,7 +6189,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -4747,6 +5313,9 @@
+@@ -4747,6 +5433,9 @@
          ggml_sycl_op_fwht(ctx, src1, dst)) {
          return;
      }
@@ -5923,7 +6199,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
      int64_t min_compute_capability = INT_MAX;
-@@ -5114,6 +5683,108 @@
+@@ -5114,6 +5803,108 @@
      }
  }
  
@@ -6032,7 +6308,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5134,6 +5805,48 @@
+@@ -5134,6 +5925,48 @@
              return;
          }
      }
@@ -6081,7 +6357,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5434,6 +6147,64 @@
+@@ -5434,6 +6267,64 @@
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_sycl_op_lightning_indexer(ctx, dst);
              break;
@@ -6146,7 +6422,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          case GGML_OP_DUP:
              ggml_sycl_dup(ctx, dst);
              break;
-@@ -5783,6 +6554,10 @@
+@@ -5783,6 +6674,10 @@
      return res;
  }
  
@@ -6157,7 +6433,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total) try {
      GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_memory\n");
      if (!sycl_get_mem_info(device, free, total)) {
-@@ -5976,6 +6751,33 @@
+@@ -5976,8 +6871,40 @@
      return skip;
  }
  
@@ -6190,8 +6466,26 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
++    // larry, GGML_SYCL_OP_PROF (patch-opprof.py): eager graphs only (a recorded graph would replay fixed marks)
++    const bool lop = larry_opprof::on() && cgraph->uid == 0;
++    const char * lop_prev = "(idle before a graph)";
++    if (lop) larry_opprof::mark(*sycl_ctx->stream(), sycl_ctx->device, lop_prev);
++    lop_prev = nullptr;
  
-@@ -6066,6 +6868,43 @@
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -5987,6 +6914,10 @@
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+             continue;
+         }
++        if (lop) {   // the previous node's interval ends; this node's begins
++            if (lop_prev) larry_opprof::mark(*sycl_ctx->stream(), sycl_ctx->device, lop_prev);
++            lop_prev = larry_opprof::label(node);
++        }
+ 
+         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
+         if (nodes_to_skip != 0) {
+@@ -6066,12 +6997,50 @@
              continue;
          }
  
@@ -6235,7 +6529,14 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-@@ -6119,6 +6958,64 @@
+         }
+         GGML_ASSERT(ok);
+     }
++    if (lop && lop_prev) larry_opprof::mark(*sycl_ctx->stream(), sycl_ctx->device, lop_prev);   // larry: the last node's end
+ }
+ 
+ #ifdef GGML_SYCL_GRAPH
+@@ -6119,6 +7088,64 @@
  
  static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
@@ -6300,7 +6601,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
-@@ -6229,6 +7126,12 @@
+@@ -6229,6 +7256,12 @@
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_sycl_guid());
  }
  
@@ -6313,7 +6614,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7372,41 @@
+@@ -6469,6 +7502,41 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
