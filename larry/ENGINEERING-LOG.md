@@ -48,6 +48,32 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 03:16 - 04:45: an out-of-memory abort after a long conversation - the stream buffer fits the card now)
+
+- **03:16 the service's engine aborted** with `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (the server restarted it). A
+  49K-token conversation had grown the TP core's KV rows by ~0.55 GiB on each expert card, and the promotion cache was
+  full; the next prompt (4.7K tokens, shallower than `STRATA_XE_PREFETCH_DEPTH`: no prefetch) regrew two expert cards'
+  stream buffers to 864 MiB with ~0.9 GiB free. The xe driver evicted to host memory past TTM's limit ("VM worker
+  error: -12" in dmesg from 03:08) and a submission failed.
+- **`STRATA_XE_STREAM_FIT=1`** (`patches/patch-streamfit.py`, commit c811ed77): a prompt call's stream buffer grows
+  only into what its card has free beyond `STRATA_XE_STREAM_FIT_MARGIN_GIB` (0.5) and 100 KiB a token for the call's
+  other buffers; a smaller buffer takes more rounds. The replay (a 50.7K needle, then a fresh 4.9K one): both found,
+  no fault, the cap engaging (64 MiB) at 0.40-0.80 GiB free. **In the service since 04:30.**
+- tsvc2 (`logs/tsvc2-streamfit.log`): needles 8K 1530.9 / 1744.5, 16K 2283.3, 31K 2588.9 tok/s (2581.7 before), all
+  FOUND; svcbench 94.6 / 91.8, essay 69.7 / 69.1 tok/s; tool call; hidden 33 GiB at most. The first-pass decode is
+  the lowest of the last 14 checks (95.4-102.7 / 73.8-81.3 before) - this engine had just replayed the 50.7K
+  conversation (KV replicas grown, experts evicted from the TP cards); the fix touches only prompt calls.
+- **The engine binary since 02:55 carries `GGML_SYCL_LI_S16`** (`patch-lis16.py`: the prompt indexer's score matrix in
+  fp16, default off), which nobody approved: a step stopped at 02:54 had already applied it and started a detached
+  build. Off, its path is the old one (three pointer declarations moved above the new branch). The source is restored
+  (04:43, from `logs/tier-rebuild/pre-lis16-lightning-indexer.cpp`); the next ggml rebuild drops it, and the
+  re-exported `ggml-sycl-dsv41.patch` (04:44, commit 147963a8: + the AVX2 Q2_0 dot and the op profiler) does not
+  carry it.
+- **Published** as [nacolias/Larry-DS](https://github.com/nacolias/Larry-DS), branch `larry-xe`, with `larry/` (the
+  deploy kit, checks, bench sources, patch scripts, this log). Commit authorship moved to the noreply address, so every
+  hash changed (old -> new: `logs/commit-map-noreply-20261026.txt`; the citations in this log are the new ones). A
+  clean clone from GitHub, bootstrapped: its repo tree and its ggml tree are identical to the live ones.
+
 ## Measured (2026-10-26 00:43 - 01:30: abwT102 - the shared expert on the expert cards, the keep-cache's learned size, the async regrow)
 
 **In the service since 01:21** (commit 9bf548eb; `patches/svc-t102.py`, backup `ds41-xe-engine.sh.pre-t102-20261026`):
@@ -1769,6 +1795,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_ENGRAM_REQUANT` | q6_K (service) | the two Engram KV projections re-quantized (engine default: off) |
 | `STRATA_HEAD_SPLIT_MB` | 100 | Q6_K mat-vecs from this size are split over the cards (the LM head, the Engram KV) |
 | `STRATA_XE_RESERVE_GIB` | 3.5 | VRAM per expert card kept free for the prompt path's buffers |
+| `STRATA_XE_STREAM_FIT` (`_MARGIN_GIB`) | 1 (0.5) | a prompt call's stream buffer grows only into its card's free VRAM beyond the margin and 100 KiB a token (more rounds instead; the 2026-10-26 03:16 abort); 0 = up to the planned size |
 | `STRATA_XE_DENSE_GIB` / `STRATA_XE_DENSE_RESERVE_GIB` | 10 / 8 (service 14 / 1.75, was 4 until 2026-10-24 22:25) | experts on card 0, and the VRAM left there for ggml's pools |
 | `STRATA_XE_GEMM_MIN` | 8 | prompt: experts with at least this many tokens take the GEMM path |
 | `STRATA_DENSE_ASYNC` | 1 | 0: ggml's synchronising graph compute per decode graph, pageable-style waits (the old path) |
