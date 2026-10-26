@@ -39,7 +39,8 @@ are under [Results](#results).
 About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
 
 - **Decode is speculative and tensor-parallel.**
-  - DSpark (the checkpoint's own MTP heads) drafts up to 4 tokens, plus lookup drafts from the context.
+  - DSpark (the checkpoint's own MTP heads) drafts up to 4 tokens, plus lookup drafts from the context. A draft
+    window is cut where the drafts' combined confidence drops below 0.5 (Project Maya's rule, +3 % decode).
   - "engine1" (`tools/v41/engine/tp/`) verifies the drafts in one pass of up to 7 tokens over all four cards. The dense
     half is split by heads and columns, and each card replays a SYCL graph.
   - Arena experts a pass needs run on the CPU pool. Hot ones are promoted into the flex regions for later passes.
@@ -67,14 +68,14 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 12:49-12:55, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 17:40-17:46, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 992 then 1,846, 16K 2,343, 31K 3,017 - all four passphrases found (16K / 31K again, warm: 2,586 / 3,023) |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 96.9 tok/s, 91.0 after the long prompts |
-| essays (3 x 800 tokens) | 78.0 tok/s, 73.6 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,160 then 1,862, 16K 2,404, 31K 3,049 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 100.0 tok/s, 98.4 after the long prompts |
+| essays (3 x 800 tokens) | 78.8 tok/s, 74.6 after the long prompts |
 | tool-call round trip | correct |
 | host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
 

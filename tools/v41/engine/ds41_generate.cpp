@@ -2397,9 +2397,17 @@ int main(int argc, char ** argv) {
                     // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
                     // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
                     static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
-                    if (conf_tau_s >= 0) {
+                    // larry, STRATA_DSPARK_CUM=<c> (patch-dsparkcum.py; Project Maya's MAYA_DS4_DSPARK_CUM): also stop at the
+                    // first draft where the product of the confidences so far drops below c
+                    static const float cum_tau_s = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : 0.0f;
+                    if (conf_tau_s >= 0 || cum_tau_s > 0) {
                         int kk = 0;
-                        while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
+                        float cum = 1.0f;
+                        while (kk < k) {
+                            const float p = 1.0f / (1.0f + std::exp(-sp_conf[kk]));
+                            if (p < conf_tau_s || (cum *= p) < cum_tau_s) break;
+                            ++kk;
+                        }
                         k = kk;
                     }
                     const bool refeed = dirty && ((P + 1) & 1);
@@ -2664,9 +2672,12 @@ int main(int argc, char ** argv) {
         auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
         while (emit(t)) {
             int k = std::min(spec_depth, a.n_predict - gen);   // drafts past the budget are never emitted
-            if (conf_tau >= 0) {
+            // larry, STRATA_DSPARK_CUM=<c> (patch-dsparkcum.py): also stop where the confidences' product drops below c
+            static const float cum_tau = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : 0.0f;
+            if (conf_tau >= 0 || cum_tau > 0) {
                 int kk = 0;
-                while (kk < k && sig(sp_conf[kk]) >= conf_tau) ++kk;
+                float cum = 1.0f;
+                while (kk < k && sig(sp_conf[kk]) >= conf_tau && (cum *= sig(sp_conf[kk])) >= cum_tau) ++kk;
                 k = kk;
             }
             const bool refeed = dirty && ((P + 1) & 1);

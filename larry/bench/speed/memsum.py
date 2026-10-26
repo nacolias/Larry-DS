@@ -25,6 +25,10 @@ for line in open(abw, errors="replace"):
         if m.group(1) == "tuned":
             arm = "tuned " + " ".join(kv.split("=")[1] for kv in m.group(2).split()[:3])
         continue
+    m = re.match(r"\[probe\] swap (on|off): ", line)   # swapctl.sh
+    if m:
+        arm = "swap " + m.group(1)
+        continue
     m = re.match(r"\[(\w+)\] server pid \d+, env:.*?(\d\d:\d\d:\d\d)\s*$", line)
     if m:
         cfgs[m.group(1)] = {"arm": arm, "start": secs(m.group(2)), "p": {}}

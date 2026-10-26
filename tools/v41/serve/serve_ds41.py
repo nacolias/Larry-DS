@@ -118,6 +118,8 @@ def to_encoder_messages(messages, tools):
     for m in messages:
         m = dict(m)
         m["content"] = _text(m.get("content"))
+        if m.get("role") == "developer":   # larry (patch-ds41conf.py): OpenAI's newer name for the system turn
+            m["role"] = "system"
         if m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -184,6 +186,11 @@ def _svc_init_ds41(self, engine, tokenizer, template, *a, **k):
     assert len(eos) == 1, eos
     self.stop_ids = set(eos)
     self.effort_end = False      # #458's tail-turn trick is Qwen text; V4.1's effort lives in the first system turn
+    # larry (patch-literals.py): every V4.1 special stays text where a message writes it.  The base server marks only
+    # the CONTROL tokens (type 3); <｜User｜>, <｜Assistant｜>, <｜System｜>, ｜DSML｜ and the tool / fim markers are
+    # USER_DEFINED (type 4), which the tokenizer matches ALWAYS - a file or a tool result holding one opened a turn or a
+    # tool call there.  (Project Maya's DeepSeek server escapes them all the same way.)
+    self.literals = F.literal_tags(list(getattr(tokenizer, "special_tokens", {})))
 
 
 S.Service.__init__ = _svc_init_ds41
@@ -206,8 +213,29 @@ def unescape(value: str) -> str:
                   lambda m: ("&" + m.group(1)[:-4] + "lt;" if m.group(1) else "<") + tail, value)
 
 
+_P_HEAD_RE = re.compile(r' name="(.*?)" string="(true|false)">', re.DOTALL)
+
+
 def ds41_call_end(text: str) -> int:
-    return text.find(INVOKE_CLOSE)
+    """The call's </｜DSML｜ invoke> - larry (patch-ds41conf.py): the first one OUTSIDE a parameter's value.  DeepSeek's
+    encoder writes values raw (a value may hold any DSML tag) and its parser ends a value only at </｜DSML｜ parameter>.
+    -1: not complete yet."""
+    i = 0
+    while True:
+        e = text.find(INVOKE_CLOSE, i)
+        p = text.find(P_OPEN, i)
+        if p < 0 or 0 <= e < p:
+            return e
+        m = _P_HEAD_RE.match(text, p + len(P_OPEN))
+        if not m:                     # a head still arriving, or not a parameter head
+            if e < 0:
+                return -1
+            i = p + len(P_OPEN)
+            continue
+        c = text.find(P_CLOSE, m.end())
+        if c < 0:
+            return -1                 # inside a value
+        i = c + len(P_CLOSE)
 
 
 def ds41_parse_tool_call(body: str, schema=None):
@@ -242,16 +270,49 @@ def _op_init_ds41(self, *a, **k):
     _op_init(self, *a, **k)
     self.stream_tools = False          # the streaming scanner reads Qwen's <function=...> body
     self.dsml_hold = ""
+    self.dsml_value = False            # larry (patch-ds41conf.py): inside a parameter's value
 
 
 def _strip_wrappers(self, delta: str, final: bool) -> str:
-    """Drop <｜DSML｜ calls> / </｜DSML｜ calls> from the stream, holding a partial one until it is decided."""
+    """Drop <｜DSML｜ calls> / </｜DSML｜ calls> from the stream, holding a partial one until it is decided.  larry
+    (patch-ds41conf.py): not inside a parameter's value, which runs from its head's `">` to the next
+    </｜DSML｜ parameter> (DeepSeek's encoder writes values raw: a file the model writes may hold any DSML tag)."""
     buf = self.dsml_hold + delta
-    for w in WRAPPERS:
-        buf = buf.replace(w, "")
-    keep = 0 if final else self._hold(buf, WRAPPERS)
-    self.dsml_hold = buf[len(buf) - keep:] if keep else ""
-    return buf[:len(buf) - keep] if keep else buf
+    self.dsml_hold = ""
+    out, i, n = [], 0, len(buf)
+    while i < n:
+        if self.dsml_value:
+            c = buf.find(P_CLOSE, i)
+            if c < 0:
+                keep = 0 if final else self._hold(buf[i:], (P_CLOSE,))
+                out.append(buf[i:n - keep])
+                self.dsml_hold = buf[n - keep:]
+                break
+            out.append(buf[i:c + len(P_CLOSE)])
+            i, self.dsml_value = c + len(P_CLOSE), False
+            continue
+        hits = [(j, t) for t in WRAPPERS + (P_OPEN,) for j in (buf.find(t, i),) if j >= 0]
+        if not hits:
+            keep = 0 if final else self._hold(buf[i:], WRAPPERS + (P_OPEN,))
+            out.append(buf[i:n - keep])
+            self.dsml_hold = buf[n - keep:]
+            break
+        j, t = min(hits)
+        out.append(buf[i:j])
+        if t != P_OPEN:                    # a wrapper outside every value: dropped
+            i = j + len(t)
+            continue
+        m = _P_HEAD_RE.match(buf, j + len(P_OPEN))
+        if m:                              # a value starts after the head
+            out.append(buf[j:m.end()])
+            i, self.dsml_value = m.end(), True
+            continue
+        if not final and '">' not in buf[j:] and n - j < 1024:   # the head is still arriving
+            self.dsml_hold = buf[j:]
+            break
+        out.append(buf[j:j + len(P_OPEN)])   # not a parameter head: text
+        i = j + len(P_OPEN)
+    return "".join(out)
 
 
 def _op_feed_ds41(self, delta: str):

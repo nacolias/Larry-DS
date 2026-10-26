@@ -17,6 +17,10 @@ export STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}"
 # the draft confidence that ends a pass's drafts: 0.3 (was 0.6) since the draft is 4.5 ms - wider passes pay
 # (one-shot essay 54.3 -> 58.4 tok/s, p1 73.0 -> 75.3; 0.1 / 0.2 / 0.45 / 0.75 lower)
 export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.3}"
+# DSpark: stop the verify window where the product of the drafts' confidences drops below 0.5 (Project Maya's rule)
+# abwT137 (3 fresh servers each, essay / code / math x 400 tokens): 102.7 -> 106.2 tok/s overall
+# (code 112.8 -> 118.7, essay 81.2 -> 82.8, math 124.1 -> 128.6); narrower, cheaper passes (essay 2.31 -> 1.78 tok/pass, 28.4 -> 21.5 ms)
+export STRATA_DSPARK_CUM="${STRATA_DSPARK_CUM:-0.5}"
 export STRATA_SERVE_LOOKUP="${STRATA_SERVE_LOOKUP:-14}"
 export STRATA_SERVE_DSPARK_EVICT="${STRATA_SERVE_DSPARK_EVICT:-0}"
 # the draft stack's Q8_0 projections requantized to Q6_K at load: fastmv kernels (wo_a one launch, not 8); draft 7.7 -> 6.5 ms/pass

@@ -422,7 +422,8 @@ class ImageMarkers(unittest.TestCase):
         # a text-only tool result renders exactly as before: one string
         msgs = [{"role": "user", "content": "q"}, call,
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "r"}]}]}]
-        self.assertEqual(anthropic_to_messages({"messages": msgs})[0][-1], {"role": "tool", "content": "r"})
+        # (larry, patch-ds41conf.py: with the result's call id, which an encoder orders parallel results by)
+        self.assertEqual(anthropic_to_messages({"messages": msgs})[0][-1], {"role": "tool", "tool_call_id": "t1", "content": "r"})
 
 
     def test_the_whole_marker_in_text_before_images(self):

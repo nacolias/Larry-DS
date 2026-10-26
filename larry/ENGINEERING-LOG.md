@@ -48,6 +48,71 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 17:10 - 17:50: Project Maya's DSpark cut in the service; the server on DeepSeek's edge cases)
+
+**`STRATA_DSPARK_CUM=0.5` in the service** (`patches/patch-dsparkcum.py`, engine default 0 = off;
+`patches/svc-dsparkcum.py`, backup `ds41-xe-engine.sh.pre-dsparkcum-20261026`). Besides the 0.3 floor on each draft's
+own confidence, the verify window stops where the product of the drafts' confidences so far drops below 0.5 - a window
+whose later drafts are likely lost is not verified whole (Project Maya's `MAYA_DS4_DSPARK_CUM`; lossless, only the
+verify width changes). abwT137, three fresh servers each, interleaved, the decode tasks (400 tokens each):
+
+| | essay | code | math | all (tokens / time) |
+| --- | ---: | ---: | ---: | ---: |
+| off | 81.2 tok/s (2.31 tok/pass, 28.4 ms) | 112.8 (3.29, 29.1) | 124.1 (3.87, 31.1) | 102.7 tok/s |
+| 0.5 | 82.8 (1.78, 21.5) | **118.7** (2.87, 24.1) | 128.6 (3.63, 28.2) | **106.2** |
+
+tsvc2 (`logs/tsvc2-dsparkcum.log`): every needle found, svcbench 94.3 / 98.0, essay 81.5 / 74.5, the tool call right.
+That run's first 8K needle read at 516 tok/s (15.5 s): the swap stall again, right after a start that followed a
+detour through the small layout (19 GiB in swap).
+
+**The server on DeepSeek's edge cases** (`patches/patch-ds41conf.py`; `tools/v41/serve/test_ds41_conformance.py`, the
+cases of Project Maya's conformance tests): three bugs fixed - (1) a `developer` message (OpenAI's newer system role)
+failed the request ("Unknown role: developer"), now a system turn; (2) Anthropic parallel tool results stayed in the
+order the client sent them: the adapter (`serve/frontend.py`) dropped `tool_use.id` / `tool_result.tool_use_id`, so
+DeepSeek's encoder could not sort them into call order, and DSML results carry no ids - the model paired results with
+the wrong calls; the ids are kept now; (3) a DSML tag inside a parameter value (a file the model writes about DSML) broke
+the call: the `<｜DSML｜ calls>` wrappers were dropped from the whole stream and a value's `</｜DSML｜ invoke>` ended
+the call; values are skipped as DeepSeek's parser does (only `</｜DSML｜ parameter>` ends one). Two differences stay,
+reported as notes: newlines right after `</think>` are dropped (the base server's Qwen habit) and a long string
+argument arrives whole (the keep-alives hold idle clients). Tests: test_ds41_conformance all passed, test_serve_ds41 42,
+the base server's test_server 314 (one expectation updated for the kept id), test_frontend 25, test_env_to_user 6.
+
+**A restart while the engine loads fails over to the small layout**: `larry-mode restart` ~45 s after a window's
+restore (health 200 comes from the server before the engine is ready) - "the server did not exit", then the small
+layout (vllm-a) came up; `larry-mode ds41` after it finished brought the service back. Restart only after the engine
+has loaded (larry-mode's "loaded in").
+
+## Measured (2026-10-26 16:40 - 17:10: swap off ends the first-prompt stalls; message text can no longer open turns)
+
+**Swap off** (`bench/speed/swapctl.sh`, abwT136: three fresh servers with swap off, three with it on, interleaved,
+`memtrace2.bt`; `swapctl.sh guard` turned swap back on after the window):
+
+| Swap | First 8K | First 16K | First 31K | TTM backups during the prompts | Rebind worker (longest) | Engine direct reclaim (longest) |
+| --- | --- | --- | --- | --- | --- | --- |
+| off (s1-s3) | 6.59 / 6.14 / 6.27 s | 7.14 / 6.62 / 6.67 s | 10.63 / 10.62 / 10.61 s | none | 85-110 ms (22 ms) | 9-26 s summed (61 ms) |
+| on (n1-n3) | 6.38 / 7.49 / 6.05 s | 6.64 / 6.58 / 6.61 s | **16.43** / 10.96 / 10.61 s | 1.25 / 0.04 / 0 GiB | 2.9 s in n1 (2.5 s) | up to 458 s summed (641 ms) |
+
+With no swap TTM has no backup space, so the xe shrinker writes nothing out: no backups, no restores, no long
+rebinds, no swap-ins, and an eighth of the time in direct reclaim. Over abwT134-136, 5 of 12 swap-on fresh servers
+had a first prompt 1.5-20 s slower; none of the 3 swap-off ones. (The first 8K's remaining ~2 s over the second are the
+first calls' own costs - oneMKL kernels, oneDNN partitions, buffer exports - not memory.) To adopt it for the service
+only: a systemd drop-in that runs `swapoff /swapfile` before the start and `swapon /swapfile` after the stop (other
+layouts keep their swap) - not installed: the owner's decision.
+
+**Message text cannot open turns any more** (`patches/patch-literals.py`, in `tools/v41/serve/serve_ds41.py`; live since
+the window's restart). V4.1's `<｜User｜>`, `<｜Assistant｜>`, `<｜System｜>`, `｜DSML｜` and its tool / fim markers are
+USER_DEFINED tokens (type 4), which Strata's tokenizer matches in any text, and the base server escaped only the CONTROL
+ones (type 3) and `<think>`: a file an agent read or a tool result holding one became a real role or tool-call token.
+The server now marks every special as text inside messages, tool results and tool-call arguments (Project Maya's
+DeepSeek server does the same). `test_serve_ds41.py` checks it (fails on the old code) and now runs its HTTP test under
+the venv that runs the tests.
+
+**Project Maya** (github.com/mw00/project-maya, MIT, the same Strata lineage; its `maya-ds4` engine runs this model on
+CUDA / ROCm), reviewed for what to take: its exact prompt skip (`MAYA_DS4_PROMPT_SKIP`) is what our `--enc-skip`
+already does (on in the service: layers 21-39 run only on a prompt's last 2,560 tokens); its two-plus parked
+conversations we have too (`STRATA_SERVE_PARK_SLOTS`, in RAM; Maya also keeps them on disk across restarts). Taken: the
+special-token escaping above, and its DSpark cut on the product of the drafts' confidences (next section).
+
 ## Measured (2026-10-26 15:54 - 16:30: the kernel's memory settings - worse; the first-prompt stalls are the xe shrinker writing the engine's buffers out)
 
 **The three settings the owner approved trying** (`bench/speed/memset.sh tuned`: `vm.watermark_scale_factor` 10 -> 200,
@@ -2079,6 +2144,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_HC_NORM_MV_WIDE` / `GGML_SYCL_NORM_MV_WIDE` | 1 (service, since 2026-10-26 10:23; engine 0) / 1 | the prompt path's hc mixes through `ggml_dsv41_norm_mv` / ggml-sycl's wide kernel for it (> 8 tokens; 0 = the per-row one) |
 | `GGML_SYCL_LARRY_SLICES_BATCH` | 0 | `larry_slices_gemm` (wo_a through mul_mat) as one strided gemm_batch into the [OL, n, OG] layout (`STRATA_OPROJ_A` supersedes it) |
 | `GGML_SYCL_OP_PROF_SHAPES` | 0 | with `GGML_SYCL_OP_PROF=1`: each label also carries the node's shape and its first source's name / type |
+| `STRATA_DSPARK_CUM` | 0.5 (service, since 2026-10-26 17:30; engine 0 = off) | DSpark: the verify window also stops where the product of the drafts' confidences so far drops below this (besides `STRATA_DSPARK_CONF`'s floor on each; Project Maya's rule): 102.7 -> 106.2 tok/s on the decode tasks (abwT137) |
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |
