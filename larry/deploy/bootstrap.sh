@@ -16,10 +16,15 @@ KIT=$X/larry
 mkdir -p "$D/logs"
 [ "$X" = "$D/xolotl" ] || [ -e "$D/xolotl" ] || ln -s "$X" "$D/xolotl"   # every script finds the checkout at $D/xolotl
 cd "$X"
-bash tools/xolotl/fetch-llama.sh                       # llama.cpp at the pin + xolotl-ggml.patch
-P=tools/v41/engine/xe/ggml-sycl-dsv41.patch
-if git -C third_party/llama.cpp apply --reverse --check "$PWD/$P" 2>/dev/null; then echo "ggml-sycl patch: already applied"
-else git -C third_party/llama.cpp apply "$PWD/$P" && echo "ggml-sycl patch: applied"; fi
+P=$PWD/tools/v41/engine/xe/ggml-sycl-dsv41.patch
+# larry's patch goes on top of xolotl-ggml.patch, so fetch-llama.sh (which re-applies that one unless it alone reverses)
+# runs only for a tree without both
+if [ -d third_party/llama.cpp/.git ] && git -C third_party/llama.cpp apply --reverse --check "$P" 2>/dev/null; then
+  echo "ggml: third_party/llama.cpp already has both patches"
+else
+  bash tools/xolotl/fetch-llama.sh                     # llama.cpp at the pin + xolotl-ggml.patch
+  git -C third_party/llama.cpp apply "$P" && echo "ggml-sycl patch: applied"
+fi
 grep -q 'larry: the Intel Arc tier' tools/v41/engine/v41_engine.cmake ||
   echo 'include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/xe/xe.cmake OPTIONAL)   # larry: the Intel Arc tier' >> tools/v41/engine/v41_engine.cmake
 # the kit into $D: a file already there that differs is kept, the kit's copy goes beside it as .kit-new
