@@ -48,6 +48,83 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 06:35 - 07:51: the prompt indexer as one fused XMX kernel, told each query's visible rows)
+
+**In the service since 07:48** (`patches/svc-lifused.py`, backup `ds41-xe-engine.sh.pre-lifused-20261026`):
+`GGML_SYCL_LI_FUSED=1` + `STRATA_LI_NVIS=1`, binaries built 07:08 (`bench/li/lif-build.sh`; the 02:55 ones, with the
+dormant `GGML_SYCL_LI_S16`, in `logs/tier-rebuild/bin-20261026-0255`). tsvc2 (`logs/tsvc2-lif.log`): every needle found
+(8K 1350 / 1791, 16K 2222, **31K 2751** tok/s), svcbench 98.9 / 94.1, essay 76.0 / 70.4 tok/s, the tool call right,
+hidden RAM 33 GiB at most.
+
+**Why**: card 0's op profile of a 31K prompt's second batch (abwT110) had the prompt indexer (`LIGHTNING_INDEXER`, li_gemm)
+at 5.7 ms a call, 9.8 % of the card. li_gemm runs one oneMKL fp16 GEMM that writes S = Q [512 queries x 32 heads x 128]
+. K^T in f32 - at 16K keys 1 GB a call - and a second kernel that reads S back for the relu-weighted head sum; the
+GEMM's own arithmetic is ~0.4 ms. Three of a span's layers run it (90 calls in that batch), on cap keys = the next power
+of two of the span's visible rows.
+
+**abwT111, `GGML_SYCL_LI_S16=1`** (S in fp16: the code the 02:55 build already carried, off): card 0's indexer 5.70 ->
+3.53 ms a call, so the bytes were the cost; fresh prompts (second runs) 16K 7.07 -> 6.92 s, 31K 12.44 -> 12.24 s; p8k KL
+mean 3.73e-3 against a floor of 3.06e-3 (one token at 6.8), p30k PPL 1.7783 against 1.7833. Not deployed: the fused
+kernel below needs no S at all.
+
+**`GGML_SYCL_LI_FUSED=1`** (`patches/patch-lifused.py`, lightning-indexer.cpp): one XMX kernel, S never leaves the
+registers. A sub-group = one query's 32 heads (4 row tiles of 8) x 32 keys (2 column tiles of 16), K = 128 in 8 steps,
+fp16 x fp16 -> f32 as li_gemm's GEMM; B = the keys transposed, loaded `col_major` straight from the (fp16-converted) key
+rows; an accumulator lane holds its key's column (element i = head row i, `bench/dqb/coord_probe.cpp`), so the head sum
+is lane-local; 32-key steps the query cannot see (all -inf) write -inf without the multiplies. `bench/li/li_probe.cpp`
+(card 1, 512 queries, the same inputs through each):
+
+| keys (cap : visible rows) | li_gemm | S in fp16 | fused | max \|diff\| / max \|ref\| (fp16 S / fused) |
+| --- | ---: | ---: | ---: | --- |
+| 4K : 3.9K | 1.11 ms | 0.59 ms | 0.19 ms | 2.7e-4 / 2.1e-7 |
+| 16K : 8.4K | 4.34 | 2.29 | 0.44 | 3.2e-4 / 2.0e-7 |
+| 16K : 15.8K | 4.36 | 2.30 | **0.63** | 2.6e-4 / 1.8e-7 |
+| 32K : 31.6K | 8.71 | 4.58 | **1.22** | 2.5e-4 / 1.9e-7 |
+| 64K : 60K | 17.4 | 9.16 | **2.33** | 2.8e-4 / 1.9e-7 |
+| 256K : 250K | 69.4 | 36.6 | **11.2** | 3.0e-4 / 2.7e-7 |
+
+~110 TFLOPS at 32-64K keys (fp16 XMX peak ~175). The forms tried (`li_probe`'s f2 / f4 / f2q, B `col_major` or a VNNI
+repack): 64 keys a step (16 accumulators, GRF256) and the query's 32 A tiles kept in registers (GRF256) lost to the
+32-key step re-loading A from L1 (GRF128) everywhere past 16K keys; the VNNI repack's scattered 2-byte stores cost up to
+6 ms at 256K keys. Work-group: 8 queries x 128 keys (256 to 64K keys, 512 beyond; 16 queries past 128K) - the sweep's
+best, `GGML_SYCL_LI_FUSED_QW` / `_KR` override. `GGML_SYCL_LI_FUSED_CHECK=N` runs the first N calls through li_gemm into
+scratch as well: in the engine (p8k, p30k) max |diff| 1e-6 of scores up to 5.6, 0 non-finite mismatches.
+
+**`STRATA_LI_NVIS=1`** (`patches/patch-linvis.py`: ggml.h / ggml.c `ggml_lightning_indexer_nvis`, ggml-sycl's supports_op,
+li_fused and li_gemm, ds41_dense.cpp): the prompt path built a [cap, n] 0 / -inf mask per call (repeat + add + step + log
++ an F16 copy: ~0.9 ms a call at 16K keys) and read it again for the selected rows' mask; now the op takes each query's
+visible row count (op_params[0] = 1, src[3] = nvis F32 [n]; the CPU op asserts on it) and the selected rows' mask is
+log(step(nvis - sel)) on [K, n].
+
+| p8k (`bench/speed/tlppl-lif.sh`, KL against run a) | PPL | KL mean | p99 | max | top-1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| a / b (without) | 1.6809 / 1.6765 | - / 2.74e-3 | - / 3.82e-2 | - / 0.51 | - / 98.81 % |
+| f (fused) | 1.6776 | 3.40e-3 | 3.75e-2 | 6.79 | 98.78 % |
+| n (fused + nvis) | 1.6774 | 2.66e-3 | 4.06e-2 | 0.46 | 98.83 % |
+
+The fused run's mean is its one outlier token (6.79 / 8538 rows = 8e-4 of it; the fp16-S run in abwT111 had a 6.8 one
+too, the nvis run with the same kernel none). p30k PPL: without 1.7816, fused 1.7823, both 1.7812.
+
+| card 0, p30k's second batch (`bench/speed/opprof.sh`) | abwT110 | S in fp16 | fused + nvis |
+| --- | ---: | ---: | ---: |
+| card 0's time | 5218 ms | 5065 ms | **4783 ms** |
+| `LIGHTNING_INDEXER` a call (90 calls) | 5699 us (host 162) | 3531 us | **684 us** (host 24) |
+| the mask: REPEAT + STEP + LOG + its F16 CPY | 76 ms | 76 ms | 6 ms |
+| (idle before a graph) | 658 ms | - | 782 ms |
+| the one-shot prompt (`--prompt-batch 16384`) | 14.94 s | 14.40 s | 13.11 s |
+
+| abwT112 (server, fresh, two runs each) | without | fused | fused + nvis |
+| --- | ---: | ---: | ---: |
+| 8K | 6.75 / 4.70 s | 7.11 / 4.63 s | 6.28 / 4.62 s |
+| 16K | 7.33 / 7.00 s | 7.02 / 6.80 s | 7.48 / 6.76 s |
+| 31K | 12.44 / 12.34 s | 11.82 / 11.47 s | 22.04 / **11.31 s** |
+
+The 22.04 s: 9.97 s of tier waits in that one batch, nothing in its log (no stream-buffer cap - all three servers capped
+21 times, during the first 8K prompts - no stall watch, nothing in the kernel log); the next 31K on that server 11.31 s.
+Not explained; watched in abwT113. The agent replay (`agentcmp.py k0 k2`, both or neither): follow-ups 42.56 -> **39.90
+s**, side prompts 16.69 -> 16.06 s, every follow-up the same or faster (3.8K tokens at 34K deep 4.40 -> 3.84 s), decode
+120.2 / 123.1 tok/s. Card 0's idle rose (658 -> 782 ms in the profiled batch): the expert cards bound more of it now.
+
 ## Measured (2026-10-26 03:16 - 04:45: an out-of-memory abort after a long conversation - the stream buffer fits the card now)
 
 - **03:16 the service's engine aborted** with `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (the server restarted it). A
@@ -1836,6 +1913,8 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_XMX` | 0 | 1: decode / verify experts on XMX (flat in tokens, slower below ~4 tokens); `STRATA_XMX_KSG` / `_KSD` / `_GRF` its K splits / register mode |
 | `GGML_SYCL_LARRY_XMXMV` | 0 | 1: XMX multi-column Q6_K mat-vecs for verify passes (no end-to-end gain measured) |
 | `GGML_SYCL_LI_GEMM_MIN` / `GGML_SYCL_LI_XMX` | 1 / 1 (service; engine 32 / 0) | the lightning indexer of decode / verify passes on XMX: li_gemm for every batch / one fused bf16 kernel for <= 8 queries (`GGML_SYCL_LI_XMX_CHECK=1` compares with li_gemm) |
+| `GGML_SYCL_LI_FUSED` (`_MIN`, `_QW`, `_KR`, `_CHECK`) | 1 (service, since 2026-10-26 07:48; engine 0) (16, -, -, 0) | the prompt indexer (batches of >= `_MIN` queries) as one fused XMX kernel - the score matrix stays in registers (16K keys 4.36 -> 0.63 ms); `_QW` / `_KR` override the work-group's queries / keys, `_CHECK=N` compares the first N calls with li_gemm |
+| `STRATA_LI_NVIS` | 1 (service, since 2026-10-26 07:48; engine 0) | the prompt path's indexer takes each query's visible row count (`ggml_lightning_indexer_nvis`) instead of a [cap, n] 0 / -inf mask built per call; ggml-sycl only |
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |

@@ -14,16 +14,16 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 
 | | Larry, 2026-10-26 |
 | --- | --- |
-| fresh 8K-token prompt | 4.66 s |
-| fresh 31K-token prompt | 12.1 s (2,565 tok/s) |
-| follow-up turn of 500 new tokens at 38K context | 1.83 s |
+| fresh 8K-token prompt | 4.62 s |
+| fresh 31K-token prompt | 11.3 s (2,742 tok/s) |
+| follow-up turn of 500 new tokens at 38K context | 1.64 s |
 | chat replies (temperature 1, speculative decoding) | 95-103 tok/s |
-| agent-session replies (greedy) | 121 tok/s |
+| agent-session replies (greedy) | 120-123 tok/s |
 | 984K-token prompt (an Oct 24 build) | 19 min, then 62 tok/s |
 | context window | 1,048,576 tokens |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
-Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 2,589 tok/s on Oct 26. The full tables
+Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 2,751 tok/s on Oct 26. The full tables
 are under [Results](#results).
 
 ## How it works
@@ -54,7 +54,7 @@ About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
   Xolotl's pin. It adds:
   - Xolotl's fused DeepSeek-V4 ops on SYCL;
   - dp4a and XMX mat-vec kernels;
-  - the lightning indexer on XMX;
+  - the lightning indexer on XMX, a prompt's as one fused kernel whose score matrix never leaves the registers;
   - layers 0-19's prompt attention through oneDNN's fused SDPA;
   - an AVX2 Q2_0 dot for the CPU pool;
   - an op profiler (off by default).
@@ -64,36 +64,36 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 04:30-04:40, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 07:48-07:51, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,531 then 1,745, 16K 2,283, 31K 2,589 - all four passphrases found |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 94.6 tok/s, 91.8 after the long prompts |
-| essays (3 x 800 tokens) | 69.7 tok/s, 69.1 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,350 then 1,791, 16K 2,222, 31K 2,751 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 98.9 tok/s, 94.1 after the long prompts |
+| essays (3 x 800 tokens) | 76.0 tok/s, 70.4 after the long prompts |
 | tool-call round trip | correct |
 | host memory held by the GPU driver | 33 GiB at most (the watchdog acts at 54) |
 
-Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 14 checks, the
+Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 15 checks, the
 first chat pass ran 94.6-102.7 tok/s and the first essay 69.7-81.3 tok/s. In every check the first 8K needle, which
 follows the decode tests, is slower than the second.
 
-**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 in the log, 2026-10-25/26: a server with
-the service's settings on a side port, greedy):
+**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 and, from 8K up, abwT112 in the log,
+2026-10-25/26: a server with the service's settings on a side port, greedy):
 
 | prompt tokens | 530 | 1,021 | 2,003 | 3,003 | 4,519 | 8,054 | 16,099 | 31,008 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.66 | 7.00 | 12.09 |
+| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.62 | 6.76 | 11.31 |
 
 **Follow-up turns** in a replayed agent session (synthetic, [`larry/bench/speed/agentx.py`](larry/bench/speed/agentx.py);
-context 8K-38K; abwT103):
-- 56 new tokens: 0.47-0.62 s.
-- 500: 1.83 s.
-- 1.4K: 2.66 s.
-- 3.7K: 3.9 s.
-- 6.5K: 4.46 s.
-- Agent replies: 121 tok/s (greedy).
+context 8K-38K; abwT112):
+- 56 new tokens: 0.47-0.60 s.
+- 500: 1.64 s.
+- 1.4K: 2.49-2.60 s.
+- 3.7K: 3.64-3.80 s.
+- 6.5K: 4.10 s.
+- Agent replies: 120-123 tok/s (greedy).
 
 **Long contexts** (2026-10-24, an earlier build; prompt then decode):
 

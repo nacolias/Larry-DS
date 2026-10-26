@@ -1098,8 +1098,16 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     ggml_tensor * iws = nq == n ? iw : ggml_view_2d(gc, iw, iw->ne[0], nq, iw->nb[1], (size_t) q0 * iw->nb[1]);
                     // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
                     ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], nq, (size_t) qc0 * 4), 1, nq);
-                    ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, nq)), nvs)));
-                    ggml_tensor * sc = ggml_lightning_indexer(gc, iqs, ksrc, iws, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, nq]
+                    // larry, STRATA_LI_NVIS (patch-linvis.py, default 0): ggml-sycl's indexer takes nvis itself - no [cap, nq]
+                    // mask (repeat + add + step + log + F16 copy a call), the selected rows' mask from their ids below
+                    static const bool li_nvis = env_on("STRATA_LI_NVIS", false);
+                    ggml_tensor * vis = nullptr, * sc = nullptr;
+                    if (li_nvis && im.sycl) {
+                        sc = ggml_lightning_indexer_nvis(gc, iqs, ksrc, iws, nvs);   // [cap, nq], -inf past nvis
+                    } else {
+                        vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, nq)), nvs)));
+                        sc = ggml_lightning_indexer(gc, iqs, ksrc, iws, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, nq]
+                    }
                     sc = ggml_reshape_2d(gc, sc, cap, nq);
                     if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
                         const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
@@ -1131,7 +1139,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     sel = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sel, 1, K, nq),
                                                             ggml_argsort(gc, ggml_cast(gc, sel, GGML_TYPE_F32),
                                                                          GGML_SORT_ORDER_ASC)), K, nq);
-                    selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, nq), sel), K, nq);   // vis at sel
+                    if (vis) {
+                        selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, nq), sel), K, nq);   // vis at sel
+                    } else {   // 0 where sel < nvis, else -inf: log(step(nvis - sel)) on [K, nq]
+                        selm = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_scale(gc, ggml_cast(gc, sel, GGML_TYPE_F32), -1.0f), nvs)));
+                    }
                     outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, nq, L.sel->nb[1], (size_t) qc0 * L.sel->nb[1])));
                     outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, nq, L.selm->nb[1], (size_t) qc0 * L.selm->nb[1])));
                     sel_parts.push_back(sel);

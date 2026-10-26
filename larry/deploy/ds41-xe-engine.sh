@@ -48,6 +48,13 @@ export STRATA_D3_PF="${STRATA_D3_PF:-0}"
 # tok/s with both (short context and decode-path PPL unchanged)
 export GGML_SYCL_LI_GEMM_MIN="${GGML_SYCL_LI_GEMM_MIN:-1}"
 export GGML_SYCL_LI_XMX="${GGML_SYCL_LI_XMX:-1}"
+# the prompt indexer (512-query spans) as one fused XMX kernel: li_gemm wrote the [B*32 x cap] f32 score matrix and
+# read it back (5.7 ms a call at a 31K prompt's second batch, ~10 % of card 0) - fused 16K keys 4.36 -> 0.63 ms,
+# 64K 17.4 -> 2.33 ms (bench/li/li_probe); and told each query's visible rows instead of a [cap, n] 0 / -inf mask
+# (its repeat / add / step / log / F16 copy, ~0.9 ms a call) - abwT112: fresh 16K 7.00 -> 6.76 s, 31K 12.34 -> 11.31 s,
+# the agent replay's follow-ups 42.6 -> 39.9 s
+export GGML_SYCL_LI_FUSED="${GGML_SYCL_LI_FUSED:-1}"
+export STRATA_LI_NVIS="${STRATA_LI_NVIS:-1}"
 # a decode / verify job's own token count picks its expert kernel form (1-token jobs of verify passes 9-17 % faster)
 export STRATA_XE_JOBNT="${STRATA_XE_JOBNT:-1}"
 # prompt chunks: each expert card pushes its part to the dense card when it is done (31.6K prompt 23.0 -> 21.5 s, exact)
