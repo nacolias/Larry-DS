@@ -181,7 +181,8 @@ rebinds, no swap-ins, and an eighth of the time in direct reclaim. Over abwT134-
 had a first prompt 1.5-20 s slower; none of the 3 swap-off ones. (The first 8K's remaining ~2 s over the second are the
 first calls' own costs - oneMKL kernels, oneDNN partitions, buffer exports - not memory.) To adopt it for the service
 only: a systemd drop-in that runs `swapoff /swapfile` before the start and `swapon /swapfile` after the stop (other
-layouts keep their swap) - not installed: the owner's decision.
+layouts keep their swap) - not installed: the owner's decision. **Decided 2026-10-26 ~20:40: swap stays on** - the
+engine-side fixes (17:50-19:00: the load through O_DIRECT, the Engram drop) cover the stalls.
 
 **Message text cannot open turns any more** (`patches/patch-literals.py`, in `tools/v41/serve/serve_ds41.py`; live since
 the window's restart). V4.1's `<｜User｜>`, `<｜Assistant｜>`, `<｜System｜>`, `｜DSML｜` and its tool / fim markers are
