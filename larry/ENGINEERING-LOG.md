@@ -48,6 +48,42 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 15:54 - 16:30: the kernel's memory settings - worse; the first-prompt stalls are the xe shrinker writing the engine's buffers out)
+
+**The three settings the owner approved trying** (`bench/speed/memset.sh tuned`: `vm.watermark_scale_factor` 10 -> 200,
+`vm.compaction_proactiveness` 20 -> 0, THP defrag `madvise` -> `defer`; runtime only) against the boot values, abwT134:
+four fresh servers each, interleaved, fresh 8K / 16K / 31K prompts twice each, with a kernel trace over the whole window
+(`bench/speed/memtrace.bt`, bpftrace: direct reclaim and direct compaction per thread class, page migrations, xe
+userptr invalidations, exec ioctls; `vmwatch2.py`: /proc/vmstat; `memsum.py` sums both per config):
+
+| Settings | First 8K (each server) | 8K again | 16K first / again | 31K first / again | Engine direct reclaim during the prompts | Swap-ins |
+| --- | --- | ---: | --- | --- | --- | ---: |
+| boot values | 15.69 / 6.35 / 6.22 / 6.48 s | 4.55 s | 6.62 / 6.35 s | 10.56 / 10.56 s | 2.7K calls, 5.4 s (summed over threads) | 4.2K pages |
+| tuned | 26.87 / 7.26 / 6.30 / 6.17 s | 4.60 s | 6.67 / 6.75 s | 10.81 / 10.66 s | 11.4K calls, 336 s | 155K pages |
+
+Worse: not adopted, and the boot values are back (nothing was persisted). The higher watermarks keep 7-11 GiB free
+(the boot values ~1 GiB) on a box whose working set already fills its RAM, so the kernel reclaims and swaps more:
+kswapd's scans x2.2, the engine's time in direct reclaim x60, 620K pages swapped in during t1's first prompt.
+Compaction was not the cause: no userptr invalidations at all, no exec ioctl over 2 ms; proactiveness 0 cut the page
+migrations 4x with no effect on the stalls; the engine has no THP regions, so `defer` changes nothing for it.
+
+**The stalls are the xe shrinker writing the engine's own buffers out.** The stacks behind the direct reclaims and
+compactions led into TTM: `ttm_tt_restore` under `xe_bo_cpu_fault` and under the xe preempt-rebind worker
+(`preempt_rebind_work_func`). `bench/speed/memtrace2.bt` adds TTM's backups and restores and the rebind worker
+(abwT135, two fresh servers on the boot values). **e1 stalled** (16K 8.07 s against 6.37 again, 31K 12.71 against
+10.59): during its prompts the shrinker backed up 457K pages (1.75 GiB) of the engine's system-memory BOs, 40 restores
+read them back (787 ms, the longest 546 ms), and the rebind worker - a compute VM's queues stay preempted while it runs -
+ran 293 times for 4.96 s (the longest 1.23 s). **e2 did not stall**: no backup, no restore, 88 ms of rebinds. TTM backs a
+BO up to shmem only while swap has room (`ttm_backup_bytes_avail` returns `nr_swap_pages` in bytes - checked in larry's
+ttm.ko), so with larry's 128 GiB swapfile the shrinker may move any unpinned BO out under pressure. The pressure during
+prompts comes from buffered reads (the Engram tables: 256 reader threads, and layer 14's `RawMap` on /dev/dm-0 without
+O_DIRECT) and anonymous faults: up to ~250 engine threads in direct reclaim at once (t1), each running the shrinkers.
+
+**Options, none done yet:** no swap (`swapoff`: TTM then has no backup space and the shrinker backs nothing up - the
+owner's call, other layouts may count on the swapfile); fewer Engram readers (Project Maya's ds4 engine uses
+min(16, max(4, cores / 2)) buffered ones) or O_DIRECT for the RawMap; `posix_fadvise(DONTNEED)` on the model file's
+ranges as the load copies them (~150 GiB goes through the page cache at every start); `mlock` of the pageable arena.
+
 ## Measured (2026-10-26 07:55 - 10:27: card 0 still bounds - wo_a as one product, the hc mixes in one pass)
 
 **In the service since 10:23** (`patches/svc-oproja.py`, backup `ds41-xe-engine.sh.pre-oproja-20261026`; binaries built
@@ -168,8 +204,8 @@ while the expert cards' calls themselves ran at normal length: the calls started
 reclaims 0.1-2.7 M pages / 2 s, direct reclaim up to 2 M pages / 2 s, direct compaction stalls up to 330 / 2 s, page
 migration up to 470 K pages / 2 s - in every big prompt, worst in the first minutes after the arena loads; between
 prompts, none. `STRATA_ENGRAM_DIRECT=1` (the paged Engram table with O_DIRECT) does not change that churn (abwT128: the
-same order of reclaim; first prompts 6.0-6.5 vs 6.35-7.2 s, two servers each) - left off. Not tried (system settings,
-the owner's call): `vm.watermark_scale_factor` (kswapd earlier, fewer direct reclaims), `vm.compaction_proactiveness=0`,
+same order of reclaim; first prompts 6.0-6.5 vs 6.35-7.2 s, two servers each) - left off. Not tried then (system
+settings, the owner's call; tried at 15:54 with the owner's OK - worse, see that section): `vm.watermark_scale_factor` (kswapd earlier, fewer direct reclaims), `vm.compaction_proactiveness=0`,
 THP defrag `defer`; and O_DIRECT for layer 14's raw block-device reads (`RawMap` opens /dev/dm-0 without it).
 
 ## Measured (2026-10-26 06:35 - 07:51: the prompt indexer as one fused XMX kernel, told each query's visible rows)

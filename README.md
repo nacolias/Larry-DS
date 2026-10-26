@@ -208,7 +208,9 @@ The Larry-specific ones:
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
 - **The first prompts after a start are slower.** Their first calls load oneMKL's kernels and compile oneDNN's
-  attention partitions.
+  attention partitions. On some starts they also stall for seconds: under memory pressure the xe driver's shrinker
+  writes some of the engine's host buffers out to swap, and the first prompts read them back (see the engineering
+  log, 2026-10-26 15:54).
 - **Runs are not bit-reproducible.** Split sums, sampling and the cache state vary.
 - **Based on Xolotl `f7c561b7` (2026-10-18).** Upstream has moved on since, and those commits are not merged here.
 - **Four cards only.** A split for any card count is planned, not built.

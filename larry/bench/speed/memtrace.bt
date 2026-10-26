@@ -1,0 +1,119 @@
+/*
+ * memtrace.bt - larry, 2026-10-26: what the kernel's memory management does to the ds41 engine, one line every 2 s:
+ *   edr / odr  direct reclaim: calls, total ms, longest ms (e = the engine's threads, o = everything else)
+ *   edc / odc  direct compaction (try_to_compact_pages): calls, total ms, longest ms
+ *   mig        pages migrated (all reasons), migc = by compaction
+ *   up         xe userptr invalidations, userptr rebinds in exec / in the rebind worker
+ *   x          xe exec ioctls: calls, calls over 2 ms, their ms, longest ms
+ *   thr        reclaim throttling events
+ * At the end: the kernel stacks that entered direct compaction / direct reclaim, migrations by reason and mode.
+ * Run: bpftrace -B line memtrace.bt (memtrace-start.sh); SIGINT ends it.
+ */
+
+tracepoint:vmscan:mm_vmscan_direct_reclaim_begin
+{
+	@drb[tid] = nsecs;
+	@dr_stk[comm, args.order, kstack(16)] = count();
+}
+
+tracepoint:vmscan:mm_vmscan_direct_reclaim_end
+/@drb[tid]/
+{
+	$d = (nsecs - @drb[tid]) / 1000;
+	delete(@drb[tid]);
+	if (comm == "ds41_generate_x") {
+		@edr_n += 1;
+		@edr_us += $d;
+		if ($d > @edr_max) { @edr_max = $d; }
+	} else {
+		@odr_n += 1;
+		@odr_us += $d;
+		if ($d > @odr_max) { @odr_max = $d; }
+	}
+}
+
+kprobe:try_to_compact_pages
+{
+	@dcb[tid] = nsecs;
+}
+
+kretprobe:try_to_compact_pages
+/@dcb[tid]/
+{
+	$d = (nsecs - @dcb[tid]) / 1000;
+	delete(@dcb[tid]);
+	if (comm == "ds41_generate_x") {
+		@edc_n += 1;
+		@edc_us += $d;
+		if ($d > @edc_max) { @edc_max = $d; }
+	} else {
+		@odc_n += 1;
+		@odc_us += $d;
+		if ($d > @odc_max) { @odc_max = $d; }
+	}
+}
+
+tracepoint:compaction:mm_compaction_try_to_compact_pages
+{
+	@dc_stk[comm, args.order, kstack(16)] = count();
+}
+
+tracepoint:migrate:mm_migrate_pages
+{
+	@mig += args.succeeded;
+	if (args.reason == 0) { @migc += args.succeeded; }
+	@mig_r[args.reason, args.mode] = sum(args.succeeded);
+}
+
+tracepoint:xe:xe_vma_userptr_invalidate { @upinv += 1; }
+tracepoint:xe:xe_vma_userptr_rebind_exec { @uprbx += 1; }
+tracepoint:xe:xe_vma_userptr_rebind_worker { @uprbw += 1; }
+
+kprobe:xe_exec_ioctl
+{
+	@xb[tid] = nsecs;
+}
+
+kretprobe:xe_exec_ioctl
+/@xb[tid]/
+{
+	$d = (nsecs - @xb[tid]) / 1000;
+	delete(@xb[tid]);
+	@x_n += 1;
+	if ($d > 2000) {
+		@x_slow += 1;
+		@x_slow_us += $d;
+	}
+	if ($d > @x_max) { @x_max = $d; }
+}
+
+tracepoint:vmscan:mm_vmscan_throttled { @thr += 1; }
+
+interval:s:2
+{
+	time("%H:%M:%S");
+	printf(" edr %d %d %d odr %d %d %d edc %d %d %d odc %d %d %d mig %d migc %d up %d %d %d x %d %d %d %d thr %d\n",
+	       @edr_n, @edr_us / 1000, @edr_max / 1000, @odr_n, @odr_us / 1000, @odr_max / 1000,
+	       @edc_n, @edc_us / 1000, @edc_max / 1000, @odc_n, @odc_us / 1000, @odc_max / 1000,
+	       @mig, @migc, @upinv, @uprbx, @uprbw, @x_n, @x_slow, @x_slow_us / 1000, @x_max / 1000, @thr);
+	@edr_n = 0; @edr_us = 0; @edr_max = 0; @odr_n = 0; @odr_us = 0; @odr_max = 0;
+	@edc_n = 0; @edc_us = 0; @edc_max = 0; @odc_n = 0; @odc_us = 0; @odc_max = 0;
+	@mig = 0; @migc = 0; @upinv = 0; @uprbx = 0; @uprbw = 0;
+	@x_n = 0; @x_slow = 0; @x_slow_us = 0; @x_max = 0; @thr = 0;
+}
+
+END
+{
+	clear(@drb); clear(@dcb); clear(@xb);
+	clear(@edr_n); clear(@edr_us); clear(@edr_max); clear(@odr_n); clear(@odr_us); clear(@odr_max);
+	clear(@edc_n); clear(@edc_us); clear(@edc_max); clear(@odc_n); clear(@odc_us); clear(@odc_max);
+	clear(@mig); clear(@migc); clear(@upinv); clear(@uprbx); clear(@uprbw);
+	clear(@x_n); clear(@x_slow); clear(@x_slow_us); clear(@x_max); clear(@thr);
+	printf("== direct compaction entries by comm, order, stack (top 12)\n");
+	print(@dc_stk, 12);
+	printf("== direct reclaim entries by comm, order, stack (top 12)\n");
+	print(@dr_stk, 12);
+	printf("== pages migrated by reason (0 compaction, 7 longterm pin), mode\n");
+	print(@mig_r);
+	clear(@dc_stk); clear(@dr_stk); clear(@mig_r);
+}
