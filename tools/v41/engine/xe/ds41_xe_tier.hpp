@@ -87,6 +87,12 @@ public:
     void release_cache();
     int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
     int64_t regrow_cache(std::string& err);
+    /// larry, patch-regrowasync.py: regrow_cache's uploads queued and left running - published by regrow_poll once
+    /// they are done (until then the experts are arena experts to every reader but resident()).  -1: error.
+    int64_t regrow_cache_async(std::string& err);
+    /// a pending async regrow published if its copies are done (`wait`: after waiting for them); true when this call
+    /// published it.  The engine's thread, between passes.
+    bool regrow_poll(bool wait);
     /// larry, engine1: the dense card's expert replicas (STRATA_XE_REPLICA_GIB) given back for an allocation that found
     /// the card full - ggml-sycl's reclaim hook (`gpu`: the device's Level Zero index).  True when there were any (the
     /// allocation is tried once more); the next seed / regrow uploads them again where there is room.
@@ -167,6 +173,14 @@ public:
     /// larry, engine1: rows [r0, r1) of weight `w` (the dense card's reordered tensor) are on GPU `gpu` already as one
     /// planar slice at `p` (the TP core's shard): the LM head split (mv_hook) reads it instead of a copy.  Before use.
     void tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p);
+    /// larry, STRATA_SHEXP_TIER (patch-shexptier.py): layer l's shared-expert slice of the TP core on GPU `gpu` - gate |
+    /// up rows (2 nf x n_embd) at gu, down (n_embd x nf) at dn, planar Q6_K; a slice on the dense card is copied to the
+    /// first expert card.  Before serving.
+    void tp_shexp_slice(int64_t l, int gpu, const void* gu, const void* dn, int64_t nf);
+    /// every layer has its shared-expert slices on the expert cards
+    bool shexp_ready() const;
+    /// the next run_chunk_dev_async computes the shared expert for all its tokens too (added into the routed sums)
+    void set_shexp_next(bool on);
     /// larry, engine1: the dense card's expert cap (STRATA_XE_DENSE_GIB) raised by `bytes` (card 0's dense weights
     /// the pager gave back).  Before the dense card's seed.
     void tp_dense_bonus(size_t bytes);

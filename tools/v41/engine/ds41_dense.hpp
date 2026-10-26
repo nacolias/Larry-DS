@@ -136,6 +136,9 @@ public:
     /// larry (pipelined batch, with the submit lock set): span graphs alternate two allocators guarded by events, so
     /// a span no longer waits for the device; pass_sync() waits for everything (the tier reads the spans' outputs)
     void set_pass_ring(bool on);
+    /// larry, STRATA_SHEXP_TIER (patch-shexpdense.py): the following prompt spans leave the shared expert to the expert
+    /// tier (their graphs write zeros into its columns; the tier adds it into the routed sum)
+    void set_shexp_skip(bool on);
     /// larry: called right before a decode / verify layer's host waits for its router readback (layer, width) - the
     /// tier queues its cards' share then (Ds41XeTier::arm)
     void set_pre_wait_hook(std::function<void(int, int)> h);

@@ -673,6 +673,32 @@ int main(int argc, char ** argv) {
                 if (const void * p = tp->shard(nm, k, r0, r1, gpu)) tier.tp_head_slice(t->data, gpu, r0, r1, p);
             }
         }
+        // larry, STRATA_SHEXP_TIER (patch-shexpgen.py): the shared expert's rank shards for the expert tier (prompt calls)
+        if (std::getenv("STRATA_SHEXP_TIER") && std::atoi(std::getenv("STRATA_SHEXP_TIER")) != 0) {
+            // every rank's slice of every layer, and together the whole n_ff (ffn_down_shexp's K) - else none
+            struct Sl { int l, gpu; const void * gu; const void * dn; int64_t nf; };
+            std::vector<Sl> sls;
+            bool whole = true;
+            for (int l = 0; l < n_layer && whole; ++l) {
+                const ggml_tensor * wd = dense.weight("blk." + std::to_string(l) + ".ffn_down_shexp.weight");
+                int64_t sum = 0;
+                for (int k = 0; k < tp->n_cards(); ++k) {
+                    Ds41TpShard gu, dn;
+                    const std::string pre = "blk." + std::to_string(l) + ".";
+                    if (!tp->shard_desc(pre + "ffn_gate_up_shexp.weight", k, gu) || !tp->shard_desc(pre + "ffn_down_shexp.weight", k, dn)) continue;
+                    const int64_t nf = gu.a1 - gu.a0;
+                    if (gu.kind != 1 || dn.kind != 2 || (dn.a1 - dn.a0) * 256 != nf) continue;
+                    sls.push_back({l, gu.gpu, gu.p, dn.p, nf});
+                    sum += nf;
+                }
+                whole = wd && sum == wd->ne[0];
+                if (!whole) std::fprintf(stderr, "shared expert on the expert tier: layer %d's slices cover %lld of %lld - off\n", l,
+                                         (long long) sum, (long long) (wd ? wd->ne[0] : -1));
+            }
+            if (whole) for (const Sl & x : sls) tier.tp_shexp_slice(x.l, x.gpu, x.gu, x.dn, x.nf);
+            std::fprintf(stderr, "shared expert on the expert tier: %zu slices, %s\n", whole ? sls.size() : (size_t) 0,
+                         whole && tier.shexp_ready() ? "every layer" : "off");
+        }
     }
 #endif
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
@@ -809,6 +835,9 @@ int main(int argc, char ** argv) {
     const float * tp_lg = nullptr;   // the last TP pass's logits rows (tp_logits, or the caller's)
 #if defined(DS41_TP)
     auto tp_run = [&](const int * toks, int m, int pos, float * vh_out, float * lg_out = nullptr) -> bool {
+#if defined(DS41_XE)
+        tier.regrow_poll(false);   // larry, STRATA_SERVE_REGROW_ASYNC: a queued regrow whose copies are done - in this pass's table
+#endif
         int64_t lo = 0, hi = 0;
         bool changed = false;
         dense.take_written(&lo, &hi, &changed);
@@ -1344,8 +1373,19 @@ int main(int argc, char ** argv) {
                     auto ptr = [&](const char * what, int l, int a0, int a1, double t) {
                         if (pipe_trace) std::fprintf(stderr, "pipe trace: %8.1f  L%-2d %s [%5d,%5d) %7.1f ms\n", t - pt0, l, what, a0, a1, now_ms() - t);
                     };
+                    // larry, STRATA_SHEXP_TIER: a part of >= STRATA_SHEXP_TIER_MIN columns has its shared expert on the expert cards
+#if defined(DS41_XE)
+                    static const bool sh_env = std::getenv("STRATA_SHEXP_TIER") && std::atoi(std::getenv("STRATA_SHEXP_TIER")) != 0;
+                    static const int sh_min = std::getenv("STRATA_SHEXP_TIER_MIN") ? std::atoi(std::getenv("STRATA_SHEXP_TIER_MIN")) : 256;
+                    const bool sh_on = sh_env && tier.shexp_ready();
+#else
+                    const bool sh_on = false;
+                    const int sh_min = 0;
+#endif
+                    auto sh_part = [&](int a0, int a1) { return sh_on && a1 - a0 >= sh_min; };
                     auto PD = [&](int l, int a0, int a1) -> bool {
                         const double t = now_ms();
+                        dense.set_shexp_skip(sh_part(a0, a1));   // larry, STRATA_SHEXP_TIER
                         for (int s = a0; s < a1; s += SB)
                             if (!dense.attn_router_span(l, s, std::min(SB, a1 - s))) { ferr = dense.last_error(); return false; }
                         fd_dense += now_ms() - t;
@@ -1425,6 +1465,9 @@ int main(int argc, char ** argv) {
                             dc_wts[(size_t) l].assign(dense.batch_wts() + (size_t) dump_col * top_k, dense.batch_wts() + (size_t) (dump_col + 1) * top_k);
                             if (fn_dev) tier.dbg_capture(2 * l, fn_dev + (size_t) dump_col * n_embd, (size_t) n_embd * 4);
                         }
+#if defined(DS41_XE)
+                        tier.set_shexp_next(sh_part(a0, a1));   // larry, STRATA_SHEXP_TIER: the same parts as PD's
+#endif
                         inflight = tier.run_chunk_dev_async(l, a1 - a0, dense.batch_ids() + (size_t) a0 * top_k,
                                                             dense.batch_wts() + (size_t) a0 * top_k,
                                                             dense.batch_fn() + (size_t) a0 * n_embd, prdev + (size_t) a0 * n_embd, last,
@@ -1483,6 +1526,7 @@ int main(int argc, char ** argv) {
                     dense.set_pass_ring(false);
                     dense.set_submit_lock(nullptr);
                     dense.set_fn_host(true);
+                    dense.set_shexp_skip(false);   // larry, STRATA_SHEXP_TIER
                     if (!okp) { tier.prefetch_end(); return false; }
                 }
                 double t0 = now_ms();
@@ -1966,6 +2010,13 @@ int main(int argc, char ** argv) {
             static const double kl_margin = std::getenv("STRATA_SERVE_KEEP_LEARN_MARGIN_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_LEARN_MARGIN_GIB")) : 1.5;
             static bool kl_now = false;
             kl_now = false;
+            // larry, STRATA_SERVE_KEEP_LEARN_HIST (patch-keephist.py): the last 8 kept batches - width, VRAM taken, end
+            struct KlEnt { int B; double used; int end; };
+            static std::vector<KlEnt> kl_hist;
+            static const bool kl_hist_on = keep_learn && std::getenv("STRATA_SERVE_KEEP_LEARN_HIST") &&
+                                           std::atoi(std::getenv("STRATA_SERVE_KEEP_LEARN_HIST")) != 0;
+            static int kl_sel_B = 0;          // the pair the shrink used (the batch width follows it)
+            static double kl_sel_used = 0;
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41Tier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
@@ -1977,7 +2028,31 @@ int main(int argc, char ** argv) {
                                   a.vram_margin_gib * 1073741824.0;
                     // larry, STRATA_SERVE_KEEP_LEARN: the last kept batch's own VRAM, plus the columns it did not have
                     kl_now = false;
-                    if (keep_learn && kl_B > 0 && total <= std::max(kl_end, 16384)) {   // patch-keeplearn2: no deeper
+                    if (kl_hist_on && !kl_hist.empty()) {   // larry, patch-keephist: the closest batch as wide, depth-scaled
+                        const int w = std::min(dh, PB);
+                        auto depth = [&](const KlEnt & e) {
+                            const int lim = std::max(e.end, 16384);
+                            return total > lim ? (double) total / lim : 1.0;
+                        };
+                        const KlEnt * be = nullptr;
+                        double est = 0;
+                        for (const KlEnt & e : kl_hist)   // a batch at least as wide bounds this one
+                            if (e.B >= w && (!be || e.used * depth(e) < est)) { be = &e; est = e.used * depth(e); }
+                        if (!be) {   // none as wide: the widest one's, kl_col a column more
+                            for (const KlEnt & e : kl_hist) if (!be || e.B > be->B) be = &e;
+                            est = be->used * depth(*be) + kl_col * 1048576.0 * (double) (w - be->B);
+                        }
+                        const double nl = est + kl_margin * 1073741824.0;
+                        if (nl < need) {
+                            std::fprintf(stderr, "serve: keep-cache learned: a %d-token batch ending at %d took %.2f GiB -> %.2f GiB for "
+                                         "this one (%d tokens ending at %d; calibrated %.2f)\n", be->B, be->end, be->used / 1073741824.0,
+                                         nl / 1073741824.0, w, total, need / 1073741824.0);
+                            need = nl;
+                            kl_now = true;
+                            kl_sel_B = be->B;
+                            kl_sel_used = be->used * depth(*be);
+                        }
+                    } else if (keep_learn && kl_B > 0 && total <= std::max(kl_end, 16384)) {   // patch-keeplearn2: no deeper
                         const double nl = kl_used + kl_col * 1048576.0 * (double) std::max(0, std::min(dh, PB) - kl_B) +
                                           kl_margin * 1073741824.0;
                         if (nl < need) {
@@ -1986,6 +2061,8 @@ int main(int argc, char ** argv) {
                                          need / 1073741824.0);
                             need = nl;
                             kl_now = true;
+                            kl_sel_B = kl_B;
+                            kl_sel_used = kl_used;
                         }
                     }
                     std::string kerr;
@@ -2074,8 +2151,8 @@ int main(int argc, char ** argv) {
                 const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - fit_fixed * 1073741824.0;
                 int fit = (int) std::max<int64_t>(2, (int64_t) (room / (fit_col * 1048576.0)));
                 if (kept && kl_now) {   // larry, STRATA_SERVE_KEEP_LEARN: the width from the same model as the shrink
-                    const double lr = (double) frb - kl_margin * 1073741824.0 - kl_used;   // patch-keeplearn2
-                    fit = (int) std::max<int64_t>(2, (int64_t) kl_B + (int64_t) (lr / (kl_col * 1048576.0)));
+                    const double lr = (double) frb - kl_margin * 1073741824.0 - kl_sel_used;   // patch-keeplearn2 / keephist
+                    fit = (int) std::max<int64_t>(2, (int64_t) kl_sel_B + (int64_t) (lr / (kl_col * 1048576.0)));
                 }
                 pb_cap = std::min(PB, std::max(SB, fit));
                 kl_free0 = (double) frb;
@@ -2106,13 +2183,26 @@ int main(int argc, char ** argv) {
                 kl_used = used;
                 kl_B = tight ? 0 : std::min(dh, pb_cap);
                 kl_end = total;   // patch-keeplearn2
+                if (kl_hist_on) {   // larry, patch-keephist: a tight batch forgets them all
+                    if (tight) kl_hist.clear();
+                    else {
+                        kl_hist.push_back({kl_B, used, total});
+                        if (kl_hist.size() > 8) kl_hist.erase(kl_hist.begin());
+                    }
+                }
             }
             kl_free0 = 0;
             g_kl_min_free = -1;   // larry, patch-keeplearn2
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
                 dense.release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)
+#if defined(DS41_XE)
+                // larry, STRATA_SERVE_REGROW_ASYNC (patch-regrowasync-gen.py): the copies left running (TP decode publishes them)
+                static const bool rg_async = tp_on && std::getenv("STRATA_SERVE_REGROW_ASYNC") && std::atoi(std::getenv("STRATA_SERVE_REGROW_ASYNC")) != 0;
+                if ((rg_async ? tier.regrow_cache_async(kerr) : tier.regrow_cache(kerr)) < 0) {
+#else
                 if (tier.regrow_cache(kerr) < 0) {
+#endif
                     std::fprintf(stderr, "serve: keep-cache regrow: %s - re-seeding\n", kerr.c_str());
                     tier.release_cache();
                     cache_open = false;

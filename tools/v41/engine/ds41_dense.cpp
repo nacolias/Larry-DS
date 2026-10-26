@@ -329,6 +329,7 @@ struct Ds41Dense::Impl {
     bool compute(ggml_cgraph * gf, bool cached, bool async = false, bool nosync = false);
     double last_alloc_ms = 0;   // larry, patch-logitsdiag: the last compute()'s graph allocation
     std::mutex * sub_mu = nullptr;            // larry: set_submit_lock
+    bool shexp_skip = false;                  // larry, STRATA_SHEXP_TIER: set_shexp_skip
     bool fn_host = true;                      // larry: set_fn_host
     std::function<void(int, int)> pre_wait;   // larry: set_pre_wait_hook
     std::function<void(int)> page_need, page_touch;   // larry, engine1: set_page_hooks
@@ -1325,7 +1326,10 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // ---- shared expert
     if (with_shexp) {
         ggml_tensor * sx = b.cols2(im.shexp, D, n, col0);
-        outs.push_back(fn8 ? shexp_ffn(im, gc, il, fn, fn8, sx) : ggml_cpy(gc, shexp_ffn(im, gc, il, fn), sx));
+        if (im.shexp_skip && !dec)   // larry, STRATA_SHEXP_TIER: the expert cards add it into the routed sum - zeros here
+            outs.push_back(ggml_cpy(gc, ggml_scale(gc, fn, 0.0f), sx));
+        else
+            outs.push_back(fn8 ? shexp_ffn(im, gc, il, fn, fn8, sx) : ggml_cpy(gc, shexp_ffn(im, gc, il, fn), sx));
     }
     ggml_tensor * o_fn8 = fn8 && !with_shexp ? ggml_view_1d(gc, im.o_fn8, ggml_dsv41_q8_floats(D, n), 0) : nullptr;   // the shexp graph's
 
@@ -2544,6 +2548,7 @@ void Ds41Dense::set_oproj_hook(std::function<bool(int, int, const ggml_tensor *,
     p_->oproj_hook = std::move(h);
 }
 void Ds41Dense::set_submit_lock(std::mutex * m, std::atomic<int> * prio) { p_->sub_mu = m; p_->sub_prio = m ? prio : nullptr; }
+void Ds41Dense::set_shexp_skip(bool on) { p_->shexp_skip = on; }   // larry, STRATA_SHEXP_TIER
 
 bool Ds41Dense::upload_routed(const float * routed_host, int B) {
     Impl & im = *p_;

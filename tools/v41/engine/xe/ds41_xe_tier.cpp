@@ -335,6 +335,12 @@ struct XeCard {
     float* cX = nullptr; size_t cX_cap = 0;          ///< floats
     sycl::half* cXh = nullptr; size_t cXh_cap = 0;   ///< larry, STRATA_XE_FN16: X as it arrives (halves; card-local)
     float* cOUT = nullptr; size_t cOUT_cap = 0;      ///< floats
+    // larry, STRATA_SHEXP_TIER (patch-shexptier.py): this card's shared-expert slices of layer sh_layer in fp16 (per
+    // slice gate | up rows, then down) and a call's scratch for them (X rows, gate | up, SwiGLU), the row indices 0..
+    sycl::half* sh_w = nullptr; size_t sh_w_cap = 0; int64_t sh_layer = -1;
+    uint8_t* sh_buf = nullptr; sycl::half* sh_x = nullptr; float* sh_g = nullptr; sycl::half* sh_h = nullptr;
+    size_t sh_rows = 0, sh_nf = 0;
+    int32_t* sh_iota = nullptr; size_t sh_iota_n = 0;
     float* cOUT_host = nullptr; size_t cOUT_host_cap = 0;
     int32_t* cS = nullptr; float* cW = nullptr; size_t cS_cap = 0;   ///< entries
     XeJob* cjobs = nullptr; float* cH = nullptr; float* cY = nullptr; int cjobs_cap = 0;
@@ -479,6 +485,19 @@ struct Ds41XeImpl {
     /// larry, engine1: rows the TP core holds already as planar slices, by weight: (GPU, r0, r1, address)
     struct GivenSlice { int gpu; int64_t r0, r1; const void* p; };
     std::map<const void*, std::vector<GivenSlice>> head_given;
+    // larry, patch-regrowasync: a queued regrow of the dense card's cache - its experts, published by regrow_poll
+    struct RgEnt { size_t key; uint8_t* p; std::pair<int32_t, int32_t> le; };
+    std::vector<RgEnt> rg_list;
+    std::vector<uint8_t> rg_mark;   ///< by key: in rg_list (resident() counts them for the route bias)
+    sycl::event rg_ev;              ///< the dense card's queue behind the last copy / repack of rg_list
+    bool rg_pending = false;
+    double rg_t0 = 0;
+    // larry, STRATA_SHEXP_TIER: per layer the shared expert's TP shards on the expert cards (card index, gate | up
+    // 2 nf x H, down H x nf - planar Q6_K, nf); copies made here (rank 0's) in sh_own
+    struct ShSlice { int card; const uint8_t* gu; const uint8_t* dn; int64_t nf; };
+    std::vector<std::vector<ShSlice>> sh_slices;
+    std::vector<std::pair<XeCard*, uint8_t*>> sh_own;
+    bool sh_next = false, sh_call = false;
     // STRATA_TP_OPROJ: per layer (keyed by wo_a), the attention output's parts - part 0 the dense card, part i >= 1 an
     // expert card: groups [g0[i], g0[i + 1]) of wo_a (its slices as they are) and wo_b's matching columns (gathered)
     struct OSplit {
@@ -1459,7 +1478,8 @@ namespace {
 /// skipped: a regrow continues where the cache ends).  Pageable arena experts go through a pinned bounce: a DMA straight
 /// from pageable memory makes the driver pin the source pages, and 15 GiB queued at once pushed larry's driver-held RAM
 /// past the watchdog (58 GiB, 2026-10-19; TTM's cap for all of it is ~60.7 GiB).  Returns the experts added, -1 on error.
-int64_t seed_dense(Ds41XeImpl& im, XeCard& c, const std::vector<std::pair<int32_t, int32_t>>& ranked, const char* what, std::string& err) {
+int64_t seed_dense(Ds41XeImpl& im, XeCard& c, const std::vector<std::pair<int32_t, int32_t>>& ranked, const char* what, std::string& err,
+                   bool defer = false) {   // larry, patch-regrowasync: defer = the uploads queued, published by regrow_poll
     const double t0 = now_ms();
     const size_t half = std::max<size_t>((size_t) im.blob_max, (size_t) 64 << 20);
     if (c.bounce_cap < 2 * half) {
@@ -1495,10 +1515,26 @@ int64_t seed_dense(Ds41XeImpl& im, XeCard& c, const std::vector<std::pair<int32_
             hused += (b + 255) & ~(size_t) 255;
             ++n_page;
         }
+        if (defer) {   // larry, patch-regrowasync
+            im.rg_list.push_back({key, p, le});
+            if (im.rg_mark.size() != im.card_of.size()) im.rg_mark.assign(im.card_of.size(), 0);
+            im.rg_mark[key] = 1;
+            continue;
+        }
         im.card_of[key] = (int8_t) c.idx;
         im.dptr[key] = p;
         rt_put(im, key);
         im.dense_set.push_back(le);
+    }
+    if (defer) {   // larry, patch-regrowasync: the bounce's copies done (the next prompt's streams use it), the rest queued
+        hev[0].wait();
+        hev[1].wait();
+        im.rg_ev = c.q.ext_oneapi_submit_barrier();
+        im.rg_pending = !im.rg_list.empty();
+        im.rg_t0 = t0;
+        std::fprintf(stderr, "xe tier: dense card %d %s: %lld experts (%lld pinned / %lld pageable) queued in %.2f s (slabs %.0f ms)\n",
+                     c.idx, what, (long long) (n_pin + n_page), (long long) n_pin, (long long) n_page, (now_ms() - t0) / 1000.0, t_alloc);
+        return n_pin + n_page;
     }
     c.q.wait();
     im.resident_n = 0;
@@ -1525,6 +1561,7 @@ int64_t dense_budget(Ds41XeImpl& im, XeCard& c) {
 
 bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
     Ds41XeImpl& im = *im_;
+    regrow_poll(true);   // larry, patch-regrowasync
     if (!im.placed && !build_arena_ranked(ranked, err)) return false;
     if (im.dense < 0 || !im.cache_enabled || !im.dense_set.empty()) return true;
     XeCard& c = *im.cards[(size_t) im.dense];
@@ -1565,6 +1602,7 @@ bool Ds41XeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
 /// Returns the experts released, -1 when even an empty cache would not make the room (the caller releases it all).
 int64_t Ds41XeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     Ds41XeImpl& im = *im_;
+    regrow_poll(true);   // larry, patch-regrowasync
     if (im.dense < 0 || im.dense_set.empty()) return -1;
     XeCard& c = *im.cards[(size_t) im.dense];
     c.q.wait();
@@ -1608,9 +1646,47 @@ int64_t Ds41XeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     return released;
 }
 
+/// larry, patch-regrowasync: regrow_cache's copies queued, published by regrow_poll (see the header)
+int64_t Ds41XeTier::regrow_cache_async(std::string& err) {
+    Ds41XeImpl& im = *im_;
+    regrow_poll(true);
+    if (im.dense < 0 || !im.cache_enabled || im.seed_ranked.empty()) return 0;
+    XeCard& c = *im.cards[(size_t) im.dense];
+    c.budget = dense_budget(im, c);
+    return c.used >= c.budget ? 0 : seed_dense(im, c, im.seed_ranked, "regrow", err, true);   // (the replicas: at publish)
+}
+
+bool Ds41XeTier::regrow_poll(bool wait) {
+    Ds41XeImpl& im = *im_;
+    if (!im.rg_pending) return false;
+    if (!wait && im.rg_ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete)
+        return false;
+    const double tw = now_ms();
+    im.rg_ev.wait();
+    const double tp = now_ms();
+    for (const auto& r : im.rg_list) {
+        im.card_of[r.key] = (int8_t) im.dense;
+        im.dptr[r.key] = r.p;
+        rt_put(im, r.key);
+        im.dense_set.push_back(r.le);
+        im.rg_mark[r.key] = 0;
+    }
+    const size_t n = im.rg_list.size();
+    im.rg_list.clear();
+    im.rg_pending = false;
+    im.resident_n = 0;
+    for (auto& cp : im.cards) im.resident_n += cp->n_experts;
+    rep_upload(im);   // larry, engine1: the replicas after the cache
+    std::fprintf(stderr, "xe tier: dense card regrow published: %zu experts, %.2f s after it was queued (%s %.0f ms); %zu experts "
+                 "(%.2f GiB) on it\n", n, (tp - im.rg_t0) / 1000.0, wait ? "waited" : "done,", tp - tw, im.dense_set.size(),
+                 im.cards[(size_t) im.dense]->used / kGiB);
+    return true;
+}
+
 /// larry (serve keep-cache): after the batch, the tail back - the seed continued within what is free now.
 int64_t Ds41XeTier::regrow_cache(std::string& err) {
     Ds41XeImpl& im = *im_;
+    regrow_poll(true);   // larry, patch-regrowasync
     if (im.dense < 0 || !im.cache_enabled || im.seed_ranked.empty()) return 0;
     XeCard& c = *im.cards[(size_t) im.dense];
     c.budget = dense_budget(im, c);
@@ -2085,6 +2161,7 @@ bool Ds41XeTier::reclaim(int gpu, int64_t bytes) {
 
 void Ds41XeTier::release_cache() {
     Ds41XeImpl& im = *im_;
+    regrow_poll(true);   // larry, patch-regrowasync
     rep_drop(im);   // larry, engine1: the replicas go first (copies: the expert cards still hold them)
     if (im.dense < 0 || im.dense_set.empty()) return;
     if (im.groute_on) { im.rt_dense_ev.wait(); im.last_sum.wait(); }   // STRATA_XE_GROUTE: its share on the dense queue
@@ -4005,9 +4082,18 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
     } else {
         fn16 = false;
     }
+    // larry, STRATA_SHEXP_TIER: the shared expert on the expert cards holding its slices (they run even with no routed
+    // expert of their own)
+    const bool shx = im.sh_call && (size_t) l < im.sh_slices.size() && !im.sh_slices[(size_t) l].empty();
+    im.sh_call = false;
+    auto sh_has = [&](int idx) {
+        if (!shx) return false;
+        for (const auto& sl : im.sh_slices[(size_t) l]) if (sl.card == idx) return true;
+        return false;
+    };
     for (auto& cp : im.cards) {
         XeCard& c = *cp;
-        c.busy = !cl[(size_t) c.idx].empty();
+        c.busy = !cl[(size_t) c.idx].empty() || (!c.dense && sh_has(c.idx));
         if (!c.busy) continue;
         const double tg0 = prof ? now_ms() : 0;
         uint8_t* const st0 = c.stream;   // a card keeping experts keeps its buffer (no regrow)
@@ -4680,6 +4766,76 @@ bool run_big(Ds41XeImpl& im, int64_t l, int n, const int32_t* ids, const float* 
             c.st_have.swap(have);
             c.st_end = end;
             c.st_layer = l;
+        }
+        // larry, STRATA_SHEXP_TIER (patch-shexptier.py): this card's shared-expert slices for every token of the call,
+        // added into its part: per slice its layer's fp16 copy (at the layer's first call), then X rows -> f16, the
+        // gate | up GEMM, the clamped SwiGLU, the down GEMM into the part (beta 1 once anything wrote it)
+        if (shx && !c.dense && sh_has(c.idx)) {
+            const auto& sls = im.sh_slices[(size_t) l];
+            size_t wneed = 0, nfm = 0;
+            for (const auto& sl : sls) if (sl.card == c.idx) { wneed += (size_t) (3 * sl.nf * H); nfm = std::max(nfm, (size_t) sl.nf); }
+            const int64_t RBs = 1024;
+            bool ok_sh;
+            {
+                std::lock_guard<PrioMutex> lk(g_submit);
+                const sycl::half* w_was = c.sh_w;
+                ok_sh = grow_loc(c.sh_w, c.sh_w_cap, wneed, c.q);
+                if (c.sh_w != w_was) c.sh_layer = -1;   // a new buffer: its layer's copy is gone
+                if (ok_sh && (c.sh_rows < (size_t) RBs || c.sh_nf < nfm)) {
+                    if (c.sh_buf) { c.q.wait(); local_free(c.q, c.sh_buf); c.sh_buf = nullptr; c.sh_rows = c.sh_nf = 0; }
+                    const size_t bx = (size_t) RBs * H * 2, bg = (size_t) RBs * 2 * nfm * 4, bh = (size_t) RBs * nfm * 2;
+                    c.sh_buf = local_alloc(c.q, bx + bg + bh);
+                    ok_sh = c.sh_buf != nullptr;
+                    if (ok_sh) {
+                        c.sh_x = (sycl::half*) c.sh_buf;
+                        c.sh_g = (float*) (c.sh_buf + bx);
+                        c.sh_h = (sycl::half*) (c.sh_buf + bx + bg);
+                        c.sh_rows = (size_t) RBs;
+                        c.sh_nf = nfm;
+                    }
+                }
+                if (ok_sh && c.sh_iota_n < (size_t) n) {
+                    if (c.sh_iota) { c.q.wait(); local_free(c.q, c.sh_iota); c.sh_iota = nullptr; c.sh_iota_n = 0; }
+                    const size_t ni = std::max<size_t>((size_t) n, 16384);
+                    c.sh_iota = (int32_t*) local_alloc(c.q, ni * 4);
+                    ok_sh = c.sh_iota != nullptr;
+                    if (ok_sh) {
+                        int32_t* io = c.sh_iota;
+                        c.q.parallel_for(sycl::range<1>(ni), [=](sycl::id<1> i) { io[i] = (int32_t) i[0]; });
+                        c.sh_iota_n = ni;
+                    }
+                }
+                if (ok_sh && c.sh_layer != l) {
+                    size_t off = 0;
+                    for (const auto& sl : sls) {
+                        if (sl.card != c.idx) continue;
+                        fastmv::dequant_q6k_planar_f16(c.q, sl.gu, 2 * sl.nf, H, c.sh_w + off);
+                        fastmv::dequant_q6k_planar_f16(c.q, sl.dn, H, sl.nf, c.sh_w + off + (size_t) (2 * sl.nf * H));
+                        off += (size_t) (3 * sl.nf * H);
+                    }
+                    c.sh_layer = l;
+                }
+            }
+            if (!ok_sh) { std::fprintf(stderr, "xe tier: card %d: shared-expert buffers failed\n", c.idx); return false; }
+            size_t off = 0;
+            for (const auto& sl : sls) {
+                if (sl.card != c.idx) continue;
+                const int64_t nf = sl.nf;
+                const sycl::half* Wgu = c.sh_w + off;
+                const sycl::half* Wdn = c.sh_w + off + (size_t) (2 * nf * H);
+                for (int64_t r0 = 0; r0 < (int64_t) n; r0 += RBs) {
+                    const int64_t m = std::min<int64_t>(RBs, (int64_t) n - r0);
+                    std::lock_guard<PrioMutex> lk(g_submit);
+                    xe::xe_gather_rows_f16(c.q, xin, c.sh_iota + r0, (int) m, (int) H, c.sh_x);
+                    mkl::blas::row_major::gemm(c.q, mkl::transpose::nontrans, mkl::transpose::trans, m, 2 * nf, H, 1.0f, c.sh_x, H,
+                                               Wgu, H, 0.0f, c.sh_g, 2 * nf);
+                    xe::xe_swiglu_f16(c.q, c.sh_g, (int) m, (int) nf, im.L, c.sh_h);
+                    mkl::blas::row_major::gemm(c.q, mkl::transpose::nontrans, mkl::transpose::trans, m, H, nf, 1.0f, c.sh_h, nf,
+                                               Wdn, nf, out_init ? 1.0f : 0.0f, c.cOUT + (size_t) r0 * H, H);
+                }
+                out_init = true;
+                off += (size_t) (3 * nf * H);
+            }
         }
         if (!out_dev) {
             std::lock_guard<PrioMutex> lk(g_submit);
@@ -5587,7 +5743,8 @@ void Ds41XeTier::tp_between_passes(int chunks) {
         pc_setup(im);
     }
     pc_poll(im, false);   // copies done (in order behind the last pass): published - their slots free for new wants
-    for (const auto& lk : im.tp_want) if (im.pc_ready) pc_want(im, lk.first, lk.second);
+    // larry, patch-regrowasync: no new promotion while a regrow is pending (its experts are arena experts until published)
+    for (const auto& lk : im.tp_want) if (im.pc_ready && !im.rg_pending) pc_want(im, lk.first, lk.second);
     im.tp_want.clear();
     // early bounces no card took (every card at its in-flight cap): given back once filled (the helper is done with them)
     for (auto it = im.pc_jobs.begin(); it != im.pc_jobs.end();) {
@@ -5647,6 +5804,46 @@ void Ds41XeTier::tp_dense_bonus(size_t bytes) {
 void Ds41XeTier::tp_head_slice(const void* w, int gpu, int64_t r0, int64_t r1, const void* p) {
     if (w && p) im_->head_given[w].push_back({gpu, r0, r1, p});
 }
+
+void Ds41XeTier::tp_shexp_slice(int64_t l, int gpu, const void* gu, const void* dn, int64_t nf) {
+    Ds41XeImpl& im = *im_;
+    const int64_t H = im.g.n_embd;
+    if (l < 0 || !gu || !dn || nf <= 0 || nf % 256 || H % 256) return;
+    if ((size_t) l >= im.sh_slices.size()) im.sh_slices.resize((size_t) l + 1);
+    XeCard* own = nullptr;
+    for (auto& cp : im.cards) if (cp->gpu == gpu) own = cp.get();
+    if (!own) return;
+    if (!own->dense) { im.sh_slices[(size_t) l].push_back({own->idx, (const uint8_t*) gu, (const uint8_t*) dn, nf}); return; }
+    // rank 0's slice: onto the first expert card, through the host (once, at load)
+    XeCard* dst = nullptr;
+    for (auto& cp : im.cards) if (!cp->dense) { dst = cp.get(); break; }
+    if (!dst) return;
+    const size_t bgu = (size_t) (2 * nf * H / 256) * 210, bdn = (size_t) (H * nf / 256) * 210;
+    uint8_t* p = local_alloc(dst->q, bgu + bdn);
+    if (!p) {
+        std::fprintf(stderr, "xe tier: shared expert: no room on card %d for layer %lld's rank-0 slice\n", dst->idx, (long long) l);
+        return;
+    }
+    std::vector<uint8_t> tmp(bgu + bdn);
+    {
+        std::lock_guard<PrioMutex> lk(g_submit);
+        own->q.memcpy(tmp.data(), gu, bgu);
+        own->q.memcpy(tmp.data() + bgu, dn, bdn);
+        own->q.wait();
+        dst->q.memcpy(p, tmp.data(), bgu + bdn).wait();
+    }
+    im.sh_own.emplace_back(dst, p);
+    im.sh_slices[(size_t) l].push_back({dst->idx, p, p + bgu, nf});
+}
+
+bool Ds41XeTier::shexp_ready() const {
+    const Ds41XeImpl& im = *im_;
+    if ((int64_t) im.sh_slices.size() < im.g.n_layers) return false;
+    for (const auto& v : im.sh_slices) if (v.empty()) return false;
+    return true;
+}
+
+void Ds41XeTier::set_shexp_next(bool on) { im_->sh_next = on; }
 
 bool Ds41XeTier::tp_make_room(int gpu, size_t bytes) {
     Ds41XeImpl& im = *im_;
@@ -5987,6 +6184,8 @@ bool Ds41XeTier::run_chunk_dev_async(int64_t l, int n, const int32_t* ids, const
     Ds41XeImpl& im = *im_;
     if (im.run_thr.joinable()) return false;   // one call in flight
     im.run_ok = true;
+    im.sh_call = im.sh_next && n > kMaxJobTok;   // larry, STRATA_SHEXP_TIER: this call's (run_big's) shared expert
+    im.sh_next = false;
     im.run_thr = std::thread([&im, l, n, ids, w, x, out_dev, last_of_layer, x_dev] {
         try {
             im.run_ok = n <= kMaxJobTok ? run_small(im, l, n, ids, w, x, nullptr, out_dev)
@@ -6039,6 +6238,7 @@ void Ds41XeTier::prefetch_end() {
 void Ds41XeTier::close() {
     if (!im_) return;
     Ds41XeImpl& im = *im_;
+    regrow_poll(true);   // larry, patch-regrowasync
     disarm(im);
     pc_drop(im);
     if (im.pc_thr.joinable()) {
@@ -6096,6 +6296,18 @@ void Ds41XeTier::close() {
     if (im.hc_n > 0)
         std::fprintf(stderr, "xe tier: HOTRING_CHECK: %lld experts compared, %lld differ\n", (long long) im.hc_n.load(),
                      (long long) im.hc_bad.load());
+    for (auto& cs : im.sh_own) { cs.first->q.wait(); local_free(cs.first->q, cs.second); }   // larry, STRATA_SHEXP_TIER
+    im.sh_own.clear();
+    im.sh_slices.clear();
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (!c.sh_w && !c.sh_buf && !c.sh_iota) continue;
+        c.q.wait();
+        if (c.sh_w) local_free(c.q, c.sh_w);
+        if (c.sh_buf) local_free(c.q, c.sh_buf);
+        if (c.sh_iota) local_free(c.q, c.sh_iota);
+        c.sh_w = nullptr; c.sh_buf = nullptr; c.sh_iota = nullptr;
+    }
     for (auto& kv : im.heads)   // the head split's slices and scratch, on their cards (before the cards go)
         for (size_t i = 0; i < kv.second.c.size(); ++i) {
             sycl::queue& q = kv.second.c[i]->q;
@@ -6182,7 +6394,9 @@ int64_t Ds41XeTier::blob_bytes(int64_t l) const {
 }
 bool Ds41XeTier::resident(int64_t l, int64_t e) const {
     if (l < 0 || l >= im_->g.n_layers || e < 0 || e >= im_->g.n_experts) return false;
-    return im_->card_of[(size_t) im_->key(l, e)] >= 0;
+    const size_t key = (size_t) im_->key(l, e);
+    // larry, patch-regrowasync: a pending regrow's experts are resident for the route bias
+    return im_->card_of[key] >= 0 || (im_->rg_pending && key < im_->rg_mark.size() && im_->rg_mark[key]);
 }
 bool Ds41XeTier::in_arena(int64_t l, int64_t e) const {
     if (l < 0 || l >= im_->g.n_layers || e < 0 || e >= im_->g.n_experts) return false;
