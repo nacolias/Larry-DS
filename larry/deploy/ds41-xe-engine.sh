@@ -42,6 +42,11 @@ export STRATA_XE_RESERVE_GIB="${STRATA_XE_RESERVE_GIB:-3.5}"   # per expert card
 export STRATA_DENSE_REQUANT="${STRATA_DENSE_REQUANT-q6_K}"   # dense Q8_0 -> Q6_K at load (upstream default; -23% bytes)
 export STRATA_ENGRAM_REQUANT="${STRATA_ENGRAM_REQUANT-q6_K}"   # the two Engram KV projections F16 -> Q6_K (315 -> 129 MB a token; PPL within noise)
 export STRATA_ENGRAM_THREADS="${STRATA_ENGRAM_THREADS-256}"   # the Engram row reader pool = queue depth over both NVMe drives (32: a cold 31.6K prompt waited 1.8 s for batch 1 rows, 256: 0.4 s)
+# a prompt batch drops the Engram weight pages it read from the page cache (each new page costs reclaim, which
+# runs the xe shrinker over the engine's own buffers)
+# abwT140 (three fresh servers each): TTM backups during the first prompts <= 29 MB (off: up to 2.8 GB, with a 17.9 s
+# first 31K); a repeated 31K prompt ~4 % slower (its Engram rows no longer page-cache hits)
+export STRATA_ENGRAM_DROP="${STRATA_ENGRAM_DROP-1}"
 # verify passes: no D3 routing prediction (a graph + a host readback per layer per pass; the Xe tier has no prefetch)
 # the serve batch-width fit (Xe: the chunk buffers live on the expert cards; ~0.32 MiB of state a column on card 0)
 export STRATA_SERVE_BATCH_FIXED_GIB="${STRATA_SERVE_BATCH_FIXED_GIB:-3.5}"

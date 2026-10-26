@@ -987,17 +987,25 @@ namespace {
 /// pointer is a reader-owned pinned buffer, valid until sink returns).
 template <class Sink>
 void read_all(Ds41XeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& list, int nth, Sink sink) {
+    // larry, STRATA_XE_LOAD_DIRECT (default 1; patch-loaddirect.py): through the source's O_DIRECT twin (read_staged,
+    // a per-thread aligned scratch) - the buffered read() put ~150 GB through the page cache at every start, which
+    // swapped the arena out and had the xe shrinker back up the engine's buffers (abwT138)
+    static const bool direct = env_i("STRATA_XE_LOAD_DIRECT", 1) != 0;
+    const size_t sc = direct ? (im.blobs->read_staged_scratch() + 4095) & ~(size_t) 4095 : 0;
     std::atomic<size_t> next{0};
     std::vector<std::thread> th;
     for (int i = 0; i < nth; ++i)
         th.emplace_back([&]() {
             uint8_t* buf = sycl::malloc_host<uint8_t>((size_t) im.blob_max, im.ctx);
+            uint8_t* scr = sc ? (uint8_t*) std::aligned_alloc(4096, sc) : nullptr;
             for (;;) {
                 const size_t k = next.fetch_add(1);
                 if (k >= list.size()) break;
-                im.blobs->read(list[k].first, list[k].second, buf);
+                if (scr) im.blobs->read_staged(list[k].first, list[k].second, buf, scr, sc);
+                else im.blobs->read(list[k].first, list[k].second, buf);
                 sink(k, buf);
             }
+            std::free(scr);
             sycl::free(buf, im.ctx);
         });
     for (auto& t : th) t.join();

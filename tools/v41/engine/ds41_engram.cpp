@@ -186,6 +186,16 @@ static ssize_t dread(int fd, void * buf, size_t n, uint64_t off) {
     return (ssize_t) n;
 }
 
+// larry, STRATA_ENGRAM_DROP (patch-engdrop.py): a prompt batch drops the weight pages it read from the page cache
+static bool engram_drop_on() {
+    static const bool on = std::getenv("STRATA_ENGRAM_DROP") && std::atoi(std::getenv("STRATA_ENGRAM_DROP")) != 0;
+    return on;
+}
+static void page_drop(int fd, uint64_t off, size_t n) {
+    const uint64_t a0 = off & ~(uint64_t) 4095, a1 = (off + n + 4095) & ~(uint64_t) 4095;
+    ::posix_fadvise(fd, (off_t) a0, (off_t) (a1 - a0), POSIX_FADV_DONTNEED);
+}
+
 Ds41Engram::~Ds41Engram() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -426,6 +436,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
     const bool pool_dq = nthreads_ > 0 && n > 64;   // larry: a prompt batch's cached rows go to the pool
     // larry, STRATA_ENGRAM_DIRECT: a prompt batch no prefetch read goes around the page cache
     const bool direct = engram_direct_on() && n > 64 && !(pf_lo_ >= 0 && pos0 >= pf_lo_ && pos0 + n <= pf_hi_);
+    const bool drop = engram_drop_on() && n > 64;   // larry, STRATA_ENGRAM_DROP
 
     std::vector<int64_t> ids((size_t) (nel * m));
     for (int64_t e = 0; e < nel; ++e)
@@ -509,7 +520,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
         auto t = std::make_shared<Task>();
         t->n = ng + nc;
         Batch * bp = b.get();
-        t->fn = [this, bp, dim, srsz, g0, ng, c0, c1, kCachedChunk, direct](int64_t a, int64_t c) {
+        t->fn = [this, bp, dim, srsz, g0, ng, c0, c1, kCachedChunk, direct, drop](int64_t a, int64_t c) {
             uint8_t bw[4096 + 512], bs[1024];
             for (int64_t gi = a; gi < c; ++gi) {
                 if (gi >= ng) {   // larry: a chunk of cached rows, dequantized from the cache pool (never evicted)
@@ -539,6 +550,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_into(int64_t pos0, int n, f
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     (!dw && tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w) ||
                     (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); continue; }
+                if (drop && !dw && !T.rm_w) page_drop(T.fd_w, G.off_w, G.len_w);   // larry, STRATA_ENGRAM_DROP
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];

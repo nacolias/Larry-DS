@@ -48,6 +48,42 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 17:50 - 19:00: the stalls without touching swap - the load and the Engram reads stop flooding the page cache)
+
+**Where the pressure comes from** (`bench/speed/memtrace3.bt`: page-cache insertions by file, anonymous faults,
+swap-ins, TTM backups; `memsum3.py`; abwT138, two fresh servers as the service runs them). At every start the engine put
+**182-186 GB** into the page cache, nearly all of it the model GGUF: the tier's bulk reads (`read_all`: the experts it
+places in VRAM and the RAM arena, the replicas) used `Ds41FileBlobs::read`, a buffered pread - only the prefetch and the
+split reads used the source's O_DIRECT twin. On a box the engine fills, that flood pushed the arena's own pages to swap
+(m2's first 8K swapped 7.2 GB back in: 17.0 s) and had the xe shrinker back up 49 GB of the engine's buffers in one
+load. During the prompts the Engram reads added 12-14 GB more (8K / 16K / 31K twice); anonymous faults ~2 GB.
+
+**`STRATA_XE_LOAD_DIRECT`** (`patches/patch-loaddirect.py`, default 1): `read_all` reads through `read_staged`
+(O_DIRECT, a per-thread aligned scratch; falls back to the buffered read on any short read). abwT139 (three fresh
+servers each): page-cache insertions while loading 156-198 GB -> 2-6 GB, the load as fast (80-86 s); the buffered arm's
+o1 still swapped in during its first prompts (8K 9.28 s, 31K 13.39 s), and the direct arm's d3 still had 1.8 GB backed
+up during its prompts (8K 7.83 s) - the Engram reads.
+
+**`STRATA_ENGRAM_DROP=1`** (`patches/patch-engdrop.py`, engine default 0; in the service, `patches/svc-engdrop.py`,
+backup `ds41-xe-engine.sh.pre-engdrop-20261026`): a prompt batch (> 64 tokens) drops the Engram weight pages it read
+(`posix_fadvise` DONTNEED; a weight page holds 15-16 random rows, the row cache keeps the rows; the prefetch's pages stay
+until the batch reads them; the scale pages - 8 bytes a row, shared by 512 rows - stay cached). abwT140, the load
+direct in both arms:
+
+| | first 8K | first 16K | first 31K | 31K again | TTM backups during the prompts | direct reclaim scans |
+| --- | --- | --- | --- | --- | --- | --- |
+| off (k1-k3) | 6.89 / 6.17 / 5.97 s | 6.68 / **8.48** / 6.68 s | 10.68 / **17.86** / 10.87 s | 10.60 s | 0 / **2.8 GB** / 21 MB | 3.1 / 27.4 / 1.3 GB |
+| on (r1-r3) | 6.97 / 7.26 / 6.19 s | 6.79 / 6.71 / 6.77 s | 10.73 / 10.78 / 10.74 s | 11.02 s | 26 / 29 / 0 MB | 1.0 / 1.0 / 0 GB |
+
+No stall with it; the price is a repeated big prompt's Engram rows (~4 % on the second 31K - its rows no longer page
+cache hits). With both (abwT140's "on" arm) the worst first prompt ran ~1 s over its usual (r2's 8K, 7.26 s), against
++7 s (k2's 31K) without the drop and +10 s (m2's 8K) with neither. Swap off would still remove the mechanism itself
+(the owner's decision); these two remove most of what set it off.
+
+**Test harness:** the service's user cannot open `/dev/dm-0`, so the service reads layer 14's Engram table through
+ext4, while every A/B test server (root) before abwT138 took the raw-device path (`RawMap`). `tabx.sh` now starts its
+servers with `STRATA_ENGRAM_RAWDEV=0` (a config can still set it).
+
 ## Measured (2026-10-26 17:10 - 17:50: Project Maya's DSpark cut in the service; the server on DeepSeek's edge cases)
 
 **`STRATA_DSPARK_CUM=0.5` in the service** (`patches/patch-dsparkcum.py`, engine default 0 = off;
@@ -2144,6 +2180,8 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_HC_NORM_MV_WIDE` / `GGML_SYCL_NORM_MV_WIDE` | 1 (service, since 2026-10-26 10:23; engine 0) / 1 | the prompt path's hc mixes through `ggml_dsv41_norm_mv` / ggml-sycl's wide kernel for it (> 8 tokens; 0 = the per-row one) |
 | `GGML_SYCL_LARRY_SLICES_BATCH` | 0 | `larry_slices_gemm` (wo_a through mul_mat) as one strided gemm_batch into the [OL, n, OG] layout (`STRATA_OPROJ_A` supersedes it) |
 | `GGML_SYCL_OP_PROF_SHAPES` | 0 | with `GGML_SYCL_OP_PROF=1`: each label also carries the node's shape and its first source's name / type |
+| `STRATA_XE_LOAD_DIRECT` | 1 | the tier's bulk reads at a start (the experts placed in VRAM and the arena, the replicas) through the blob source's O_DIRECT twin: 156-198 GB -> 2-6 GB through the page cache a start (abwT139); 0: the buffered reads |
+| `STRATA_ENGRAM_DROP` | 1 (service, since 2026-10-26 18:50; engine 0) | a prompt batch drops the Engram weight pages it read from the page cache (DONTNEED): no TTM backups / swap-ins from Engram's 12-14 GB a prompt set (abwT140); a repeated big prompt ~4 % slower |
 | `STRATA_DSPARK_CUM` | 0.5 (service, since 2026-10-26 17:30; engine 0 = off) | DSpark: the verify window also stops where the product of the drafts' confidences so far drops below this (besides `STRATA_DSPARK_CONF`'s floor on each; Project Maya's rule): 102.7 -> 106.2 tok/s on the decode tasks (abwT137) |
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |

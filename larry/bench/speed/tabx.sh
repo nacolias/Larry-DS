@@ -29,7 +29,9 @@ PY
 mkdir -p /run/ds41-test $S/out
 rm -f logs/engine-$N.log $S/out/abx-$N.jsonl $S/out/agent-$N.jsonl
 /usr/local/sbin/larry-gpu-clock pin > /dev/null
-env "$@" RUNTIME_DIRECTORY=/run/ds41-test DS41_PORT=18081 DS41_CONFIG=$CFG setsid ./ds41-serve.sh > logs/serve-$N.log 2>&1 < /dev/null &
+# (2026-10-26) the Engram tables through the filesystem as the service reads them - its user cannot open /dev/dm-0, root
+# could, so every test server before abwT138 took the raw device path; a config sets STRATA_ENGRAM_RAWDEV to change it
+env STRATA_ENGRAM_RAWDEV=0 "$@" RUNTIME_DIRECTORY=/run/ds41-test DS41_PORT=18081 DS41_CONFIG=$CFG setsid ./ds41-serve.sh > logs/serve-$N.log 2>&1 < /dev/null &
 SP=$!
 echo "[$N] server pid $SP, env: $*  $(date +%T)"
 ok=0

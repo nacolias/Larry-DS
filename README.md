@@ -68,14 +68,14 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 17:40-17:46, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 ~18:50, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,160 then 1,862, 16K 2,404, 31K 3,049 - all four passphrases found |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 100.0 tok/s, 98.4 after the long prompts |
-| essays (3 x 800 tokens) | 78.8 tok/s, 74.6 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,477 then 1,855, 16K 2,402, 31K 3,053 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 107.0 tok/s, 96.3 after the long prompts |
+| essays (3 x 800 tokens) | 78.2 tok/s, 77.8 after the long prompts |
 | tool-call round trip | correct |
 | host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
 
@@ -209,9 +209,10 @@ The Larry-specific ones:
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
 - **The first prompts after a start are slower.** Their first calls load oneMKL's kernels and compile oneDNN's
-  attention partitions. On some starts they also stall for seconds: under memory pressure the xe driver's shrinker
-  writes some of the engine's host buffers out to swap, and the first prompts read them back (see the engineering
-  log, 2026-10-26 15:54).
+  attention partitions. Some starts also stalled for seconds: under memory pressure the xe driver's shrinker wrote
+  the engine's host buffers out to swap and the first prompts read them back. Since 2026-10-26 the load and the
+  Engram reads no longer flood the page cache (`STRATA_XE_LOAD_DIRECT`, `STRATA_ENGRAM_DROP`), which removes most of
+  it; swap off while the service runs removes the rest (see the engineering log, 2026-10-26 15:54-19:00).
 - **Runs are not bit-reproducible.** Split sums, sampling and the cache state vary.
 - **Based on Xolotl `f7c561b7` (2026-10-18).** Upstream has moved on since, and those commits are not merged here.
 - **Four cards only.** A split for any card count is planned, not built.

@@ -1,0 +1,30 @@
+/*
+ * memtrace3.bt - larry, 2026-10-26: where a fresh engine's memory pressure during prompts comes from, every 2 s:
+ *   fadd   page-cache insertions, pages (e = the engine's threads, o = the rest)
+ *   anon   anonymous page faults (do_anonymous_page)      swin  swap-ins (do_swap_page)
+ *   bk     TTM backups (pages) by the xe shrinker          rs    TTM restores (pages)
+ * At the end: page-cache insertions by device:inode (top 12) - which files fill the cache.
+ */
+tracepoint:filemap:mm_filemap_add_to_page_cache
+{
+	$p = 1 << args.order;
+	if (comm == "ds41_generate_x") { @fe += $p; } else { @fo += $p; }
+	@fino[args.s_dev, args.i_ino] = sum($p);
+}
+kprobe:do_anonymous_page { if (comm == "ds41_generate_x") { @ae += 1; } else { @ao += 1; } }
+kprobe:do_swap_page { if (comm == "ds41_generate_x") { @se += 1; } else { @so += 1; } }
+fexit:ttm:ttm_tt_backup { if (retval > 0) { @bk += retval; } }
+kprobe:ttm_tt_restore { @rs += ((struct ttm_tt *)arg1)->num_pages; }
+interval:s:2
+{
+	time("%H:%M:%S");
+	printf(" fadd %d %d anon %d %d swin %d %d bk %d rs %d\n", @fe, @fo, @ae, @ao, @se, @so, @bk, @rs);
+	@fe = 0; @fo = 0; @ae = 0; @ao = 0; @se = 0; @so = 0; @bk = 0; @rs = 0;
+}
+END
+{
+	clear(@fe); clear(@fo); clear(@ae); clear(@ao); clear(@se); clear(@so); clear(@bk); clear(@rs);
+	printf("== page-cache insertions by dev, inode (pages, top 12)\n");
+	print(@fino, 12);
+	clear(@fino);
+}
