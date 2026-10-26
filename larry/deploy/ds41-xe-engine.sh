@@ -55,6 +55,16 @@ export GGML_SYCL_LI_XMX="${GGML_SYCL_LI_XMX:-1}"
 # the agent replay's follow-ups 42.6 -> 39.9 s
 export GGML_SYCL_LI_FUSED="${GGML_SYCL_LI_FUSED:-1}"
 export STRATA_LI_NVIS="${STRATA_LI_NVIS:-1}"
+# card 0's 512-column prompt span: wo_a's 8 slices as one product written in wo_b's layout (768 us + a 162 us copy ->
+# 520 us) and the hc mixes' rms_norm copy + [24 x 20480] GEMM as one pass over the state (2 x 323 -> 2 x 153 us)
+# - abwT123: fresh 16K 6.74 -> 6.40 s, 31K 11.51 -> 10.96 s (first runs 11.71 -> 10.78); the agent replay's side
+# prompts 16.09 -> 15.30 s
+export STRATA_OPROJ_A="${STRATA_OPROJ_A:-1}"
+export STRATA_HC_NORM_MV_WIDE="${STRATA_HC_NORM_MV_WIDE:-1}"
+# the fused hc ops at prompt widths too (patch-hcwide.py's wide hc_fa: 16 tokens a chunk's work-group, the mixes' rows
+# staged once): the separate hc_post / hc_pre / mixes and their state copies go - abwT124: fresh 16K 6.45 -> 6.23 s,
+# 31K 10.90 / 10.96 -> 10.55 / 10.35 s (here the prompt path's STRATA_HC_NORM_MV_WIDE is then unused)
+export STRATA_HC_FUSE_MAXN="${STRATA_HC_FUSE_MAXN:-16384}"
 # a decode / verify job's own token count picks its expert kernel form (1-token jobs of verify passes 9-17 % faster)
 export STRATA_XE_JOBNT="${STRATA_XE_JOBNT:-1}"
 # prompt chunks: each expert card pushes its part to the dense card when it is done (31.6K prompt 23.0 -> 21.5 s, exact)

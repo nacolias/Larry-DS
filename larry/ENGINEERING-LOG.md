@@ -48,6 +48,85 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 07:55 - 10:27: card 0 still bounds - wo_a as one product, the hc mixes in one pass)
+
+**In the service since 10:23** (`patches/svc-oproja.py`, backup `ds41-xe-engine.sh.pre-oproja-20261026`; binaries built
+10:21): `STRATA_OPROJ_A=1` + `STRATA_HC_NORM_MV_WIDE=1`. tsvc2 (`logs/tsvc2-oproja.log`): every needle found (8K 1139 /
+1833, 16K 2354, **31K 2990** tok/s), svcbench 93.3 / 96.4, essay 76.8 / 71.1 tok/s, the tool call right, hidden RAM 33
+GiB at most.
+
+**Which side bounds a big prompt now.** 1024-column spans (abwT115) again bought nothing (31K 11.34 -> 11.23 s, 4.5K
++0.34 s), and the server's split moved from "dense" to "experts" as before. Card 0's GPU timeline says why
+(`STRATA_GPU_PTL`, abwT114 at 512 columns, abwT117 at 1024): its queue is 94-96 % busy through layers 0-19 at both widths,
+13.1 ms a 1024-column span = 6.54 ms a 512 one against 6.82. The server's dense / experts split is host time, not the
+cards': card 0's GPU work is the bound (~230 ms a layer of a 16K batch, the expert cards' calls ~165-175 ms). The expert
+GEMMs alone (`bench/dqb/bench_dqgemm`, abwT116; `bench/dqb/dqb-shapes.sh` sources oneAPI first): xe_dqgemm tops out near
+50 TFLOPS at 128+ tokens an expert (Q3_K 46, Q2_0 50, PTQ1_0 48; 24-36 at 32-64) - its A fragments come from local memory
+one DPAS each - so the tier has room, but card 0 is first.
+
+**Card 0's span by op** (`bench/speed/opprof-shapes.sh`: `GGML_SYCL_OP_PROF_SHAPES=1`, `patches/patch-opprof5.py` - each
+label gets the node's shape and its first source's name / type; abwT118, p30k's second batch, a layer-span = one layer's
+512 columns):
+
+| a layer-span (abwT118) | us | |
+| --- | ---: | --- |
+| SDPA: oneDNN execute + its Q' / mask kernels + the op's other kernels | 1123 + 232 + 299 | the attention |
+| DSV41_KGATHER (each query's 656 key rows gathered, 387 MB written) | 784 | |
+| wo_a (`larry_slices_gemm`: 8 slices, each gathered to fp16 + its own GEMM) + the CONT after it | 768 + 162 | 277 us of host a call |
+| q_b / wo_b | 446 / 419 | 115 / 102 TFLOPS |
+| the hc mixes: rms_norm [20480 x 512] + MUL_MAT [24 x 512], twice | 2 x (197 + 126) | |
+| HC_POST, HC_PRE, the state / output copies | ~2 x 173, ~2 x 120, ~0.4 ms | |
+
+* **`STRATA_OPROJ_A=1`** (`patches/patch-oproja.py` + `patch-oproja2.py`; ggml.h / ggml.c `ggml_dsv41_oproj_a` = a
+  `GGML_OP_DSV41_OPROJ` node with op_params[0] = 1): wo_a as one product written in wo_b's input layout - o converted to
+  fp16 once, the per-slice planar slices dequantised into one fp16 cache entry, the 8 slices in ONE oneMKL gemm_batch.
+  oneMKL's strided batch refuses interleaved outputs ("Illegal value supplied for parameter stride_c": abwT121's runs
+  aborted, rc 134), so the pointer form (one group of 8, the device pointer arrays written by a kernel). 768 + 162 ->
+  **520 us** (abwT122). The strided form into the old layout (`GGML_SYCL_LARRY_SLICES_BATCH=1`, `patch-slicesbatch.py`,
+  default 0) gave 490 us + the CONT (abwT120).
+* **`STRATA_HC_NORM_MV_WIDE=1`** (`patches/patch-normmvw.py`): the prompt path's hc mixes through
+  `ggml_dsv41_norm_mv` (the norm folded out of the product) with a wide kernel - a work-group = 64 tokens x a 640-value
+  slice of the 20480, the slice's weight rows staged in local memory once, a sub-group = 2 tokens, partials then one
+  pass. 2 x 323 -> **2 x 153 us**. Forms that lost: no staging (the weight through L2 for every token: 349 us), 16
+  tokens a work-group with scalar staging (120 dependent loads a work-item: 604 us; abwT120's prompts 0.1-0.2 s slower).
+
+Numerics of both (`bench/speed/tlppl-ab.sh opb`, abwT123; the script runs any switch): p8k KL mean 2.62e-3 against a
+floor of 2.54e-3 (p99 3.91e-2 / 3.80e-2, max 0.31 / 0.36), p30k PPL 1.7833 / 1.7829. (abwT120's floor run had one
+token at KL 12.4 with no change at all: the single big-KL tokens are run-to-run, not a kernel.)
+
+| abwT123 (server, fresh) | without | with both |
+| --- | ---: | ---: |
+| 8K (second run) | 4.93 s | **4.51 s** |
+| 16K | 7.23 / 6.74 s | 6.61 / **6.40 s** |
+| 31K | 11.71 / 11.51 s | **10.78 / 10.96 s** |
+| agent replay: follow-ups / side prompts | 40.23 / 16.09 s | 39.84 / **15.30 s** |
+| decode (agent replay) | 122.0 tok/s | 120.4 tok/s |
+
+Card 0's batch 4753 -> 4131 ms in the profiled range (abwT122; the profiler's skip lands on fewer layer-spans now, so
+compare per call). Follow-ups barely move: their layers wait on streamed experts and the CPU pool.
+
+* **`STRATA_HC_FUSE_MAXN=16384`** (in the service since 10:54, `patches/svc-hcwide.py`, backup
+  `ds41-xe-engine.sh.pre-hcwide-20261026`; `patches/patch-hcwide.py`): the fused hc ops (hc_fa / hc_fb: hc_post, the mixes'
+  dots and hc_pre in one pass, the outputs written in place - `STRATA_DIRECT_OUT`) at prompt widths too. They lost there
+  before (31.6K 26.2 -> 27.7 s, 2026-10-22) because hc_fa's sub-group per (token, chunk, row group of 6) re-read the
+  token's state for each of 4 row groups and every token read all of fn through L2; its wide form (n > 8,
+  `GGML_SYCL_HC_FA_WIDE=0` = the narrow one) takes 16 tokens x a 128-column chunk a work-group with the chunk's fn rows
+  staged in local memory, a sub-group = one token with all 24 rows. hc_merge (<= 64 tokens) stays off past 64. In the
+  profile the separate HC_POST / HC_PRE / mixes and the state copies go: HC_FA 340 us (~147 MB moved: near bandwidth),
+  HC_FB 71, the finish (HC_POST2) 198. Numerics (`tlppl-ab.sh hcw`, abwT124): p8k KL 2.72e-3 against 2.70e-3, p30k PPL
+  1.7799 / 1.7825.
+
+| abwT124 (server, fresh; the config of 10:23 without / with it) | without | with |
+| --- | ---: | ---: |
+| 8K (second run) | 4.79 s | **4.50 s** |
+| 16K | 6.80 / 6.45 s | 6.61 / **6.23 s** |
+| 31K | 10.90 / 10.96 s | **10.55 / 10.35 s** |
+| agent replay: follow-ups / side prompts | 39.64 / 15.31 s | 39.25 / **14.81 s** |
+| decode (agent replay) | 122.9 tok/s | 124.0 tok/s |
+
+Over the day (fresh 31K through the server, second runs): 12.34 s (07:30) -> 11.31 (the indexer) -> 10.96 (wo_a, the
+mixes) -> **10.35 s**.
+
 ## Measured (2026-10-26 06:35 - 07:51: the prompt indexer as one fused XMX kernel, told each query's visible rows)
 
 **In the service since 07:48** (`patches/svc-lifused.py`, backup `ds41-xe-engine.sh.pre-lifused-20261026`):
@@ -1915,6 +1994,10 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `GGML_SYCL_LI_GEMM_MIN` / `GGML_SYCL_LI_XMX` | 1 / 1 (service; engine 32 / 0) | the lightning indexer of decode / verify passes on XMX: li_gemm for every batch / one fused bf16 kernel for <= 8 queries (`GGML_SYCL_LI_XMX_CHECK=1` compares with li_gemm) |
 | `GGML_SYCL_LI_FUSED` (`_MIN`, `_QW`, `_KR`, `_CHECK`) | 1 (service, since 2026-10-26 07:48; engine 0) (16, -, -, 0) | the prompt indexer (batches of >= `_MIN` queries) as one fused XMX kernel - the score matrix stays in registers (16K keys 4.36 -> 0.63 ms); `_QW` / `_KR` override the work-group's queries / keys, `_CHECK=N` compares the first N calls with li_gemm |
 | `STRATA_LI_NVIS` | 1 (service, since 2026-10-26 07:48; engine 0) | the prompt path's indexer takes each query's visible row count (`ggml_lightning_indexer_nvis`) instead of a [cap, n] 0 / -inf mask built per call; ggml-sycl only |
+| `STRATA_OPROJ_A` | 1 (service, since 2026-10-26 10:23; engine 0) | the prompt path's wo_a as one op (`ggml_dsv41_oproj_a`): its 8 slices in one oneMKL gemm_batch written in wo_b's input layout (768 us + a 162 us copy -> 520 us a 512-column span) |
+| `STRATA_HC_NORM_MV_WIDE` / `GGML_SYCL_NORM_MV_WIDE` | 1 (service, since 2026-10-26 10:23; engine 0) / 1 | the prompt path's hc mixes through `ggml_dsv41_norm_mv` / ggml-sycl's wide kernel for it (> 8 tokens; 0 = the per-row one) |
+| `GGML_SYCL_LARRY_SLICES_BATCH` | 0 | `larry_slices_gemm` (wo_a through mul_mat) as one strided gemm_batch into the [OL, n, OG] layout (`STRATA_OPROJ_A` supersedes it) |
+| `GGML_SYCL_OP_PROF_SHAPES` | 0 | with `GGML_SYCL_OP_PROF=1`: each label also carries the node's shape and its first source's name / type |
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |

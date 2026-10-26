@@ -645,8 +645,11 @@ struct B {
         const int64_t HC = g->hc, nt = x->ne[2], D = g->n_embd;
         // larry, STRATA_DEC_FUSE: decode / verify widths take the norm folded into the mat-vec (one kernel, not two)
         static const bool dec_fuse = env_on("STRATA_DEC_FUSE", true);
+        // larry, STRATA_HC_NORM_MV_WIDE (patch-normmvw.py, default 0): prompt widths too - ggml-sycl's wide norm_mv reads
+        // the state once (the rms_norm copy + GEMM read it twice and wrote it once: 323 -> ~100 us at 512 tokens)
+        static const bool nmv_wide = env_on("STRATA_HC_NORM_MV_WIDE", false);
         ggml_tensor * mixes = nullptr;
-        if (dec_fuse && im->sycl && nt <= 8 && ggml_is_contiguous(x)) {
+        if (dec_fuse && im->sycl && (nt <= 8 || nmv_wide) && ggml_is_contiguous(x)) {
             mixes = ggml_dsv41_norm_mv(c, fn, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);   // [24, n]
         } else {
             ggml_tensor * flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);
@@ -680,7 +683,8 @@ struct B {
     // STRATA_HC_MERGE (default 1): each hc_fa + hc_fb pair as ONE kernel (ggml_dsv41_hc_merge) - 3
     ggml_tensor * hc_merge(ggml_tensor * fb) const {
         static const bool on = env_on("STRATA_HC_MERGE", true);
-        return on && g->n_embd % 512 == 0 ? ggml_dsv41_hc_merge(fb) : fb;
+        // (larry, patch-hcwide.py: the merged kernel takes <= 64 tokens - hc_fb's op_params[2] is its n)
+        return on && g->n_embd % 512 == 0 && fb->op_params[2] <= 64 ? ggml_dsv41_hc_merge(fb) : fb;
     }
     bool hc_fused(int64_t nt) const {
         static const bool on = env_on("STRATA_HC_FUSE", true);
@@ -1249,10 +1253,17 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     } else if (dec && tp_oproj == 1 && im.sycl && n <= 8) {
         attn = ggml_dsv41_oproj(gc, o, wo_a, im.BL(il, "attn_output_b.weight"));                  // [D, n]
     } else {
+        // larry, STRATA_OPROJ_A (patch-oproja.py, default 0): prompt widths take wo_a as one op that writes wo_b's input
+        // layout (the mul_mat's [OL, n, OG] was permuted and copied back: 0.16 ms a 512-column span)
+        static const bool oproj_a = env_on("STRATA_OPROJ_A", false);
+        if (oproj_a && im.sycl && n > 8 && ggml_is_contiguous(o) && wo_a->type == GGML_TYPE_Q6_K) {
+            attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), ggml_dsv41_oproj_a(gc, o, wo_a));   // [D, n]
+        } else {
         // grouped output LoRA (model.py: einsum over groups) then wo_b
         o = ggml_permute(gc, ggml_reshape_3d(gc, o, im.OGD, im.OG, n), 0, 2, 1, 3);           // [OGD, n, OG]
         ggml_tensor * oa = ggml_permute(gc, ggml_mul_mat(gc, wo_a, o), 0, 2, 1, 3);          // [OL, OG, n]
         attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
+        }
     }
     }   // part != 2
 
