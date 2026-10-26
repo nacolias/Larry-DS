@@ -125,7 +125,9 @@ compare per call). Follow-ups barely move: their layers wait on streamed experts
 | decode (agent replay) | 122.9 tok/s | 124.0 tok/s |
 
 Over the day (fresh 31K through the server, second runs): 12.34 s (07:30) -> 11.31 (the indexer) -> 10.96 (wo_a, the
-mixes) -> **10.35 s**.
+mixes) -> 10.35 (the fused hc path, since off: see "984K" below) -> 10.24 (the fp16 attention output). The final config
+(12:49, abwT133, two servers): 8K **4.48** / 4.80 s, 16K **6.39** / 6.41 s, 31K **10.53** / 10.59 s (07:30: 4.70, 7.00,
+12.34).
 
 * **`STRATA_SDPA_O16=1`** (in the service since 12:11, `patches/svc-sdpao16.py`, backup
   `ds41-xe-engine.sh.pre-sdpao16-20261026`; `patches/patch-sdpao16.py`: ggml.h / ggml.c `ggml_dsv41_attn_sdpa_o16`, the
@@ -135,6 +137,22 @@ mixes) -> **10.35 s**.
   (abwT129): p8k KL 2.22e-3 against 2.34e-3, p30k PPL 1.7773 / 1.7816. Fresh (two servers each, interleaved): 16K 6.25 /
   6.29 -> 6.17 / 6.16 s, 31K 10.32-10.35 -> 10.16-10.27 s - card 0's ~0.26 ms a span shows up as ~1 %: the expert cards'
   waits grew as much (31K "experts" 1.64-2.19 -> 1.79-2.44 s). Card 0 and the expert cards are balanced now.
+
+**Long contexts on the 12:11 config** (abwT130, `tabx.sh needles`): a 131K needle from empty in **41.1 s** (3,192 tok/s;
+Oct 24's build 80 s), found, decode at that depth 85.9 tok/s, an 11.7K-token turn on it 5.9 s; a 256K needle in **73.8 s**
+(3,466 tok/s), found, decode 82.2 tok/s, an 11.7K turn 6.2 s.
+
+**984K, and the fused hc path off again.** abwT131: a 973K needle in **348 s** (2,796 tok/s; Oct 24: 1,140 s), found,
+decode at that depth 67.9 tok/s - then the 11,684-token turn on it (a 13,139-column batch fit to card 0's 10.27 GiB
+free) failed in `DSV41_HC_FA` with `UR_RESULT_ERROR_OUT_OF_RESOURCES` (the server restarted the engine). With
+`STRATA_HC_FUSE_MAXN=8` the same run passed (abwT132: needle 356.6 s, found, decode 66.6 tok/s, the turn 10.0 s), the
+same batch width and the same first BAR staging on card 0 before it. On Larry this error has meant card 0's VRAM running
+out (a 32K batch's GEMM scratch, an under-sized learned batch), so the fused path likely raises card 0's peak at a
+1M-context turn, though not at 31K. **Off in the service since 12:49** (backup `ds41-xe-engine.sh.pre-hcoff-20261026`;
+the code stays, the default 8). To bring it back: `STRATA_VRAM_TRACE=1` on both paths at 973K, then a larger
+`STRATA_SERVE_BATCH_COL_MIB` or a smaller kernel footprint. tsvc2 on the 12:49 config (`logs/tsvc2-hcoff.log`): every
+needle found (8K 992 / 1846, 16K 2343, 31K 3017 tok/s; warm repeats 2586 / 3023), svcbench 96.9 / 91.0, essay 78.0 /
+73.6 tok/s, the tool call right, hidden RAM 34 GiB.
 
 **The balance after it** (abwT125, `STRATA_GPU_PTL`): card 0's span 6.49 ms (first 16K batch) / 6.05 (second), its idle
 before the combines 482 / 411 ms a batch (was 183-346) - it waits on the expert cards more; a layer of a 16K batch ~218

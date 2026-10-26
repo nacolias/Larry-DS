@@ -14,16 +14,16 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 
 | | Larry, 2026-10-26 |
 | --- | --- |
-| fresh 8K-token prompt | 4.40 s |
-| fresh 31K-token prompt | 10.2 s (3,040 tok/s) |
+| fresh 8K-token prompt | 4.48 s |
+| fresh 31K-token prompt | 10.5 s (2,946 tok/s) |
 | follow-up turn of 500 new tokens at 38K context | 1.6 s |
 | chat replies (temperature 1, speculative decoding) | 95-103 tok/s |
 | agent-session replies (greedy) | 120-124 tok/s |
-| 984K-token prompt (an Oct 24 build) | 19 min, then 62 tok/s |
+| 984K-token prompt | 6 min, then 67 tok/s |
 | context window | 1,048,576 tokens |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
-Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 3,174 tok/s on Oct 26 (~3,120 when
+Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 3,017 tok/s on Oct 26 (~3,020 when
 repeated warm). The full tables
 are under [Results](#results).
 
@@ -56,8 +56,8 @@ About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
   - Xolotl's fused DeepSeek-V4 ops on SYCL;
   - dp4a and XMX mat-vec kernels;
   - the lightning indexer on XMX, a prompt's as one fused kernel whose score matrix never leaves the registers;
-  - the prompt's hyper-connection steps fused into one pass over the 4-stream state, wo_a's 8 slices as one product
-    fed by the attention's fp16 output;
+  - the prompt's hyper-connection mixes in one pass over the 4-stream state, wo_a's 8 slices as one product fed by
+    the attention's fp16 output;
   - layers 0-19's prompt attention through oneDNN's fused SDPA;
   - an AVX2 Q2_0 dot for the CPU pool;
   - an op profiler (off by default).
@@ -67,30 +67,30 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 12:11-12:16, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 12:49-12:55, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,228 then 1,878, 16K 2,473, 31K 3,174 - all four passphrases found (16K / 31K again, warm: 2,665 / 3,121) |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 100.0 tok/s, 96.8 after the long prompts |
-| essays (3 x 800 tokens) | 75.9 tok/s, 71.6 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 992 then 1,846, 16K 2,343, 31K 3,017 - all four passphrases found (16K / 31K again, warm: 2,586 / 3,023) |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 96.9 tok/s, 91.0 after the long prompts |
+| essays (3 x 800 tokens) | 78.0 tok/s, 73.6 after the long prompts |
 | tool-call round trip | correct |
-| host memory held by the GPU driver | 33 GiB at most (the watchdog acts at 54) |
+| host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
 
-Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 18 checks, the
+Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 19 checks, the
 first chat pass ran 93.3-102.7 tok/s and the first essay 69.7-81.3 tok/s. In every check the first 8K needle, which
 follows the decode tests, is slower than the second.
 
-**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 and, from 8K up, abwT129 in the log,
+**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 and, from 8K up, abwT133 in the log,
 2026-10-25/26: a server with the service's settings on a side port, greedy):
 
 | prompt tokens | 530 | 1,021 | 2,003 | 3,003 | 4,519 | 8,054 | 16,099 | 31,008 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.40 | 6.16 | 10.24 |
+| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.48 | 6.39 | 10.53 |
 
 **Follow-up turns** in a replayed agent session (synthetic, [`larry/bench/speed/agentx.py`](larry/bench/speed/agentx.py);
-context 8K-38K; abwT124):
+context 8K-38K; abwT124, with the fused hc path since turned off - ~1 % slower without it):
 - 56 new tokens: 0.48-0.59 s.
 - 500: 1.61 s.
 - 1.4K: 2.41-2.48 s.
@@ -98,13 +98,15 @@ context 8K-38K; abwT124):
 - 6.5K: 3.95 s.
 - Agent replies: 120-124 tok/s (greedy).
 
-**Long contexts** (2026-10-24, an earlier build; prompt then decode):
+**Long contexts** (needles from empty, prompt then decode; 131K / 256K: abwT130, 2026-10-26 with the fused hc path
+since turned off; 973K: abwT132, the current config; 490K: Oct 24's build):
 
 | context | prompt | decode after it |
 | --- | --- | --- |
-| 129K | 80 s (1,610 tok/s) | 90 tok/s |
-| 490K | 393 s | 81 tok/s |
-| 984K | 1,140 s (863 tok/s) | 61.7 tok/s |
+| 131K | 41 s (3,192 tok/s; Oct 24: 80 s) | 86 tok/s |
+| 256K | 74 s (3,466 tok/s) | 82 tok/s |
+| 490K | 393 s (Oct 24) | 81 tok/s |
+| 973K | 357 s (2,729 tok/s; Oct 24: 1,140 s) | 67 tok/s; an 11.7K-token turn on it 10.0 s |
 
 **Fidelity against DeepSeek's own release** (2026-10-22). The original FP8/FP4 model was teacher-forced on Larry's
 CPU with DeepSeek's `inference/model.py`, and compared on 36,846 tokens across 18 x 2,048-token sequences
