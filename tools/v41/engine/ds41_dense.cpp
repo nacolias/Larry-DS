@@ -252,6 +252,16 @@ struct Ds41Dense::Impl {
     int64_t span_memo_pos0 = -1;
     int span_memo_col0 = -1, span_memo_n = -1;
     ggml_tensor * i_lastblk = nullptr;    // F32 [NC]   (nvis - 1) / block size: the pinned candidate block (ratio 1)
+    ggml_tensor * i_img = nullptr;        // larry (vision): F32 [NC]  1 at an image position (VL routing bias, no Engram)
+    std::vector<Ds41Dense::ImageSpan> img;   // larry (vision): the prompt's image spans (set_images)
+    const float * img_row(int64_t p) const {
+        for (const auto & s : img) if (p >= s.p0 && p < s.p0 + s.n) return s.rows + (size_t) (p - s.p0) * (size_t) D;
+        return nullptr;
+    }
+    bool img_in(int64_t p0, int64_t n) const {
+        for (const auto & s : img) if (s.p0 < p0 + n && s.p0 + s.n > p0) return true;
+        return false;
+    }
     ggml_tensor * i_eng[2] = {};          // F32 [EC * ED, NC]  Engram rows
     ggml_tensor * neg_ramp = nullptr;     // F32 [cmax1]  -i     (constant)
     ggml_tensor * blk_ramp = nullptr;     // F32 [cmax1 / CBS + 1]  i (constant)
@@ -894,6 +904,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     const bool hcf = b.hc_fused(n);
     const bool q8f = hcf && q8_fused(im, il, n);
     GGML_ASSERT(part == 0 || (hcf && col0 == 0 && n <= im.o_att->ne[1]));
+    // larry (vision): image positions among this graph's columns - their VL routing bias and no Engram for them
+    ggml_tensor * mimg = !im.img.empty() && im.img_in((int64_t) im.pos0 + col0, n) ? b.v1(im.i_img, n, (size_t) col0 * 4) : nullptr;
     if (part == 2) {
         x = b.cols3(im.x_state, D, HC, n, col0);
         ggml_tensor * mx = ggml_view_1d(gc, im.o_mix, (2 * HC + HC * HC) * n, 0);
@@ -920,6 +932,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         // gate = sigmoid(sign(dot) * sqrt(max(|dot|, 1e-6)))  (signed sqrt, as the training kernel)
         ggml_tensor * mag = ggml_sqrt(gc, ggml_clamp(gc, ggml_abs(gc, dot), 1e-6f, INFINITY));
         ggml_tensor * gate = ggml_sigmoid(gc, ggml_mul(gc, ggml_sgn(gc, dot), mag));
+        if (mimg) gate = ggml_mul(gc, gate, ggml_reshape_3d(gc, ggml_scale_bias(gc, mimg, -1.0f, 1.0f), 1, 1, n));   // (larry, vision)
         ggml_tensor * gv = ggml_mul(gc, ggml_repeat(gc, ggml_cont(gc, val), x), gate);
         x = ggml_add(gc, x, gv);
         outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));   // the block input (residual) = state + Engram
@@ -1298,6 +1311,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // selection = score + exp_probs_b + the selection-only rbias (soft prune / cache bonus); the weights below come
     // from the unbiased scores, as model.py's Gate - all-zero rbias (the default) = the model's routing bit for bit
     ggml_tensor * s0 = ggml_add(gc, sc, im.BL(il, "exp_probs_b.bias"));                        // the model's own selection score
+    if (mimg) {   // larry (vision): an image position selects with the VL bias (model.py Gate: bias_vl where image_mask)
+        ggml_tensor * dvl = ggml_sub(gc, im.BL(il, "exp_probs_b_vl.bias"), im.BL(il, "exp_probs_b.bias"));   // [NE]
+        s0 = ggml_add(gc, s0, ggml_mul(gc, ggml_repeat(gc, ggml_reshape_2d(gc, dvl, im.NE, 1), s0),
+                                         ggml_repeat(gc, ggml_reshape_2d(gc, mimg, 1, n), s0)));
+    }
     ggml_tensor * rb = ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1);
     ggml_tensor * sel = nullptr;
     // SMART route bias (opt-in; the flat bias changes ~every choice it can: -14 pt API top-1, repetition loops):
@@ -1338,7 +1356,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // larry: ggml-sycl's fused Gate (GGML_OP_DSV41_ROUTER: one kernel for the ~11 below) with the flat bias (the default;
     // STRATA_ROUTER_FUSED=0: the composite).  Its ids are floats; the cpy into o_ids converts them.
     static const bool fused_router = [] { const char * v = std::getenv("STRATA_ROUTER_FUSED"); return !(v && v[0] == '0'); }();
-    if (im.sycl && fused_router && rb_protect <= 0 && rb_margin < 0.0f) {
+    if (im.sycl && fused_router && rb_protect <= 0 && rb_margin < 0.0f && !mimg) {   // (larry, vision: one bias only)
         ro = ggml_dsv41_router(gc, rl, im.BL(il, "exp_probs_b.bias"), ggml_reshape_1d(gc, rb, im.NE), (int) im.NU,
                                G.norm_topk, (float) G.weights_scale);   // [2 NU, n]
         ids = ggml_view_2d(gc, ro, im.NU, n, ro->nb[1], 0);
@@ -1406,6 +1424,7 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
     const int64_t r = L.ratio;
     std::vector<ggml_tensor *> outs, late;   // late: the ring / state write-backs, after every read
     ggml_tensor * pos = b.v1(im.i_pos, n, (size_t) col0 * 4);
+    ggml_tensor * mimg = !im.img.empty() && im.img_in((int64_t) im.pos0 + col0, n) ? b.v1(im.i_img, n, (size_t) col0 * 4) : nullptr;   // (larry, vision)
 
     ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
     if (L.eslot >= 0 && im.engram.enabled()) {   // the Engram add still feeds the K/V + compressor projections
@@ -1419,6 +1438,7 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
         ggml_tensor * dot = ggml_scale(gc, ggml_sum_rows(gc, ggml_mul(gc, ggml_mul(gc, hn, wqk), kn)), 1.0f / std::sqrt((float) D));
         ggml_tensor * mag = ggml_sqrt(gc, ggml_clamp(gc, ggml_abs(gc, dot), 1e-6f, INFINITY));
         ggml_tensor * gate = ggml_sigmoid(gc, ggml_mul(gc, ggml_sgn(gc, dot), mag));
+        if (mimg) gate = ggml_mul(gc, gate, ggml_reshape_3d(gc, ggml_scale_bias(gc, mimg, -1.0f, 1.0f), 1, 1, n));   // (larry, vision)
         x = ggml_add(gc, x, ggml_mul(gc, ggml_repeat(gc, ggml_cont(gc, val), x), gate));
         outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
     }
@@ -1696,6 +1716,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.i_sidx = ggml_new_tensor_1d(c, GGML_TYPE_I32, 2 * NC);
     im.i_sslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, 2));
     im.i_lastblk = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
+    im.i_img = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);   // larry (vision)
     for (int e = 0; e < 2; ++e) im.i_eng[e] = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.EC * im.ED, NC);
     // STRATA_VRAM_TRACE: WHICH state tensor owns the columns' VRAM (s13c: a batch's state alloc was 2.45-2.76 GiB and
     // a 2193.81 MiB allocation later failed with 6.83 GiB "free" - name the owner before sizing anything).
@@ -1989,7 +2010,8 @@ static double eng_now() { return std::chrono::duration<double, std::milli>(std::
 static void eng_pf_launch(Ds41Dense::Impl & im) {
     if (im.eng_pf_pos0 < 0 || im.eng_pf) return;
     const int n = (int) im.eng_pf_tids.size();
-    for (int t = 0; t < n; ++t) im.engram.set_token(im.eng_pf_pos0 + t, im.eng_pf_tids[(size_t) t]);
+    for (int t = 0; t < n; ++t)   // (larry, vision: an image position as DEAD)
+        im.engram.set_token(im.eng_pf_pos0 + t, im.img_row((int64_t) im.eng_pf_pos0 + t) ? -1 : im.eng_pf_tids[(size_t) t]);
     std::string e2;
     im.eng_pf = im.engram.prefetch(im.eng_pf_pos0, n, e2);
     im.eng_pf_pos0 = -1;
@@ -2129,6 +2151,10 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             for (int k = 1; k < nt; ++k) th.emplace_back(part, k);
             part(0);
             for (auto & t : th) t.join();
+            if (!im.img.empty())   // larry (vision): an image position's row is the encoder's, not the token table's
+                for (int t = 0; t < n; ++t)
+                    if (const float * r = im.img_row((int64_t) pos0 + t))
+                        for (int64_t i = 0; i < D; ++i) st[(size_t) t * (size_t) D + (size_t) i] = ggml_fp32_to_fp16(r[i]);
             tu1 = g_dprof_on && n > 64 ? dprof_now() : 0;
             ggml_backend_tensor_set_async(im.backend, im.i_emb, st, 0, (size_t) n * rowb);
             if (im.emb_ev) ggml_backend_event_record(im.emb_ev, im.backend);
@@ -2136,6 +2162,9 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         } else {
             std::vector<uint16_t> rows((size_t) n * (size_t) D);
             for (int t = 0; t < n; ++t) std::memcpy(rows.data() + (size_t) t * (size_t) D, tab + (size_t) tids[t] * (size_t) D, rowb);
+            for (int t = 0; t < n && !im.img.empty(); ++t)   // larry (vision)
+                if (const float * r = im.img_row((int64_t) pos0 + t))
+                    for (int64_t i = 0; i < D; ++i) rows[(size_t) t * (size_t) D + (size_t) i] = ggml_fp32_to_fp16(r[i]);
             im.up_set(im.i_emb, rows.data(), rows.size() * 2);
         }
     } else {
@@ -2144,6 +2173,8 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
         for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
     }
+    for (int t = 0; t < n && !im.img.empty(); ++t)   // larry (vision)
+        if (const float * r = im.img_row((int64_t) pos0 + t)) std::memcpy(&im.host_emb[(size_t) (t * D)], r, (size_t) D * 4);
     tu1 = g_dprof_on && n > 64 ? dprof_now() : 0;
     im.up_set(im.i_emb, im.host_emb.data(), im.host_emb.size() * 4);
     }
@@ -2151,6 +2182,11 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
     im.up_set(im.i_pos, pos.data(), (size_t) n * 4);
+    if (im.img_in(pos0, n)) {   // larry (vision): these columns' image mask
+        std::vector<float> m((size_t) n);
+        for (int t = 0; t < n; ++t) m[(size_t) t] = im.img_row((int64_t) pos0 + t) ? 1.0f : 0.0f;
+        im.up_set(im.i_img, m.data(), (size_t) n * 4);
+    }
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
     std::vector<float> wm((size_t) (SWA * n));
@@ -2221,7 +2257,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             im.engram.wait(im.eng_pf, e2);   // best effort: a failed read is read again below
             im.eng_pf.reset();
         }
-        for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
+        for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, im.img_row((int64_t) pos0 + t) ? -1 : tids[t]);   // (larry, vision)
         static const bool eng_async = env_on("STRATA_ENG_ASYNC", true);
         if (n <= 8 && im.up_async && eng_async) {   // larry: decode / verify - start the reads (worker threads) now and
             // wait at the first Engram layer (engram_ready); layer 0 runs meanwhile.  Synchronous, they cost ~0.66 ms a token
@@ -2324,6 +2360,15 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
 }
 
 // ================================================================== the layer-major prompt batch
+
+// larry (vision, patch-vision-engine.py)
+void Ds41Dense::set_images(const std::vector<ImageSpan> & spans) { p_->img = spans; }
+void Ds41Dense::clear_images() { p_->img.clear(); }
+void Ds41Dense::engram_tokens(int64_t pos0, const int * tids, int n) {
+    Impl & im = *p_;
+    if (!im.engram.enabled()) return;
+    for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, im.img_row(pos0 + t) ? -1 : tids[t]);
+}
 
 void Ds41Dense::engram_prefetch(const int * tids, int n, int pos0) {
     Impl & im = *p_;

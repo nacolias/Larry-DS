@@ -72,6 +72,9 @@ from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+# larry (patch-vision-server.py): a picture's image token is one only right after VISION_START (Qwen's template writes the
+# pair); False for a model whose template writes the image token alone (DeepSeek-V4.1's <｜deepseek_image｜>)
+IMAGE_NEEDS_START = True
 
 
 def popen(what: str, args: list, **kw):
@@ -4021,7 +4024,7 @@ class Service:
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
+                if t == pad and (not IMAGE_NEEDS_START or (j > 0 and ids[j - 1] == start)):
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")

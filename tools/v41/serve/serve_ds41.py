@@ -113,11 +113,53 @@ def _text(content):
     return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text", None))
 
 
+def _content(content):
+    """larry (patch-vision-server.py): a message's content for DeepSeek's encoder - its text as before, or, when it has
+    pictures, its text and picture parts in order (the encoder writes <｜deepseek_image｜> for each picture)"""
+    if not (isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image" for p in content)):
+        return _text(content)
+    out = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "image":
+            out.append({"type": "image", "source": p.get("source")})
+        elif p.get("type") in ("text", "input_text", None) and isinstance(p.get("text"), str):
+            out.append({"type": "text", "text": p["text"]})
+    return out
+
+
+def ds41_images_of(messages):
+    """larry (patch-vision-server.py): the server's picture sources in the order DeepSeek's encoder writes their
+    placeholders - message order, except that a run of tool results follows its assistant message's call order (the
+    encoder sorts parallel results by call id; ids it does not know sort first, stably, as its sorted() does)."""
+    out, order, i = [], {}, 0
+
+    def pics(m):
+        c = m.get("content")
+        return [p["source"] for p in c if isinstance(p, dict) and p.get("type") == "image"] if isinstance(c, list) else []
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            order = {c.get("id"): k for k, c in enumerate(m["tool_calls"]) if c.get("id")}
+        if m.get("role") == "tool":
+            j = i
+            while j < len(messages) and messages[j].get("role") == "tool":
+                j += 1
+            for t in sorted(messages[i:j], key=lambda t: order.get(t.get("tool_call_id"), 0)):
+                out += pics(t)
+            i = j
+            continue
+        out += pics(m)
+        i += 1
+    return out
+
+
 def to_encoder_messages(messages, tools):
     out = []
     for m in messages:
         m = dict(m)
-        m["content"] = _text(m.get("content"))
+        m["content"] = _content(m.get("content"))   # (larry, patch-vision-server.py: pictures kept)
         if m.get("role") == "developer":   # larry (patch-ds41conf.py): OpenAI's newer name for the system turn
             m["role"] = "system"
         if m.get("tool_calls"):
@@ -175,6 +217,10 @@ S.ChatTemplate = Ds41Template
 
 # ---- end of turn
 S.IM_END = E.eos_token
+# larry (patch-vision-server.py): DeepSeek's picture marker, written alone by its encoder; the pictures in its order
+S.IMAGE_PAD = E.IMAGE_PLACEHOLDER
+S.IMAGE_NEEDS_START = False
+S.images_of = ds41_images_of
 _svc_init = S.Service.__init__
 
 

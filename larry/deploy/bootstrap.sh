@@ -38,7 +38,7 @@ put() {   # put SRC DST [MODE]
   elif cmp -s "$tmp" "$2"; then rm -f "$tmp"
   else mv "$tmp" "$2.kit-new"; echo "kept $2 (differs from the kit: see $2.kit-new)"; fi
 }
-for f in build-xe.sh dl.sh export-patch.sh run.sh ds41-xe-engine.sh ds41-serve.sh; do put "$KIT/deploy/$f" "$D/$f" 755; done
+for f in build-xe.sh dl.sh export-patch.sh run.sh ds41-xe-engine.sh ds41-serve.sh ds41-vision.sh; do put "$KIT/deploy/$f" "$D/$f" 755; done
 put "$KIT/deploy/xe-env.sh" "$D/xe-env.sh"
 put "$KIT/deploy/replica-usage.txt" "$D/replica-usage.txt"
 put "$KIT/deploy/larry-ds41.json.in" "$D/larry-ds41.json"

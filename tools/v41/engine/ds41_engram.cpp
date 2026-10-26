@@ -307,13 +307,19 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
 
 void Ds41Engram::set_token(int64_t pos, int tid) {
     if (pos >= (int64_t) hist_.size()) hist_.resize((size_t) pos + 1024, 0);
-    hist_[(size_t) pos] = g_->engram_token_map[(size_t) tid];
+    // larry (vision, patch-vision-engine.py): tid < 0 = an image position - model.py's DEAD: no n-gram crosses it
+    hist_[(size_t) pos] = tid < 0 ? (int64_t) -1 : (int64_t) g_->engram_token_map[(size_t) tid];
 }
 
 void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const {
     const int64_t N = g_->engram_ngram, H = g_->engram_heads;
     int64_t tok[8];
-    for (int64_t k = 0; k < N; ++k) tok[k] = pos - k >= 0 ? hist_[(size_t) (pos - k)] : g_->engram_pad;
+    // the look-back stops at the sequence's start and (larry, vision) at an image position: pad from there on
+    bool blocked = false;
+    for (int64_t k = 0; k < N; ++k) {
+        if (pos - k < 0 || hist_[(size_t) (pos - k)] < 0) blocked = true;
+        tok[k] = blocked ? g_->engram_pad : hist_[(size_t) (pos - k)];
+    }
     const int64_t * mult = &g_->engram_mult[(size_t) (e * N)];
     int64_t rolling = tok[0] * mult[0];
     for (int64_t i = 1; i < N; ++i) {

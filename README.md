@@ -3,7 +3,7 @@
 This repository serves [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) from
 one workstation, **Larry**: four Intel Arc Pro B70 (32 GB) cards, a Ryzen 7 5800X, 121 GiB of DDR4 and two NVMe
 drives. The model has 40 layers of 384 routed experts (top-6), Engram n-gram memory and a 1M-token context. It runs as
-the 163 GiB GSQ quant through an OpenAI- and Anthropic-compatible API.
+the 163 GiB GSQ quant through an OpenAI- and Anthropic-compatible API, pictures included.
 
 It is a fork of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whose `ds41` engine runs this model on one
 NVIDIA card. This fork adds the Intel side: SYCL / Level Zero code that spreads the model over four Arc cards, system
@@ -52,6 +52,11 @@ About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
     through the cards' 32 GiB BARs.
   - Card 0's expert cache lends a batch only the VRAM it needs, sized from the last batches, and refills in the
     background.
+- **Pictures.** DeepSeek's vision tower (in the DSpark sidecar GGUF: a 1024-wide ViT and the aligner, 485M parameters)
+  encodes a picture on the CPU ([`larry/deploy/ds41-vision.sh`](larry/deploy/ds41-vision.sh) around Xolotl's
+  `ds41_vision.py`; ~6 s an 800x600 picture, 2.2 GB of RAM) into its span of image tokens. The engine places the rows,
+  routes them with the model's VL bias and gives them no Engram, as DeepSeek's `model.py` does; OpenAI `image_url`
+  parts and Anthropic image blocks both work, and a conversation reuses a picture it has already read.
 - **Kernels.** [`ggml-sycl-dsv41.patch`](tools/v41/engine/xe/ggml-sycl-dsv41.patch) is applied to llama.cpp at
   Xolotl's pin. It adds:
   - Xolotl's fused DeepSeek-V4 ops on SYCL;
@@ -68,15 +73,16 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 ~20:15, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 ~23:20, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,499 then 1,887, 16K 2,478, 31K 3,193 - all four passphrases found |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 105.5 tok/s, 96.2 after the long prompts |
-| essays (3 x 800 tokens) | 78.3 tok/s, 76.6 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,422 then 1,899, 16K 2,506, 31K 3,185 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 105.2 tok/s, 102.4 after the long prompts |
+| essays (3 x 800 tokens) | 80.6 tok/s, 78.0 after the long prompts |
 | tool-call round trip | correct |
+| pictures ([`larry/bench/vision/vtest.py`](larry/bench/vision/vtest.py): two test cards, OpenAI and Anthropic APIs) | both described right (shapes, colours, the text on them); 7-8 s with the encode, a follow-up on the same picture 0.2 s |
 | host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
 
 Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 19 checks, the

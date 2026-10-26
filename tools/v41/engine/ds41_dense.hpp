@@ -109,6 +109,15 @@ public:
     /// chunk path (the per-layer KV ring / compressed rows / indexer state advances in sub-batch order; layer l's
     /// residual and pre-mix are the columns the sub-batch used) is preserved, so the outputs match --prefill-chunk.
     bool begin_batch(const int * tids, int B, int pos0);
+    /// larry (vision, patch-vision-engine.py): the prompt's image spans - absolute positions [p0, p0 + n) take their
+    /// input embeddings from `rows` (the vision encoder's F32 [n][n_embd], reading order; valid until clear_images),
+    /// select their experts with the model's VL bias (exp_probs_b_vl) and get no Engram (model.py image spans).  Set
+    /// around a prompt's feed; begin_batch / begin read them.
+    struct ImageSpan { int64_t p0; int n; const float * rows; };
+    void set_images(const std::vector<ImageSpan> & spans);
+    void clear_images();
+    /// larry (vision): the Engram's token history at positions [pos0, pos0 + n) again (an image position as DEAD)
+    void engram_tokens(int64_t pos0, const int * tids, int n);
     /// larry: the NEXT layer-major batch's Engram rows (tokens tids[0..n) at positions pos0..) read into the Engram row
     /// cache while this batch computes (STRATA_ENG_PREFETCH, default 1); the next pass's inputs wait for it first.
     void engram_prefetch(const int * tids, int n, int pos0);

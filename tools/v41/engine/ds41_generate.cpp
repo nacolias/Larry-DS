@@ -106,7 +106,61 @@ struct Args {
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
+    bool vision = false;          // larry: --vision (the server adds it for a config with a "vision" section; GENI is always read)
 };
+
+// larry (vision, patch-vision-engine.py): a GENI request's pictures - the vision encoder's SVE1 records (int32 {magic,
+// n, nx, ny, n_embd} + float32[n][n_embd]), one per picture in prompt order - and the spans they fill
+struct ImgRec { int n = 0; std::vector<float> rows; };
+static bool load_sve1(const std::string & path, int64_t n_embd, std::vector<ImgRec> & out, std::string & err) {
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open the image embeddings " + path; return false; }
+    for (;;) {
+        int32_t h[5];
+        const size_t r = std::fread(h, 4, 5, f);
+        if (r == 0) break;
+        if (r != 5 || h[0] != 0x31455653 || h[1] <= 0 || (int64_t) h[4] != n_embd) {
+            err = "the image embeddings are not SVE1 records of this model's width";
+            std::fclose(f);
+            return false;
+        }
+        ImgRec rec;
+        rec.n = h[1];
+        rec.rows.resize((size_t) h[1] * (size_t) n_embd);
+        if (std::fread(rec.rows.data(), 4, rec.rows.size(), f) != rec.rows.size()) { err = "short SVE1 record"; std::fclose(f); return false; }
+        out.push_back(std::move(rec));
+    }
+    std::fclose(f);
+    return true;
+}
+// an image span of a conversation: positions [p0, p0 + n) and the picture it holds
+struct ImgId { int64_t p0; int n; uint64_t key; };
+static uint64_t fnv64(const void * p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= ((const unsigned char *) p)[i]; h *= 1099511628211ull; }
+    return h;
+}
+// the prefix two token streams share once their pictures are compared too (every image position carries the same
+// token id, so another picture of the same size would pass for the same one): cut at the first span either has that
+// the other does not have with the same extent and key
+static size_t img_cap(size_t lcp, const std::vector<ImgId> & a, const std::vector<ImgId> & b) {
+    auto cut = [&](const std::vector<ImgId> & x, const std::vector<ImgId> & y) {
+        for (const ImgId & s : x) {
+            if ((size_t) s.p0 >= lcp) break;
+            bool same = false;
+            for (const ImgId & t : y) if (t.p0 == s.p0) { same = t.n == s.n && t.key == s.key; break; }
+            if (!same) { lcp = (size_t) s.p0; break; }
+        }
+    };
+    cut(a, b);
+    cut(b, a);
+    return lcp;
+}
+static std::vector<ImgId> img_trim(const std::vector<ImgId> & v, int64_t len) {
+    std::vector<ImgId> o;
+    for (const ImgId & s : v) if (s.p0 + s.n <= len) o.push_back(s);
+    return o;
+}
 
 std::vector<int> parse_csv(const std::string & s) {
     std::vector<int> v;
@@ -172,6 +226,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-skip") a.enc_skip = 1;
         else if (k == "--no-enc-skip") a.enc_skip = 0;
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
+        else if (k == "--vision") a.vision = true;
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     // any other name used to pick the CPU backend without a word
@@ -1721,6 +1776,7 @@ int main(int argc, char ** argv) {
         auto is_stop = [&](int t) { return std::find(a.stop.begin(), a.stop.end(), t) != a.stop.end() || t == (int) G.eos; };
         const int ctxv = (int) ctx;
         std::vector<int> hist;
+        std::vector<ImgId> conv_img;   // larry (vision): the live conversation's image spans (hist's pictures)
         int snap_len = -1;
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         // s6: DSpark's seed rows (main_hidden) of the snapshot's prompt tail - a repeated prompt (regenerate / a client
@@ -1774,6 +1830,7 @@ int main(int argc, char ** argv) {
         struct ParkMeta {
             std::vector<int> hist;        // the parked conversation's tokens (its snapshot length)
             std::vector<float> logits;
+            std::vector<ImgId> img;       // larry (vision): its image spans
             int64_t saved = 0;            // positions saved
             int64_t valid = 0;            // a write past this spoils it (INT64_MAX: saved whole)
             long stamp = 0;               // when it was parked (the oldest goes first)
@@ -1806,21 +1863,28 @@ int main(int argc, char ** argv) {
         while (next_line(line)) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
-            if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            // larry (vision): GENI <max_new> [keys] [img_keys=k,..] <embeddings file> <ids csv> - a request with pictures
+            const bool geni = line.rfind("GENI ", 0) == 0;
+            if (!geni && line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
             std::istringstream ss(line);
-            std::string w, csv;
+            std::string w, csv, img_path;
+            std::vector<std::string> img_keys;
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
-                if (eq == std::string::npos) { csv = w; continue; }
+                if (eq == std::string::npos) { if (geni && img_path.empty()) img_path = w; else csv = w; continue; }
                 const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
                 if (k == "temperature") temp = (float) std::atof(v.c_str());
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
+                else if (k == "img_keys") {   // larry (vision): one key a picture (the server's hash of it)
+                    std::stringstream ks(v);
+                    for (std::string x; std::getline(ks, x, ',');) img_keys.push_back(x);
+                }
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
@@ -1829,8 +1893,38 @@ int main(int argc, char ** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            // larry (vision): the request's pictures - each a run of image tokens, record by record
+            std::vector<ImgRec> img_recs;
+            std::vector<ImgId> req_img;
+            std::vector<Ds41Dense::ImageSpan> img_spans;
+            if (geni) {
+                static const int img_tok = std::getenv("STRATA_IMAGE_TOKEN") ? std::atoi(std::getenv("STRATA_IMAGE_TOKEN")) : 129264;
+                std::string ierr;
+                if (load_sve1(img_path, n_embd, img_recs, ierr)) {
+                    size_t k = 0;
+                    int j = 0;
+                    int64_t ps = -1;
+                    for (size_t p = 0; p < ids.size() && ierr.empty(); ++p) {
+                        if (ids[p] != img_tok) continue;
+                        if (k >= img_recs.size()) { ierr = "more image tokens than image rows"; break; }
+                        if (j == 0) ps = (int64_t) p;
+                        if ((int64_t) p != ps + j) { ierr = "a picture's image tokens are not consecutive"; break; }
+                        if (++j == img_recs[k].n) {
+                            const uint64_t key = k < img_keys.size() ? fnv64(img_keys[k].data(), img_keys[k].size())
+                                                                     : fnv64(img_recs[k].rows.data(), img_recs[k].rows.size() * 4);
+                            req_img.push_back({ ps, img_recs[k].n, key });
+                            img_spans.push_back({ ps, img_recs[k].n, img_recs[k].rows.data() });
+                            ++k;
+                            j = 0;
+                        }
+                    }
+                    if (ierr.empty() && (k != img_recs.size() || j != 0)) ierr = "the prompt's image tokens and the image rows do not match";
+                }
+                if (!ierr.empty()) { std::printf("ERR %s\n", ierr.c_str()); std::fflush(stdout); continue; }
+            }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            lcp = img_cap(lcp, conv_img, req_img);   // (larry, vision)
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
@@ -1839,6 +1933,7 @@ int main(int argc, char ** argv) {
                 if (!dense.parked(s)) continue;
                 size_t l = 0;
                 while (l < pk[s].hist.size() && l < ids.size() && pk[s].hist[l] == ids[l]) ++l;
+                l = img_cap(l, pk[s].img, req_img);   // (larry, vision)
                 if (ub < 0 || l > lp_show) { ub = s; lp_show = l; }
             }
             // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
@@ -1873,6 +1968,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "serve: unparked the %zu-token conversation from slot %d at lcp %zu (partial: re-feeds from there; %.2f s)\n",
                                  park_hist.size(), ub, lp, (now_ms() - tup) / 1000.0);
                     hist = park_hist;
+                    conv_img = pk[ub].img;   // (larry, vision)
                     snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
                     reuse_override = (int) lp;
                     lcp = lp;
@@ -1884,6 +1980,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "serve: unparked the %zu-token conversation from slot %d (%.2f s)\n", park_hist.size(), ub,
                                  (now_ms() - tup) / 1000.0);
                     hist = park_hist;
+                    conv_img = pk[ub].img;   // (larry, vision)
                     snap_len = (int) park_hist.size();
                     snap_logits = pk[ub].logits;
                     snap_seed_n = 0;
@@ -1900,11 +1997,13 @@ int main(int argc, char ** argv) {
             else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
+                conv_img = img_trim(conv_img, snap_len);   // (larry, vision)
                 reused = snap_len;
                 last_logits = snap_logits;
                 regen = true;
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
+                conv_img = img_trim(conv_img, snap_len);   // (larry, vision)
                 reused = snap_len;
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
@@ -1928,6 +2027,7 @@ int main(int argc, char ** argv) {
                     }
                     if (dense.park(save, ps)) {
                         pk[ps].hist.assign(hist.begin(), hist.begin() + snap_len);
+                        pk[ps].img = img_trim(conv_img, snap_len);   // (larry, vision)
                         pk[ps].logits = snap_logits;
                         pk[ps].saved = save;
                         pk[ps].valid = save == (int64_t) snap_len + 1 ? INT64_MAX : rows;
@@ -1938,6 +2038,7 @@ int main(int argc, char ** argv) {
                     }
                 }
                 hist.clear();
+                conv_img.clear();   // (larry, vision)
                 snap_len = -1;
             }
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu/%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
@@ -1960,13 +2061,18 @@ int main(int argc, char ** argv) {
 #endif
             int dh = delta - sp_tail;   // the part the passes / batch feed
             bool by_step = defer_vram && dh >= 1 && dh <= step_max;
+            // larry (vision): new tokens with a picture run as a batch (the passes have no image path) and take their
+            // DSpark tail from it (a tail re-run as passes would re-feed the picture's positions as plain tokens)
+            bool img_new = false;
+            for (const ImgId & s : req_img) if (s.p0 + s.n > reused) img_new = true;
+            if (img_new) by_step = false;
             // STRATA_SERVE_BATCH_TAIL (default on, =0 the old way): a turn that runs as a layer-major batch anyway takes
             // its DSpark tail INTO the batch and the seed rows are read off the batch's state (bcap_vh) - the tail as
             // 16-token exact passes was half of every turn (s11 2026-10-15: +273 tokens 33.5 s = batch 17.1 + tail 15.8).
             // DSpark drafts are verified, so only the seed's numerics (batch vs pass kernels) change, never the output.
             static const bool batch_tail = !(std::getenv("STRATA_SERVE_BATCH_TAIL") && std::getenv("STRATA_SERVE_BATCH_TAIL")[0] == '0');
             int bcap = 0;
-            if (batch_tail && sp_tail > 0 && !by_step && dh >= 2 && PB > 1) { bcap = sp_tail; dh = delta; }
+            if ((batch_tail || img_new) && sp_tail > 0 && !by_step && dh >= 2 && PB > 1) { bcap = sp_tail; dh = delta; }
             // STRATA_SERVE_BATCH_MIN (tokens; default 128, 0 = off): a turn of at least this many new tokens runs as a
             // layer-major batch even when the passes would take it (every turn up to 128 + STEP_MAX = 224 tokens did:
             // the DSpark tail + the step path).  The batch's floor fell with the routed-only reads.  s11, 512K, prompt s
@@ -2173,7 +2279,13 @@ int main(int argc, char ** argv) {
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             if (!ensure_kv(total + 64)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
             g_kl_min_free = kept && keep_learn && kl_free0 > 0 ? 1e30 : -1;   // larry, patch-keeplearn2
+            if (!img_spans.empty()) {   // larry (vision): the pictures' rows for the feed; the Engram's look-back history again
+                dense.set_images(img_spans);
+                const int kb = std::min(reused, 8);
+                if (kb > 0) dense.engram_tokens(reused - kb, ids.data() + reused - kb, kb);
+            }
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            dense.clear_images();
             bcap_n = 0;
             btr("feed end");
             if (kept && keep_learn && !mc.cpu_only && kl_free0 > 0) {   // larry, STRATA_SERVE_KEEP_LEARN: what it took
@@ -2314,10 +2426,12 @@ int main(int argc, char ** argv) {
                 std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
                 hist.clear();
+                conv_img.clear();   // (larry, vision)
                 snap_len = -1;
                 continue;
             }
             hist = ids;
+            conv_img = req_img;   // (larry, vision)
             if (total > reused && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
@@ -2509,6 +2623,7 @@ int main(int argc, char ** argv) {
             if (std::strcmp(finish, "error") == 0) {
                 std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
                 hist.clear();
+                conv_img.clear();   // (larry, vision)
                 snap_len = -1;
                 finish = "length";
             }

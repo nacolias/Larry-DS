@@ -48,6 +48,42 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-26 22:40 - 23:45: pictures - DeepSeek-V4.1's vision path on the Intel engine)
+
+**What was there.** The sidecar GGUF (`V41-MTP-Vision-1017.Q2_K.gguf`) carries the vision tower: 266 tensors, 485M
+parameters (a 1024-wide ViT, the aligner up to the model's 5,120, the learned image start / newline / end vectors).
+Xolotl's `tools/v41/vision/ds41_vision.py` runs DeepSeek's reference `vision.py` / `image_processor.py` on it behind
+strata-vision's line protocol; here on the CPU (tvenv's torch 2.14): it loads in 6.8 s, and an 800x600 picture becomes a
+317-token span in 5.7 s on 6 threads. Strata's server already drives such an encoder (its `Vision` class, `GENI` lines
+to the engine), but the ds41 engine had no image path and `serve_ds41.py` dropped a message's picture parts.
+
+**The model's own rules** (DeepSeek's `model.py` for 1017): every position of an image span carries the image token
+id (129264, `<｜deepseek_image｜>`) and takes the aligner's row (or a learned delimiter vector); positions stay plain
+1-D; the router selects with `exp_probs_b_vl` at image positions (our GGUF keeps it for all 40 layers); the Engram
+treats them as DEAD - no n-gram crosses one - and adds nothing there.
+
+**`patches/patch-vision-engine.py`**: `GENI` (and `--vision`); the encoder's rows over the token table's at those
+positions (`upload_inputs`, f16 like the table); the VL bias in a span's router (spans with pictures take the
+composite router - the fused kernel has one bias); the Engram gate 0 and DEAD in its history; the conversation cache
+compares the pictures' keys (every image position has the same token id) and ends a prefix match at the first span
+that differs; new tokens with a picture run as a batch, their DSpark tail taken from it.
+**`patches/patch-vision-server.py`**: Strata's image expansion without Qwen's `<|vision_start|>` pair for DeepSeek's
+placeholder; the picture parts reach DeepSeek's encoder; `images_of` in the order the encoder writes the placeholders
+(parallel tool results by call id). **`ds41-vision.sh`** (deploy/): the encoder for the config's `"vision"` section.
+
+**Test** (`bench/vision/vtest.sh` / `vtest.py`, two 800x600 cards, a test server): card 1 - *"I see a red rectangle, a
+blue oval, and a green downward-pointing triangle. The text reads "LARRY 42"."* (OpenAI API, 9.9 s with the encode);
+the follow-up *"What number is written there?"* - *"42"* in 0.2 s (373 of 382 tokens reused, the picture included);
+card 2 with the same question - *"a large yellow circle on the left, a purple rectangle on the right, and the text
+"BLUE MOON""*, nothing reused (another picture); card 1 through the Anthropic API right (1.8 s: the encoder's cache);
+a text-only question as before.
+
+**In the service since 23:16** (`larry-ds41.json`: the `"vision"` section + `--vision`; backup
+`larry-ds41.json.pre-vision-20261026`): tsvc2 (`logs/tsvc2-vision.log`) every needle found (8K 1,422 / 1,899, 16K
+2,506, 31K 3,185 tok/s), svcbench 105.2 / 102.4, essay 80.6 / 78.0, the tool call right, hidden RAM 34 GiB; the same
+picture checks through the service: card 1 7.9 s with its encode (prompt 1.55 s), the follow-up 0.2 s (393 of 403
+reused), card 2 right, Anthropic 1.8 s. The encoder holds 2.2 GB of RAM (26 GiB stayed available).
+
 ## Measured (2026-10-26 19:50 - 20:15: the fused hc path back on - its 1M failure was the kept batch's VRAM edge)
 
 **`STRATA_HC_FUSE_MAXN=16384` again** (`patches/svc-hcon.py`, backup `ds41-xe-engine.sh.pre-hcon-20261026`): it was off
@@ -2549,4 +2585,5 @@ Older notes (2026-10-19):
   is the next step).
 - `--kv-fp4` (FP4 compressed KV, +1 GiB VRAM at 512K) needs MXFP4 keys in ggml-sycl's lightning indexer.
 - A fused quantised-weight XMX GEMM for the prompt's experts (now: fp16 dequantisation + oneMKL).
-- Vision (the sidecar carries the vision tower; the Intel path is text-only).
+- Vision (the sidecar carries the vision tower; the Intel path is text-only). *Done 2026-10-26: pictures through the
+  service - see "Measured (2026-10-26 22:40 - 23:45: pictures ...)".*

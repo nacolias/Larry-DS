@@ -20,7 +20,8 @@
     "--route-bias-file",
     "0.3",
     "--prompt-batch",
-    "16384"
+    "16384",
+    "--vision"
   ],
   "cwd": "@DS41_HOME@/xolotl",
   "tokenizer": "@DS41_HOME@/models/gsq1017/tokenizer",
@@ -33,5 +34,11 @@
     "top_p": 0.95
   },
   "api_monitor": false,
-  "reasoning_budget_tokens": 32768
+  "reasoning_budget_tokens": 32768,
+  "vision": {
+    "exe": "@DS41_HOME@/ds41-vision.sh",
+    "mmproj": "@DS41_HOME@/models/gsq1017/V41-MTP-Vision-1017.Q2_K.gguf",
+    "model": "@DS41_HOME@/models/gsq1017/V41-GSQ-1017.gguf",
+    "threads": 6
+  }
 }
