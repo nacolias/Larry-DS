@@ -14,8 +14,8 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 
 | | Larry, 2026-10-26 |
 | --- | --- |
-| fresh 8K-token prompt | 4.50 s |
-| fresh 31K-token prompt | 10.4 s (2,997 tok/s) |
+| fresh 8K-token prompt | 4.40 s |
+| fresh 31K-token prompt | 10.2 s (3,040 tok/s) |
 | follow-up turn of 500 new tokens at 38K context | 1.6 s |
 | chat replies (temperature 1, speculative decoding) | 95-103 tok/s |
 | agent-session replies (greedy) | 120-124 tok/s |
@@ -23,7 +23,7 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 | context window | 1,048,576 tokens |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
-Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 2,880 tok/s on Oct 26 (~3,090 when
+Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 3,174 tok/s on Oct 26 (~3,120 when
 repeated warm). The full tables
 are under [Results](#results).
 
@@ -56,7 +56,8 @@ About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
   - Xolotl's fused DeepSeek-V4 ops on SYCL;
   - dp4a and XMX mat-vec kernels;
   - the lightning indexer on XMX, a prompt's as one fused kernel whose score matrix never leaves the registers;
-  - the prompt's hyper-connection steps fused into one pass over the 4-stream state, and wo_a's 8 slices as one product;
+  - the prompt's hyper-connection steps fused into one pass over the 4-stream state, wo_a's 8 slices as one product
+    fed by the attention's fp16 output;
   - layers 0-19's prompt attention through oneDNN's fused SDPA;
   - an AVX2 Q2_0 dot for the CPU pool;
   - an op profiler (off by default).
@@ -66,27 +67,27 @@ engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 10:54-10:58, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 12:11-12:16, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,118 then 1,888, 16K 2,202, 31K 2,880 - all four passphrases found (16K / 31K again, warm: 2,644 / 3,098) |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 100.5 tok/s, 97.7 after the long prompts |
-| essays (3 x 800 tokens) | 75.9 tok/s, 74.9 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,228 then 1,878, 16K 2,473, 31K 3,174 - all four passphrases found (16K / 31K again, warm: 2,665 / 3,121) |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 100.0 tok/s, 96.8 after the long prompts |
+| essays (3 x 800 tokens) | 75.9 tok/s, 71.6 after the long prompts |
 | tool-call round trip | correct |
-| host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
+| host memory held by the GPU driver | 33 GiB at most (the watchdog acts at 54) |
 
-Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 17 checks, the
+Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 18 checks, the
 first chat pass ran 93.3-102.7 tok/s and the first essay 69.7-81.3 tok/s. In every check the first 8K needle, which
 follows the decode tests, is slower than the second.
 
-**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 and, from 8K up, abwT124 in the log,
+**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 and, from 8K up, abwT129 in the log,
 2026-10-25/26: a server with the service's settings on a side port, greedy):
 
 | prompt tokens | 530 | 1,021 | 2,003 | 3,003 | 4,519 | 8,054 | 16,099 | 31,008 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.50 | 6.23 | 10.35 |
+| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.40 | 6.16 | 10.24 |
 
 **Follow-up turns** in a replayed agent session (synthetic, [`larry/bench/speed/agentx.py`](larry/bench/speed/agentx.py);
 context 8K-38K; abwT124):

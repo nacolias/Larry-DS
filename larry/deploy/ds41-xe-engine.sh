@@ -65,6 +65,11 @@ export STRATA_HC_NORM_MV_WIDE="${STRATA_HC_NORM_MV_WIDE:-1}"
 # staged once): the separate hc_post / hc_pre / mixes and their state copies go - abwT124: fresh 16K 6.45 -> 6.23 s,
 # 31K 10.90 / 10.96 -> 10.55 / 10.35 s (here the prompt path's STRATA_HC_NORM_MV_WIDE is then unused)
 export STRATA_HC_FUSE_MAXN="${STRATA_HC_FUSE_MAXN:-16384}"
+# the prompt attention's output in fp16 straight into wo_a's op (with STRATA_OPROJ_A): no f32 copy of it, no
+# conversion back
+# - abwT129 (two servers each): fresh 16K 6.25 / 6.29 -> 6.17 / 6.16 s, 31K 10.32-10.35 -> 10.16-10.27 s;
+# card 0 ~0.26 ms a span lighter (wo_a 543 -> 337 us), the rest now waits on the expert cards
+export STRATA_SDPA_O16="${STRATA_SDPA_O16:-1}"
 # a decode / verify job's own token count picks its expert kernel form (1-token jobs of verify passes 9-17 % faster)
 export STRATA_XE_JOBNT="${STRATA_XE_JOBNT:-1}"
 # prompt chunks: each expert card pushes its part to the dense card when it is done (31.6K prompt 23.0 -> 21.5 s, exact)

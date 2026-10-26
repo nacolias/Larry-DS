@@ -1201,7 +1201,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     static const int sdpa_dp = std::getenv("STRATA_ATTN_SDPA_DP") ? std::atoi(std::getenv("STRATA_ATTN_SDPA_DP")) : 576;
     if (attn_sdpa && sycl_mqa && DH == 512 && (M == SWA || (Kc && M == SWA + 512))) {
         ggml_tensor * kp = ggml_dsv41_kgather_pad(gc, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, (int) SWA, sdpa_dp);
-        o = ggml_dsv41_attn_sdpa(gc, q, kp, Mall, im.BL(il, "attn_sinks.weight"), 1.0f / std::sqrt((float) DH));   // [DH, NH, n]
+        // larry, STRATA_SDPA_O16 (patch-sdpao16.py, default 0): the output in fp16 when wo_a takes it as one op (STRATA_OPROJ_A)
+        static const bool sdpa_o16 = env_on("STRATA_SDPA_O16", false) && env_on("STRATA_OPROJ_A", false);
+        const bool o16 = sdpa_o16 && im.sycl && n > 8 && im.BL(il, "attn_output_a.weight")->type == GGML_TYPE_Q6_K;
+        o = (o16 ? ggml_dsv41_attn_sdpa_o16 : ggml_dsv41_attn_sdpa)(gc, q, kp, Mall, im.BL(il, "attn_sinks.weight"),
+                                                                   1.0f / std::sqrt((float) DH));   // [DH, NH, n]
         o = b.rope(o, pos, r, true, rope_ip && im.sycl);                                       // de-RoPE the output
     } else {
     if (!im.cpu && !sycl_mqa && !sycl_dec && M % 256) {

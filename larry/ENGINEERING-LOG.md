@@ -127,6 +127,33 @@ compare per call). Follow-ups barely move: their layers wait on streamed experts
 Over the day (fresh 31K through the server, second runs): 12.34 s (07:30) -> 11.31 (the indexer) -> 10.96 (wo_a, the
 mixes) -> **10.35 s**.
 
+* **`STRATA_SDPA_O16=1`** (in the service since 12:11, `patches/svc-sdpao16.py`, backup
+  `ds41-xe-engine.sh.pre-sdpao16-20261026`; `patches/patch-sdpao16.py`: ggml.h / ggml.c `ggml_dsv41_attn_sdpa_o16`, the
+  same op with an F16 result): the prompt attention's output stays fp16 - the oneDNN path copies O' through, the oneMKL
+  path's second gemm_batch writes fp16, the in-place de-RoPE takes F16, `ggml_dsv41_oproj_a` reads it as it is (wo_a
+  always read o rounded to fp16). wo_a's op 543 -> 337 us a span, the attention op's own kernels 382 -> 323 us. Numerics
+  (abwT129): p8k KL 2.22e-3 against 2.34e-3, p30k PPL 1.7773 / 1.7816. Fresh (two servers each, interleaved): 16K 6.25 /
+  6.29 -> 6.17 / 6.16 s, 31K 10.32-10.35 -> 10.16-10.27 s - card 0's ~0.26 ms a span shows up as ~1 %: the expert cards'
+  waits grew as much (31K "experts" 1.64-2.19 -> 1.79-2.44 s). Card 0 and the expert cards are balanced now.
+
+**The balance after it** (abwT125, `STRATA_GPU_PTL`): card 0's span 6.49 ms (first 16K batch) / 6.05 (second), its idle
+before the combines 482 / 411 ms a batch (was 183-346) - it waits on the expert cards more; a layer of a 16K batch ~218
+ms of card 0's work against the expert cards' two calls ~176 ms. Not adopted: `STRATA_XE_FN16=1 / 2` again (abwT126:
+31K 10.42 / 10.42 / 10.30 s, 16K 6.32 / 6.28 / 6.24 - within the noise).
+
+**Known: a fresh engine's first big prompts stall on host memory.** On 3 of ~14 fresh servers today the first 16K or
+31K prompt took 15-22 s (abwT112 s2, abwT117, abwT126 f0: 7-10 s of tier waits), and on all of them the first 8K takes
+6.0-8.5 s against ~4.45 for the second. In the traced one (abwT117) card 0 idled 70-200 ms before nearly every combine
+while the expert cards' calls themselves ran at normal length: the calls started late, each layer's staging done only
+5-10 ms before its call (17-19 ms normally); that run's card-0 cache regrow spent 245 ms on its slabs (50-95 normally).
+`bench/speed/vmwatch.sh` (/proc/vmstat every 2 s, abwT127 / abwT128) over a fresh server's first prompts: kswapd
+reclaims 0.1-2.7 M pages / 2 s, direct reclaim up to 2 M pages / 2 s, direct compaction stalls up to 330 / 2 s, page
+migration up to 470 K pages / 2 s - in every big prompt, worst in the first minutes after the arena loads; between
+prompts, none. `STRATA_ENGRAM_DIRECT=1` (the paged Engram table with O_DIRECT) does not change that churn (abwT128: the
+same order of reclaim; first prompts 6.0-6.5 vs 6.35-7.2 s, two servers each) - left off. Not tried (system settings,
+the owner's call): `vm.watermark_scale_factor` (kswapd earlier, fewer direct reclaims), `vm.compaction_proactiveness=0`,
+THP defrag `defer`; and O_DIRECT for layer 14's raw block-device reads (`RawMap` opens /dev/dm-0 without it).
+
 ## Measured (2026-10-26 06:35 - 07:51: the prompt indexer as one fused XMX kernel, told each query's visible rows)
 
 **In the service since 07:48** (`patches/svc-lifused.py`, backup `ds41-xe-engine.sh.pre-lifused-20261026`):
