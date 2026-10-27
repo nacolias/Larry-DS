@@ -1,13 +1,15 @@
 #!/bin/bash
 # bootstrap.sh - set the DeepSeek-V4.1 Xe engine up from this checkout (idempotent): llama.cpp at Xolotl's pin with
 # Xolotl's ggml patch plus larry's (tools/v41/engine/xe/ggml-sycl-dsv41.patch), the deploy scripts and checks
-# installed into DS41_HOME, the Python venv, the build.  DS41_HOME defaults to the directory holding this checkout
-# (larry: /opt/ai/dsv41, the checkout at /opt/ai/dsv41/xolotl):
+# installed into DS41_HOME, the Python venv, the image encoder's torch venv, the build.  DS41_HOME defaults to the
+# directory holding this checkout (larry: /opt/ai/dsv41, the checkout at /opt/ai/dsv41/xolotl):
 #   git clone -b larry-xe https://github.com/nacolias/Larry-DS.git /opt/ai/dsv41/xolotl
 #   /opt/ai/dsv41/xolotl/larry/deploy/bootstrap.sh
 # Needs oneAPI 2026.1 (ONEAPI_VARS) and intel-ocloc; the model download is separate (dl.sh, the top-level README.md).
 #   DS41_SRV (/srv/dsv41): the second NVMe drive - layer 14's Engram table, the paged Engram copy, the TP cache
 #   BUILD=0: install only, no build
+#   VISION=0: no torch venv (tvenv, ~1 GB: CPU torch for ds41-vision.sh) - then take the "vision" section and --vision
+#             out of larry-ds41.json, or the server will not start
 set -euo pipefail
 X=$(cd "$(dirname "$0")/../.." && pwd)
 D=${DS41_HOME:-$(dirname "$X")}
@@ -43,8 +45,12 @@ put "$KIT/deploy/xe-env.sh" "$D/xe-env.sh"
 put "$KIT/deploy/replica-usage.txt" "$D/replica-usage.txt"
 put "$KIT/deploy/larry-ds41.json.in" "$D/larry-ds41.json"
 put "$KIT/checks/tsvc2.sh" "$D/tsvc2.sh" 755
-for f in ds41api.py needle.py svcbench.py essay.py tooltest.py tok.py; do put "$KIT/checks/$f" "$D/$f"; done
+for f in ds41api.py needle.py svcbench.py essay.py tooltest.py imagetest.py tok.py; do put "$KIT/checks/$f" "$D/$f"; done
 mkdir -p "$SRV/tpcache" "$SRV/gsq1017" 2>/dev/null || echo "bootstrap: could not create $SRV/tpcache - make it, or set DS41_SRV" >&2
 cd "$D"
 [ -x venv/bin/python ] || { python3 -m venv venv && venv/bin/pip -q install -U "huggingface_hub[hf_xet]" -r xolotl/requirements.txt; }
+# the image encoder's (ds41-vision.sh): CPU torch, numpy and pillow at larry's versions
+[ "${VISION:-1}" = 0 ] || [ -x tvenv/bin/python ] || { python3 -m venv tvenv &&
+  tvenv/bin/pip -q install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu &&
+  tvenv/bin/pip -q install numpy==2.5.4 pillow==13.0.0; }
 [ "${BUILD:-1}" = 0 ] || ./build-xe.sh

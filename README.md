@@ -8,7 +8,7 @@ the 163 GiB GSQ quant through an OpenAI- and Anthropic-compatible API, pictures 
 It is a fork of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whose `ds41` engine runs this model on one
 NVIDIA card. This fork adds the Intel side: SYCL / Level Zero code that spreads the model over four Arc cards, system
 RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B change at a time, between 2026-10-19 and
-10-26. [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) is that record.
+10-27. [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) is that record.
 
 ## Headline numbers
 
@@ -21,6 +21,7 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 | agent-session replies (greedy) | 120-124 tok/s |
 | 984K-token prompt | 6 min, then 67 tok/s |
 | context window | 1,048,576 tokens |
+| a new 800x600 picture | 7-8 s (~6 s of it the CPU encode); a follow-up question on it 0.2-1.2 s |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
 Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 3,017 tok/s on Oct 26 (~3,020 when
@@ -152,19 +153,23 @@ and GPUs are untested.
 2. **Clone and build.** [`bootstrap.sh`](larry/deploy/bootstrap.sh) does the following:
    - fetches llama.cpp at Xolotl's pin and applies both ggml patches;
    - installs the deploy scripts and checks into `DS41_HOME` (default: the checkout's parent, `/opt/ai/dsv41`);
-   - creates the venv and builds `ds41_generate_xe` + `libds41_xe.so`.
+   - creates the server's venv and the image encoder's (`tvenv`: CPU torch, numpy, pillow; `VISION=0` skips it);
+   - builds `ds41_generate_xe` + `libds41_xe.so`.
 
    ```bash
    git clone -b larry-xe https://github.com/nacolias/Larry-DS.git /opt/ai/dsv41/xolotl
    /opt/ai/dsv41/xolotl/larry/deploy/bootstrap.sh     # DS41_SRV=/srv/dsv41: the second drive; NINJA_JOBS=N if RAM is short
    ```
    On 2026-10-26 a clean clone from GitHub went through this on Larry. Its repo and ggml trees came out identical to
-   the live ones, and it built in under 10 minutes with `NINJA_JOBS=3` at nice 19.
-3. **Download the model** (163 GiB GGUF, 5.3 GiB DSpark sidecar, tokenizer, `rank.bin`, two 95 GiB Engram tables),
-   at the revision Larry runs:
+   the live ones, and it built in under 10 minutes with `NINJA_JOBS=3` at nice 19. On 2026-10-27 the picture setup
+   went through the same way (`BUILD=0` into a scratch `DS41_HOME`, then `dl.sh vision`), and the encoder read a test
+   picture through that install.
+3. **Download the model** (163 GiB GGUF, 5.3 GiB DSpark sidecar with the vision tower, tokenizer, `rank.bin`, two
+   95 GiB Engram tables) at the revision Larry runs, and DeepSeek's reference image code for the encoder:
    ```bash
    /opt/ai/dsv41/dl.sh main     # -> /opt/ai/dsv41/models/gsq1017 (~263 GiB)
    /opt/ai/dsv41/dl.sh l14      # -> /srv/dsv41/gsq1017: layer 14's Engram table (~95 GiB); one drive: DS41_SRV=/opt/ai/dsv41/models
+   /opt/ai/dsv41/dl.sh vision   # -> /opt/ai/dsv41/models/ds1017/inference: vision.py + image_processor.py (12 KB)
    ```
 4. **Optional: the paged Engram copy** (98 GiB on the faster drive). Each row of layer 1's table becomes one aligned
    4 KiB read instead of two random ones. The engine uses `engram-L1.epg` from the first `--engram` directory that
@@ -188,16 +193,19 @@ and GPUs are untested.
      and the watchdog script. Install steps are in `ds41.service`'s header.
    - The first start writes the TP shard cache (`/srv/dsv41/tpcache`, 6 GiB). A normal start takes 80-95 s to the
      first request.
-7. **Check it**: `/opt/ai/dsv41/tsvc2.sh` (as in Results; a few minutes). The checks read `DS41_URL` and
-   `DS41_API_KEY` / `DS41_KEY_FILE` ([`larry/checks/ds41api.py`](larry/checks/ds41api.py)).
+   - The server also starts the image encoder ([`ds41-vision.sh`](larry/deploy/ds41-vision.sh), 2.2 GB of RAM). It
+     needs `tvenv` and `dl.sh vision`; without them the server does not start (see Settings for a text-only config).
+7. **Check it**: `/opt/ai/dsv41/tsvc2.sh` (as in Results, ending with a picture, `imagetest.py`; a few minutes). The
+   checks read `DS41_URL` and `DS41_API_KEY` / `DS41_KEY_FILE` ([`larry/checks/ds41api.py`](larry/checks/ds41api.py)).
 
 ## Settings
 
 - **[`ds41-xe-engine.sh`](larry/deploy/ds41-xe-engine.sh)** holds every setting the service runs with, as
   environment defaults. A variable already set wins. Each comment gives the A/B result that set the value.
 - **[`larry-ds41.json.in`](larry/deploy/larry-ds41.json.in)** holds the engine flags (`--ctx 1048576
-  --prompt-batch 16384 --route-bias 0.5 --route-bias-file 0.3`), the sampling defaults (temperature 1.0, top-p
-  0.95), and the model paths. `bootstrap.sh` renders it as `larry-ds41.json`.
+  --prompt-batch 16384 --route-bias 0.5 --route-bias-file 0.3 --vision`), the sampling defaults (temperature 1.0,
+  top-p 0.95), the model paths and the `"vision"` section (the encoder script, the sidecar it reads, 6 CPU threads).
+  For a text-only server, delete the section and `--vision`. `bootstrap.sh` renders it as `larry-ds41.json`.
 - [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) ("Knobs") lists the tier's knobs.
 
 The Larry-specific ones:
@@ -214,6 +222,11 @@ The Larry-specific ones:
 - **One request at a time** (first in, first out). A side request can park one long conversation.
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
+- **Pictures are encoded on the CPU.** A new 800x600 picture takes ~6 s on 6 threads (a repeat comes from the
+  server's cache), up to DeepSeek's 1,024 image tokens a picture. Through the model, only one picture per request has
+  been run (both APIs, with follow-ups). Several pictures in a request and pictures in tool results are covered only by
+  the server's tests with a stub encoder ([`test_serve_ds41.py`](tools/v41/serve/test_serve_ds41.py)), and pictures
+  deep in a long context are untested.
 - **The first prompts after a start are slower.** Their first calls load oneMKL's kernels and compile oneDNN's
   attention partitions. Some starts also stalled for seconds: under memory pressure the xe driver's shrinker wrote
   the engine's host buffers out to swap and the first prompts read them back. Since 2026-10-26 the load and the
@@ -238,10 +251,11 @@ DeepSeek's official 1017 release, and the metadata is mislabeled. The scripts ar
 | --- | --- |
 | [`tools/v41/engine/xe/`](tools/v41/engine/xe/) | the Intel expert tier (`ds41_xe_tier.cpp`), its kernels, `xe.cmake`, the ggml patch, tests |
 | [`tools/v41/engine/tp/`](tools/v41/engine/tp/) | engine1, the tensor-parallel decode core, and its `DESIGN.md` |
-| `tools/v41/engine/ds41_*.cpp` | the engine: prompt pipeline, keep-cache, Engram reader, serve-path changes |
+| `tools/v41/engine/ds41_*.cpp` | the engine: prompt pipeline, keep-cache, Engram reader, serve-path changes, picture spans |
+| [`tools/v41/serve/`](tools/v41/serve/) | the server's DeepSeek-V4.1 glue (`serve_ds41.py`: prompts, tool calls, special-token escaping, pictures) and its tests |
 | [`larry/deploy/`](larry/deploy/) | bootstrap, build, download, the engine and server launchers, config template, `host/` units |
-| [`larry/checks/`](larry/checks/) | the service check (`tsvc2.sh`) and its pieces (needle, decode, essay, tool call), `tok.py` |
-| [`larry/bench/`](larry/bench/) | the A/B harness (`speed/`), microbenchmarks, quality and provenance scripts |
+| [`larry/checks/`](larry/checks/) | the service check (`tsvc2.sh`) and its pieces (needle, decode, essay, tool call, picture), `tok.py` |
+| [`larry/bench/`](larry/bench/) | the A/B harness (`speed/`), microbenchmarks, quality, provenance and picture (`vision/`) scripts |
 | [`larry/patches/`](larry/patches/) | the scripts each change was made with: a record, not a build step |
 | [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) | the log |
 | everything else | upstream Xolotl at `f7c561b7`; its README is [`README.xolotl.md`](README.xolotl.md) |

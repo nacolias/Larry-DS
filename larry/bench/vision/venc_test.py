@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """venc_test.py OUTDIR [THREADS] - larry, 2026-10-26: one image through Xolotl's DeepSeek-V4.1 vision encoder process
 (tools/v41/vision/ds41_vision.py, the strata-vision line protocol) on the CPU, with the sidecar's vision tower and
-DeepSeek's reference vision.py / image_processor.py.  Draws a test card (text, shapes, colours), encodes it, and
-prints the encoder's reply, the SVE1 record's shape and simple statistics of its rows."""
+DeepSeek's reference vision.py / image_processor.py - started as the server starts it, through DS41_HOME's
+ds41-vision.sh (DS41_HOME: the install, default /opt/ai/dsv41; DS41_MODELS: the sidecar's directory, default
+DS41_HOME/models/gsq1017).  Draws a test card (text, shapes, colours), encodes it, and prints the encoder's reply, the
+SVE1 record's shape and simple statistics of its rows."""
 import os
 import struct
 import subprocess
@@ -14,7 +16,8 @@ from PIL import Image, ImageDraw
 
 OUT = sys.argv[1]
 THREADS = sys.argv[2] if len(sys.argv) > 2 else "6"
-D = "/opt/ai/dsv41"
+D = os.environ.get("DS41_HOME", "/opt/ai/dsv41")
+M = os.environ.get("DS41_MODELS", D + "/models/gsq1017")
 os.makedirs(OUT, exist_ok=True)
 
 img = Image.new("RGB", (800, 600), "white")
@@ -26,11 +29,8 @@ d.text((60, 320), "LARRY 42", fill="black")
 path = os.path.join(OUT, "card.png")
 img.save(path)
 
-cmd = [D + "/tvenv/bin/python", "-I", D + "/xolotl/tools/v41/vision/ds41_vision.py",
-       "--mmproj", D + "/models/gsq1017/V41-MTP-Vision-1017.Q2_K.gguf",
-       "--model", D + "/models/gsq1017/V41-GSQ-1017.gguf",
-       "--device", "cpu", "--threads", THREADS,
-       "--reference-dir", D + "/qv/ds1017/inference"]
+cmd = [D + "/ds41-vision.sh", "--mmproj", M + "/V41-MTP-Vision-1017.Q2_K.gguf", "--model", M + "/V41-GSQ-1017.gguf",
+       "--threads", THREADS]
 t0 = time.time()
 p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 ready = p.stdout.readline().strip()

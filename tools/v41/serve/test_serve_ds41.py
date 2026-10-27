@@ -2,11 +2,13 @@
 """Tests for serve_ds41.py (CPU, seconds).  Run under Strata's venv:
   /home/mal/AI/Strata/.venv/bin/python tools/v41/serve/test_serve_ds41.py [TOKENIZER_DIR]
 TOKENIZER_DIR (export_tokenizer.py's output) enables the tokenizer and the HTTP tests (server --engine mock)."""
+import itertools
 import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -123,13 +125,17 @@ def t_parser():
     check("DwarfStar escape undone", D.unescape(esc) == "a" + D.P_CLOSE + "b", D.unescape(esc))
 
 
-def t_tokenizer(tok_dir):
+def load_tok(tok_dir):
     import strata_tokenizer as ST
     tokens = json.load(open(tok_dir / "vocab.json"))
     tokens = [t for t, _ in sorted(tokens.items(), key=lambda kv: kv[1])] if isinstance(tokens, dict) else tokens
     merges = (tok_dir / "merges.txt").read_text(encoding="utf-8").split("\n")
     types = json.load(open(tok_dir / "token_type.json"))
-    tok = ST.Tokenizer(tokens, merges, types)   # = serve_ds41.Ds41Tokenizer (patched)
+    return ST.Tokenizer(tokens, merges, types)   # = serve_ds41.Ds41Tokenizer (patched)
+
+
+def t_tokenizer(tok_dir):
+    tok = load_tok(tok_dir)
     p = D.Ds41Template().render([{"role": "user", "content": "hi"}])
     ids = tok.encode(p, parse_special=True)
     check("tokenizer: specials are single tokens", len(tok.encode(E.eos_token, parse_special=True)) == 1 and
@@ -155,6 +161,60 @@ def t_tokenizer(tok_dir):
     check("specials inside messages / tool results / arguments stay text", specials(conv(lit)) == specials(conv("")),
           (specials(conv(lit)), specials(conv(""))))
     check("... and read back as the same text", tok.decode(svc.encode_prompt(conv(lit), TOOLS, {})).count(lit) == 4)
+
+
+def t_images(tok_dir):
+    """larry (patch-vision-server.py): a message's pictures reach DeepSeek's encoder in place, and Service.prepare gives
+    each its span of image tokens in the encoder's order (a stub encoder: no model needed)"""
+    import serve.server as S
+    tok = load_tok(tok_dir)
+    img = tok.encode(E.IMAGE_PLACEHOLDER, parse_special=True)
+    check("image placeholder is one token", len(img) == 1, img)
+    img = img[0]
+    pic = lambda src: {"type": "image", "source": src}
+    txt = lambda t: {"type": "text", "text": t}
+    check("content without pictures stays its text", D._content([txt("a"), txt("b")]) == "ab")
+    got = D._content([txt("see "), pic("/p/a.png"), txt(" and "), pic("/p/b.png")])
+    check("pictures kept in place for the encoder", got == [txt("see "), pic("/p/a.png"), txt(" and "), pic("/p/b.png")], got)
+    # parallel tool results arrive out of call order (DeepSeek's encoder sorts them by call id); a typed marker is text
+    calls = [{"id": c, "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": f})}}
+             for c, f in (("c1", "a.png"), ("c2", "b.png"))]
+    msgs = [{"role": "user", "content": [txt("compare "), pic("/p/u.png")]},
+            {"role": "assistant", "content": "", "tool_calls": calls},
+            {"role": "tool", "tool_call_id": "c2", "content": [txt("RESULT-B2"), pic("/p/b.png")]},
+            {"role": "tool", "tool_call_id": "c1", "content": [txt("RESULT-A1"), pic("/p/a.png")]},
+            {"role": "user", "content": "the " + E.IMAGE_PLACEHOLDER + " marker, typed"}]
+    order = D.ds41_images_of(msgs)
+    check("images_of in the encoder's order", order == ["/p/u.png", "/p/a.png", "/p/b.png"], order)
+
+    class StubVision:   # (file, image tokens) per picture, as Vision.encode
+        def __init__(self, d):
+            self.dir, self.n = d, {"/p/u.png": 5, "/p/a.png": 7, "/p/b.png": 9}
+
+        def encode(self, src):
+            f = Path(self.dir) / (Path(src).stem * 16 + ".sve")
+            f.write_bytes(b"x" * self.n[src])
+            return str(f), self.n[src]
+    with tempfile.TemporaryDirectory() as d:
+        svc = S.Service(S.MockEngine(tok, "x"), tok, D.Ds41Template(), vision=StubVision(d))
+        try:
+            ids = svc.prepare(msgs, TOOLS, {})[0]
+            keys = svc.embeddings.keys
+        finally:
+            svc.drop_embeddings()
+        base = svc.encode_prompt(msgs, TOOLS, {})   # one placeholder per picture
+
+    def show(ids):   # the prompt with each run of image tokens as [IMGn]
+        return "".join(f"[IMG{len(g)}]" if k else tok.decode(g)
+                       for k, g in ((k, list(g)) for k, g in itertools.groupby(ids, key=lambda t: t == img)))
+    shown, want = show(ids), show(base)
+    for n in (5, 7, 9):
+        want = want.replace("[IMG1]", f"[IMG{n}]", 1)
+    check("each picture its span in its placeholder's place", shown == want, (shown[-300:], want[-300:]))
+    at = [shown.find(t) for t in ("compare", "[IMG5]", "RESULT-A1", "[IMG7]", "RESULT-B2", "[IMG9]")]
+    check("... the tool results in call order, each with its picture", -1 not in at and at == sorted(at), at)
+    check("... a typed marker stays text", "the " + E.IMAGE_PLACEHOLDER + " marker, typed" in shown, shown[-200:])
+    check("... one picture key each", keys == ["u" * 16, "a" * 16, "b" * 16], keys)
 
 
 def free_port():
@@ -213,6 +273,7 @@ if __name__ == "__main__":
     t_parser()
     if len(sys.argv) > 1:
         t_tokenizer(Path(sys.argv[1]))
+        t_images(Path(sys.argv[1]))
         t_http(Path(sys.argv[1]))
     print(f"{'FAILED ' + str(len(FAILS)) if FAILS else 'all passed'}")
     sys.exit(1 if FAILS else 0)

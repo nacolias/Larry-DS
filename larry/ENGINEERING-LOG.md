@@ -1,4 +1,4 @@
-> **Larry's build log, as kept on Larry** while the engine was built (newest sections first, 2026-10-19 to 10-26). Paths
+> **Larry's build log, as kept on Larry** while the engine was built (newest sections first, 2026-10-19 to 10-27). Paths
 > are Larry's: `/opt/ai/dsv41` (the checkout at `/opt/ai/dsv41/xolotl`), `/srv/dsv41` on the second NVMe drive.
 > `larry-mode`, vllm-a, the studio, NPM and the public endpoint are Larry's own services. Here, `bench/...` and
 > `patches/...` are this directory's `bench/` and `patches/`. `logs/...` stayed on Larry, except `logs/provenance/`
@@ -27,6 +27,7 @@ Clients: Larry's public endpoint, a reverse proxy to the server (OpenAI: `/v1/ch
 `deepseek-v4.1-flash-1017` (the server ignores the `model` field, so `larry` works too), the vllm-a API key. Thinking is on
 by default and comes back as `reasoning_content`; `"reasoning_effort": "none"` turns it off (`low`/`medium`/`high`/`max`
 or 1-100 are DeepSeek's numeric effort). Tool calls: DeepSeek's DSML, parsed into OpenAI/Anthropic tool calls.
+Pictures (since 2026-10-26): OpenAI `image_url` parts and Anthropic image blocks (end to end so far: one a request).
 Sampling defaults: temperature 1.0, top-p 0.95. Context: 1,048,576 tokens (since 2026-10-24 20:35; see below).
 
 ## Model provenance (verified 2026-10-26)
@@ -83,6 +84,21 @@ a text-only question as before.
 2,506, 31K 3,185 tok/s), svcbench 105.2 / 102.4, essay 80.6 / 78.0, the tool call right, hidden RAM 34 GiB; the same
 picture checks through the service: card 1 7.9 s with its encode (prompt 1.55 s), the follow-up 0.2 s (393 of 403
 reused), card 2 right, Anthropic 1.8 s. The encoder holds 2.2 GB of RAM (26 GiB stayed available).
+
+**For a fresh install (2026-10-27 01:10 - 01:25).** The kit's config template turned pictures on, but nothing in the
+kit installed what the encoder needs, so a server set up from the repository would not have started. Now
+`deploy/bootstrap.sh` makes the torch venv (`tvenv`: torch 2.14.1+cpu, numpy 2.5.4, pillow 13.0.0; 1.0 GB; `VISION=0`
+skips it), `deploy/dl.sh vision` fetches DeepSeek's `inference/vision.py` + `image_processor.py` from
+deepseek-ai/DeepSeek-V4.1-Flash-1017 at `1bae0e10` (the same blobs as `qv/ds1017`'s copies) into `models/ds1017`, and
+`ds41-vision.sh` reads them there - larry's install too (backups `dl.sh` / `ds41-vision.sh` / `tsvc2.sh`
+`.pre-kit-20261027`; the running encoder untouched). Tested: `bootstrap.sh` with `BUILD=0` into a scratch `DS41_HOME`
+(25 s, the checkout already patched), `dl.sh vision`, then `bench/vision/venc_test.py` (now started through
+`ds41-vision.sh`, as the server starts it) through that install: ready in 10.2 s, 317 rows in 5.8 s, row statistics
+the same as larry's own install gives (also as the service user). tsvc2 ends with a picture now
+(`checks/imagetest.py`: the card, then *"What number is written there?"*): through the service 2.3 s, then *"42"* in
+1.2 s. `tools/v41/serve/test_serve_ds41.py` gained 8 picture tests on a stub encoder (each placeholder's span in its
+place, parallel tool results' pictures in call order, a typed `<｜deepseek_image｜>` kept as text, one key per
+picture): 50 pass.
 
 ## Measured (2026-10-26 19:50 - 20:15: the fused hc path back on - its 1M failure was the kept batch's VRAM edge)
 
