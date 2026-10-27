@@ -40,5 +40,6 @@
     "mmproj": "@DS41_HOME@/models/gsq1017/V41-MTP-Vision-1017.Q2_K.gguf",
     "model": "@DS41_HOME@/models/gsq1017/V41-GSQ-1017.gguf",
     "threads": 6
-  }
+  },
+  "parallel": 2
 }

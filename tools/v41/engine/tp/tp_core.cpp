@@ -275,6 +275,10 @@ struct Card {
     uint64_t * stamps = nullptr;                               // STRATA_TP_STAMP_LAYER: the clock at each step of that layer
     // graphs: (n, cap1, cap2) -> the recorded pass
     std::map<std::tuple<int, int64_t, int64_t>, sx::command_graph<sx::graph_state::executable>> graphs;
+    // larry (batch slots, patch-seqs-tp.py): the other conversations' state and graphs - bind_seq swaps them with ls /
+    // graphs (entry [seq] is empty while that conversation is bound)
+    std::vector<std::vector<LS>> ls_seq;
+    std::vector<std::map<std::tuple<int, int64_t, int64_t>, sx::command_graph<sx::graph_state::executable>>> graphs_seq;
 };
 
 }  // namespace
@@ -379,6 +383,10 @@ struct Ds41Tp::Impl {
     bool lazy = false;
     int64_t rows_done[3] = { 0, 0, 0 };
     std::function<bool(int, size_t)> make_room;   // the tier: room for that many more bytes on that GPU
+    // larry (batch slots, patch-seqs-tp.py): NS conversations, `seq` bound; the others' rows_done / draft maps here
+    int NS = 1, seq = 0;
+    std::vector<std::array<int64_t, 3>> rows_done_seq;
+    std::vector<std::vector<int>> d_filled_seq;
 
     ~Impl() {
         for (auto & c : cards) { try { c->q.wait(); } catch (...) {} }
@@ -397,6 +405,8 @@ struct Ds41Tp::Impl {
             if (c->peer_blk) sycl::free(c->peer_blk, c->q);
             ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
             for (auto & s : c->ls) { s.vcomp.release(zc); s.vidxk.release(zc); }
+            for (auto & v : c->ls_seq) for (auto & s : v) { s.vcomp.release(zc); s.vidxk.release(zc); }
+            for (auto & g : c->graphs_seq) g.clear();
             c->ar.release();
         }
         if (hin) sycl::free(hin, ctx);
@@ -834,13 +844,24 @@ struct Ds41Tp::Impl {
         c.lgt = dalloc<float>(c, n * (size_t) c.vk);
         c.seq = dalloc<int32_t>(c, tpk::MAXS); c.err = dalloc<int32_t>(c, 4);
         if (stamp_l >= -1) c.stamps = dalloc<uint64_t>(c, stamp_l == -1 ? (size_t) NST * NL : NST);
-        // persistent state
-        c.ls.assign((size_t) NL, {});
+        // persistent state (larry, batch slots: one set a conversation - conversation 0's in c.ls, the others' in
+        // c.ls_seq; the per-pass scratch sel / selm is conversation 0's for all)
+        c.ls_seq.assign((size_t) NS, {});
+        c.graphs_seq.assign((size_t) NS, {});
+        for (int q = 0; q < NS; ++q) {
+        std::vector<LS> & lsq = q == 0 ? c.ls : c.ls_seq[(size_t) q];
+        const std::vector<Ds41TpLayerState> * stq = q == 0 ? &hooks.state :
+            (size_t) q - 1 < hooks.seq_state.size() ? &hooks.seq_state[(size_t) q - 1] : nullptr;
+        if (c.rank == 0 && !hooks.state.empty() && (!stq || stq->size() < (size_t) NL)) {
+            err = "tp: conversation " + std::to_string(q) + ": the engine gave no state for it";
+            return false;
+        }
+        lsq.assign((size_t) NL, {});
         for (int l = 0; l < NL; ++l) {
-            LS & s = c.ls[(size_t) l];
+            LS & s = lsq[(size_t) l];
             const LInfo & L = li[(size_t) l];
             if (c.rank == 0 && !hooks.state.empty()) {   // the dense half's own tensors on card 0
-                const Ds41TpLayerState & e = hooks.state[(size_t) l];
+                const Ds41TpLayerState & e = (*stq)[(size_t) l];
                 s.raw = e.raw; s.comp = e.comp; s.idxk = e.idxk; s.st_kv = e.st_kv; s.st_sc = e.st_sc;
                 if (!s.raw || (L.kv_src && (!s.comp || !s.idxk)) || (L.kv_src && L.ratio == 2 && (!s.st_kv || !s.st_sc))) {
                     err = "tp: layer " + std::to_string(l) + ": the engine's state is missing a tensor";
@@ -869,9 +890,13 @@ struct Ds41Tp::Impl {
                     if (L.ratio == 2) { s.st_kv = dalloc<float>(c, (size_t) (2 * DH)); s.st_sc = dalloc<float>(c, (size_t) (2 * DH)); }
                 }
             }
-            if (L.idx_src) { s.sel = dalloc<int32_t>(c, n * (size_t) ITOP); s.selm = dalloc<float>(c, n * (size_t) ITOP); }
+            if (L.idx_src) {
+                if (q == 0) { s.sel = dalloc<int32_t>(c, n * (size_t) ITOP); s.selm = dalloc<float>(c, n * (size_t) ITOP); }
+                else { s.sel = c.ls[(size_t) l].sel; s.selm = c.ls[(size_t) l].selm; }
+            }
         }
         if (!err.empty()) return false;
+        }
         // peer-written buffers (SYCL USM: peers' copy engines write them)
         const size_t ar_f = (size_t) N * n * D, eng_f = (size_t) N * n * RMAX, fl = (size_t) N * tpk::MAXS;
         const size_t bytes = (ar_f * 2 + eng_f) * 4 + fl * 4;
@@ -1457,6 +1482,9 @@ struct Ds41Tp::Impl {
         int32_t * tok2 = nullptr; float * conf2 = nullptr; // [8] STRATA_TP_DRAFT_MK_CHECK: the old chain's
         uint64_t * stamps = nullptr;                       // STRATA_TP_DRAFT_STAMP: the clock after each phase
         std::map<int, sx::command_graph<sx::graph_state::executable>> graphs;
+        // larry (batch slots, patch-seqs-tp.py): the other conversations' rings and graphs (swapped by bind_seq)
+        std::vector<std::array<float *, 3>> ring_seq;
+        std::vector<std::map<int, sx::command_graph<sx::graph_state::executable>>> graphs_seq;
     };
     // STRATA_TP_DRAFT_STAMP=1 (diagnostic): the sub-group clock after each phase of a draft step on every card (inputs,
     // feed, the three blocks, the LM head, the Markov chain); per 64 drafting steps each card's average phase times
@@ -1593,6 +1621,11 @@ struct Ds41Tp::Impl {
     bool draft_buffers(Card & c, DCard & d) {
         const size_t n = (size_t) NMAX;
         for (int b = 0; b < 3; ++b) d.ring[b] = dalloc<float>(c, (size_t) (DWIN * DH));
+        d.ring_seq.assign((size_t) NS, { nullptr, nullptr, nullptr });   // (larry, batch slots: a window a conversation)
+        d.graphs_seq.assign((size_t) NS, {});
+        for (int q = 0; q < NS; ++q)
+            if (q != seq)
+                for (int b = 0; b < 3; ++b) d.ring_seq[(size_t) q][(size_t) b] = dalloc<float>(c, (size_t) (DWIN * DH));
         d.tap = dalloc<float>(c, n * 3 * D);
         d.frows = dalloc<float>(c, (size_t) DKMAX * 3 * D);
         d.din = dalloc<int32_t>(c, DL.words);
@@ -2117,11 +2150,44 @@ struct Ds41Tp::Impl {
     // the VRAM a rank's lazy replicas have not mapped yet (what the tier's flex region can hold meanwhile)
     size_t deferred(const Card & c) const {
         size_t b = 0;
-        for (const LS & s : c.ls) {
-            if (s.vcomp.va) b += s.vcomp.cap - s.vcomp.mapped();
-            if (s.vidxk.va) b += s.vidxk.cap - s.vidxk.mapped();
-        }
+        auto add = [&](const std::vector<LS> & v) {
+            for (const LS & s : v) {
+                if (s.vcomp.va) b += s.vcomp.cap - s.vcomp.mapped();
+                if (s.vidxk.va) b += s.vidxk.cap - s.vidxk.mapped();
+            }
+        };
+        add(c.ls);
+        for (const auto & v : c.ls_seq) add(v);   // (larry, batch slots: every conversation's)
         return b;
+    }
+    // larry (batch slots, patch-seqs-tp.py): conversation s's state, graphs, rows_done and draft rings / window in
+    // place of the bound one's (swaps: the bound one's go to its own entries)
+    bool bind_seq(int s) {
+        if (s < 0 || s >= NS) { err = "tp: no conversation " + std::to_string(s); return false; }
+        if (s == seq) return true;
+        for (auto & cp : cards) {
+            Card & c = *cp;
+            std::swap(c.ls, c.ls_seq[(size_t) seq]);
+            std::swap(c.ls, c.ls_seq[(size_t) s]);
+            std::swap(c.graphs, c.graphs_seq[(size_t) seq]);
+            std::swap(c.graphs, c.graphs_seq[(size_t) s]);
+        }
+        for (auto & d : dc) {
+            if (d.ring_seq.size() != (size_t) NS) continue;
+            for (int b = 0; b < 3; ++b) {
+                std::swap(d.ring[b], d.ring_seq[(size_t) seq][(size_t) b]);
+                std::swap(d.ring[b], d.ring_seq[(size_t) s][(size_t) b]);
+            }
+            std::swap(d.graphs, d.graphs_seq[(size_t) seq]);
+            std::swap(d.graphs, d.graphs_seq[(size_t) s]);
+        }
+        rows_done_seq[(size_t) seq] = { rows_done[0], rows_done[1], rows_done[2] };
+        for (int r = 0; r < 3; ++r) rows_done[r] = rows_done_seq[(size_t) s][(size_t) r];
+        std::swap(d_filled, d_filled_seq[(size_t) seq]);
+        std::swap(d_filled, d_filled_seq[(size_t) s]);
+        if (d_filled.empty() && !d_filled_seq[(size_t) seq].empty()) d_filled.assign(DWIN, -1);   // its first draft
+        seq = s;
+        return true;
     }
     // the cards' free VRAM (GiB; what the driver reports: the xe driver spills an over-commit into host RAM)
     std::string free_str() const {
@@ -2137,6 +2203,7 @@ struct Ds41Tp::Impl {
     size_t lazy_mapped(const Card & c) const {
         size_t b = 0;
         for (const LS & s : c.ls) b += s.vcomp.mapped() + s.vidxk.mapped();
+        for (const auto & v : c.ls_seq) for (const LS & s : v) b += s.vcomp.mapped() + s.vidxk.mapped();   // (batch slots)
         return b;
     }
     void caps(int pos0, int n, int64_t out[3]) const {
@@ -2150,6 +2217,9 @@ struct Ds41Tp::Impl {
 };
 
 Ds41Tp::Ds41Tp() : p_(std::make_unique<Impl>()) {}
+bool Ds41Tp::bind_seq(int s) { return p_->bind_seq(s); }
+int Ds41Tp::n_seqs() const { return p_->NS; }
+int Ds41Tp::seq() const { return p_->seq; }
 Ds41Tp::~Ds41Tp() = default;
 int64_t Ds41Tp::vocab() const { return p_->V; }
 int64_t Ds41Tp::n_embd() const { return p_->D; }
@@ -2243,6 +2313,9 @@ bool Ds41Tp::init(const Ds41TpConfig & cfg, const Ds41TpHooks & hooks, std::stri
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
     im.lazy = env_on("STRATA_TP_LAZY_KV", true) && cfg.n_cards > 1;
     for (int r = 1; r <= 2; ++r) im.rows_done[r] = im.lazy ? std::min<int64_t>(im.cmax[r], 1024) : im.cmax[r];
+    im.NS = std::max(1, std::min(8, cfg.n_seqs));   // larry (batch slots, patch-seqs-tp.py)
+    im.rows_done_seq.assign((size_t) im.NS, { im.rows_done[0], im.rows_done[1], im.rows_done[2] });
+    im.d_filled_seq.assign((size_t) im.NS, {});
     if (im.D != 5120 || G.hc != tpk::HC || im.DH != tpdec::DD || im.ND != 64 || im.IH != tpdec::LIH || im.ID != tpdec::LID ||
         im.ITOP > 512 || im.CBS != 8 || im.NFF % QK || im.ER % QK || im.V % 16 || (im.EC * im.ED) % QK || cfg.ctx_max % 256 ||
         im.N < 1 || im.N > 8 || im.NMAX < 1 || im.NMAX > 7) {
@@ -2634,7 +2707,10 @@ bool Ds41Tp::attach_experts(const void * rtab, const volatile uint64_t * rtab_ve
     const tpk::TpExp * t = (const tpk::TpExp *) rtab;
     for (int64_t i = 0; i < (int64_t) im.NL * im.NE; ++i)
         if (t[i].owner >= im.N) { im.err = "tp: an expert lives on a card past the TP ranks (the tier's cards must be the TP cards)"; return false; }
-    for (auto & c : im.cards) c->graphs.clear();   // recorded without the expert part
+    for (auto & c : im.cards) {   // recorded without the expert part (larry, batch slots: every conversation's)
+        c->graphs.clear();
+        for (auto & g : c->graphs_seq) g.clear();
+    }
     im.rtab_seen = ~(uint64_t) 0;
     im.refresh_rtab();
     for (auto & c : im.cards) c->q.wait();
@@ -2643,14 +2719,19 @@ bool Ds41Tp::attach_experts(const void * rtab, const volatile uint64_t * rtab_ve
     if (env_on("STRATA_TP_PRERECORD", true)) {
         const double t0 = now_us();
         int nk = 0;
-        for (int n = 1; n <= im.NMAX; ++n)
-            for (int taps = 0; taps < 2; ++taps) {
-                Impl::PassK P;
-                P.n = n;
-                im.caps(0, n, P.cap);
-                if (!im.record(P, std::make_tuple(n * 2 + taps, P.cap[1], P.cap[2]))) return false;
-                ++nk;
-            }
+        const int s0 = im.seq;
+        for (int q = 0; q < im.NS; ++q) {   // (larry, batch slots: each conversation's own - they bake its state)
+            if (!im.bind_seq(q)) return false;
+            for (int n = 1; n <= im.NMAX; ++n)
+                for (int taps = 0; taps < 2; ++taps) {
+                    Impl::PassK P;
+                    P.n = n;
+                    im.caps(0, n, P.cap);
+                    if (!im.record(P, std::make_tuple(n * 2 + taps, P.cap[1], P.cap[2]))) return false;
+                    ++nk;
+                }
+        }
+        if (!im.bind_seq(s0)) return false;
         im.pf_rec = 0;
         std::fprintf(stderr, "tp: %d pass graphs recorded a card in %.2f s%s\n", nk, (now_us() - t0) / 1e6, im.free_str().c_str());
     }
@@ -2845,7 +2926,10 @@ bool Ds41Tp::draft_init(const std::string & sidecar, int n_used, int noise_id, i
     }
     // the trunk's DSpark passes now also write main_hidden on every card (their graphs are recorded again)
     im.d_tap = true;
-    for (auto & c : im.cards) c->graphs.clear();
+    for (auto & c : im.cards) {   // (larry, batch slots: every conversation's)
+        c->graphs.clear();
+        for (auto & g : c->graphs_seq) g.clear();
+    }
     std::fprintf(stderr, "tp draft: %s on %d cards, %.2f GiB a card (%lld experts a block, top-%d), sums by %s, %.1f s%s\n", sidecar.c_str(), im.N,
                  im.d_bytes / 1073741824.0, (long long) im.DNE, im.DNU, im.d_push ? "P2P stores" : "copies", (now_us() - t0) / 1e6, im.free_str().c_str());
     return true;

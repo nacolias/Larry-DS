@@ -305,20 +305,37 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     return true;
 }
 
-void Ds41Engram::set_token(int64_t pos, int tid) {
-    if (pos >= (int64_t) hist_.size()) hist_.resize((size_t) pos + 1024, 0);
-    // larry (vision, patch-vision-engine.py): tid < 0 = an image position - model.py's DEAD: no n-gram crosses it
-    hist_[(size_t) pos] = tid < 0 ? (int64_t) -1 : (int64_t) g_->engram_token_map[(size_t) tid];
+void Ds41Engram::set_seqs(int n, int64_t ctx) {
+    nseq_ = std::max(1, n);
+    hstride_ = nseq_ > 1 ? ctx : 0;
+    hbase_ = 0;
+    if (nseq_ > 1) hist_.assign((size_t) (nseq_ * ctx), 0);
 }
 
-void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const {
+void Ds41Engram::bind_seq(int s) {
+    if (s >= 0 && s < nseq_) hbase_ = (int64_t) s * hstride_;
+}
+
+void Ds41Engram::set_token(int64_t pos, int tid) {
+    if (hstride_ > 0) {   // larry (batch slots): the bound conversation's region, sized at set_seqs
+        if (pos < 0 || pos >= hstride_) return;
+    } else if (pos >= (int64_t) hist_.size()) {
+        hist_.resize((size_t) pos + 1024, 0);
+    }
+    // larry (vision, patch-vision-engine.py): tid < 0 = an image position - model.py's DEAD: no n-gram crosses it
+    hist_[(size_t) (hbase_ + pos)] = tid < 0 ? (int64_t) -1 : (int64_t) g_->engram_token_map[(size_t) tid];
+}
+
+void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const { hash_at(hbase_, pos, e, out); }
+
+void Ds41Engram::hash_at(int64_t base, int64_t pos, int e, int64_t * out) const {
     const int64_t N = g_->engram_ngram, H = g_->engram_heads;
     int64_t tok[8];
     // the look-back stops at the sequence's start and (larry, vision) at an image position: pad from there on
     bool blocked = false;
     for (int64_t k = 0; k < N; ++k) {
-        if (pos - k < 0 || hist_[(size_t) (pos - k)] < 0) blocked = true;
-        tok[k] = blocked ? g_->engram_pad : hist_[(size_t) (pos - k)];
+        if (pos - k < 0 || hist_[(size_t) (base + pos - k)] < 0) blocked = true;
+        tok[k] = blocked ? g_->engram_pad : hist_[(size_t) (base + pos - k)];
     }
     const int64_t * mult = &g_->engram_mult[(size_t) (e * N)];
     int64_t rolling = tok[0] * mult[0];
@@ -633,12 +650,13 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::prefetch(int64_t pos0, int n, std
     // hashing / sorting a 16K batch is ~0.1 s: its own thread plans it and waits its reads (hist_ is not written until
     // the caller's wait(): the dense half waits for it before its next set_token)
     Batch * bp = b.get();
-    b->th = std::thread([this, bp, pos0, n] { prefetch_run(bp, pos0, n); });
+    const int64_t hb = hbase_;   // larry (batch slots): the planner hashes this conversation's history, whatever is bound later
+    b->th = std::thread([this, bp, pos0, n, hb] { prefetch_run(bp, pos0, n, hb); });
     (void) err;
     return b;
 }
 
-void Ds41Engram::prefetch_run(Batch * b, int64_t pos0, int n) {
+void Ds41Engram::prefetch_run(Batch * b, int64_t pos0, int n, int64_t hbase) {
     const int64_t nel = (int64_t) tables_.size();
     const int64_t cols = cols_, dim = dim_, srsz = dim / 32, m = n * cols;
     b->uniq.resize((size_t) nel);
@@ -646,7 +664,7 @@ void Ds41Engram::prefetch_run(Batch * b, int64_t pos0, int n) {
     std::vector<uint32_t> r((size_t) m);
     for (int64_t e = 0; e < nel; ++e) {
         const Table & T = tables_[(size_t) e];
-        for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) (t * cols)]);
+        for (int64_t t = 0; t < n; ++t) hash_at(hbase, pos0 + t, (int) e, &ids[(size_t) (t * cols)]);
         for (int64_t i = 0; i < m; ++i) r[(size_t) i] = (uint32_t) ids[(size_t) i];
         std::sort(r.begin(), r.end());
         auto & uq = b->uniq[(size_t) e];

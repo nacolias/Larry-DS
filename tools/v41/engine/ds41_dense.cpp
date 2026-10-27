@@ -220,12 +220,20 @@ struct Ds41Dense::Impl {
     int64_t wr_lo = 0, wr_hi = INT64_MAX;
     bool wr_changed = true;
     void wrote(int64_t lo, int64_t hi) { wr_lo = std::min(wr_lo, lo); wr_hi = std::max(wr_hi, hi); wr_changed = true; }
-    struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; };
+    // (larry, batch slots: by layer l and kind k - 0 raw_snap, 1 st_kv_snap, 2 st_sc_snap, 3 comp, 4 idxk - so a parked
+    // conversation comes back into whichever conversation is bound)
+    struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; int l = -1, k = -1; };
     // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites; larry: a pool of
     // slots, grown on demand (patch-parkpool.py)
     struct ParkSlot { std::vector<ParkedRows> rows; int pos = -1; int64_t n = 0; size_t bytes = 0; };
     std::vector<ParkSlot> pk;
     std::vector<Layer> ly;
+    // larry (batch slots, patch-seqs-dense.py): every conversation's state tensors (per layer: raw, raw_snap, comp, idxk,
+    // st_kv, st_sc, st_kv_snap, st_sc_snap - the Layer members are the bound one's), snapshot position, written range
+    struct SeqT { std::vector<std::array<ggml_tensor *, 8>> t; int snap_pos = -1; int64_t wr_lo = 0, wr_hi = INT64_MAX; bool wr_changed = true; };
+    std::vector<SeqT> seqs;
+    int seq = 0;
+    std::vector<int> kv_unit_seq;   // the conversation of each kv_units entry
 
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
     ggml_context * ictx = nullptr;
@@ -305,8 +313,8 @@ struct Ds41Dense::Impl {
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
     std::vector<uint8_t> pf_meta;         // node structs of a pass graph with n > 1 (built per pass)
     Allo allo_dec, allo_pass;
-    struct GKey { int il, kind; int64_t cap, n; bool operator<(const GKey & o) const {
-        return std::tie(il, kind, cap, n) < std::tie(o.il, o.kind, o.cap, o.n); } };
+    struct GKey { int il, kind; int64_t cap, n; int seq; bool operator<(const GKey & o) const {   // (larry: + the conversation)
+        return std::tie(il, kind, cap, n, seq) < std::tie(o.il, o.kind, o.cap, o.n, o.seq); } };
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
@@ -1816,6 +1824,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // batch is ~1.4M random reads: at 32 a cold 31.6K prompt waited ~4 s for its first batch's rows)
     const int eng_threads = std::getenv("STRATA_ENGRAM_THREADS") ? std::atoi(std::getenv("STRATA_ENGRAM_THREADS")) : cfg.engram_threads;
     if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, eng_threads, err)) return false;
+    if (cfg.n_seqs > 1) im.engram.set_seqs(cfg.n_seqs, cfg.ctx_max);   // larry (batch slots): a history a conversation
 
     // layers
     im.ly.resize((size_t) im.nl);
@@ -1836,7 +1845,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         return false;
     }
     const ggml_type kvt = cfg.kv_type >= 0 ? (ggml_type) cfg.kv_type : cfg.act_quant ? GGML_TYPE_BF16 : GGML_TYPE_F32;
-    ggml_init_params sp = { ggml_tensor_overhead() * 512, nullptr, true };
+    ggml_init_params sp = { ggml_tensor_overhead() * (size_t) (512 + 384 * std::max(0, cfg.n_seqs - 1)), nullptr, true };
     im.sctx = ggml_init(sp);
     auto T = [&](ggml_type t, std::initializer_list<int64_t> ne) {
         const int64_t * d = ne.begin();
@@ -1871,18 +1880,35 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
             }
         }
     }
+    // larry (batch slots, patch-seqs-dense.py): conversation 0's tensors are the Layer members; the others' the same
+    // shapes, from the same context (allocated below with them)
+    im.seqs.assign((size_t) std::max(1, cfg.n_seqs), {});
+    for (size_t q = 0; q < im.seqs.size(); ++q) {
+        auto & S = im.seqs[q];
+        S.t.assign((size_t) im.nl, {});
+        for (int64_t l = 0; l < im.nl; ++l) {
+            auto & L = im.ly[(size_t) l];
+            auto & a = S.t[(size_t) l];
+            if (q == 0) { a = { L.raw, L.raw_snap, L.comp, L.idxk, L.st_kv, L.st_sc, L.st_kv_snap, L.st_sc_snap }; continue; }
+            auto dup = [&](ggml_tensor * t) { return t ? ggml_dup_tensor(im.sctx, t) : nullptr; };
+            a = { dup(L.raw), dup(L.raw_snap), dup(L.comp), dup(L.idxk), dup(L.st_kv), dup(L.st_sc), dup(L.st_kv_snap), dup(L.st_sc_snap) };
+        }
+    }
     // larry (cfg.kv_alloc, STRATA_DENSE_LAZY_KV): the compressed KV and indexer keys in the caller's virtual memory,
     // mapped as the context grows - a 1M context's rows stay out of card 0's VRAM until a conversation reaches them
+    // (batch slots: every conversation's units, each mapped as its own conversation grows)
     if (im.sycl && im.cfg.kv_alloc) {
         const ggml_backend_buffer_type_t bt = ggml_backend_get_default_buffer_type(im.backend);
         std::vector<size_t> ub, spare, uo;
-        for (auto & L : im.ly)
-            for (ggml_tensor * t : { L.comp, L.idxk })
-                if (t) {
-                    im.kv_units.push_back({ t, (int) L.ratio });
-                    ub.push_back(ggml_backend_buft_get_alloc_size(bt, t));
-                    spare.push_back((size_t) (t->ne[1] - 1) * t->nb[1]);   // the spare row (open compressor groups)
-                }
+        for (size_t q = 0; q < im.seqs.size(); ++q)
+            for (int64_t l = 0; l < im.nl; ++l)
+                for (ggml_tensor * t : { im.seqs[q].t[(size_t) l][2], im.seqs[q].t[(size_t) l][3] })
+                    if (t) {
+                        im.kv_units.push_back({ t, (int) im.ly[(size_t) l].ratio });
+                        im.kv_unit_seq.push_back((int) q);
+                        ub.push_back(ggml_backend_buft_get_alloc_size(bt, t));
+                        spare.push_back((size_t) (t->ne[1] - 1) * t->nb[1]);   // the spare row (open compressor groups)
+                    }
         if (!im.kv_units.empty())
             if (ggml_backend_buffer_t kb = im.cfg.kv_alloc(ub, spare, uo)) {
                 uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(kb);
@@ -1894,14 +1920,15 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
                     }
                 im.kv_buf = kb;
             }
-        if (!im.kv_buf) im.kv_units.clear();
+        if (!im.kv_buf) { im.kv_units.clear(); im.kv_unit_seq.clear(); }
     }
     im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
     if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
     ggml_backend_buffer_clear(im.sbuf, 0);
     // the ratio-2 state scores start at -1e30 (an unwritten state gets softmax weight 0); sel = 0 (a valid row)
-    for (auto & L : im.ly)
-        if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
+    for (auto & S : im.seqs)   // (larry, batch slots: every conversation's)
+        for (auto & a : S.t)
+            if (ggml_tensor * sc = a[5]) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(sc, v.data(), 0, v.size() * 4); }
     // inputs
     ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
     im.ictx = ggml_init(ipp);
@@ -2345,7 +2372,7 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     const bool cached = n == 1 || (pass_cache && n <= 8);
     std::vector<uint8_t> meta;
     if (cached) {
-        const Impl::GKey key { -1, 0, 0, (int64_t) n };
+        const Impl::GKey key { -1, 0, 0, (int64_t) n, im.seq };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_init(im, im.gctx, n)).first;
         gf = it->second;
@@ -2701,7 +2728,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const bool halves = cached && tp_mode == 2 && im.sycl && im.oproj_hook && hc_fuse && n <= hc_maxn && n <= im.o_att->ne[1];
     ggml_cgraph * gf2 = nullptr;
     if (halves) {
-        const Impl::GKey ka { il, 11, cap, (int64_t) n }, kb { il, 12, cap, (int64_t) n };
+        const Impl::GKey ka { il, 11, cap, (int64_t) n, im.seq }, kb { il, 12, cap, (int64_t) n, im.seq };
         auto ia = im.graphs.find(ka);
         if (ia == im.graphs.end()) ia = im.graphs.emplace(ka, build_attn(im, im.gctx, il, n, 0, !split_shexp, 2048, true, 1)).first;
         auto ib = im.graphs.find(kb);
@@ -2709,7 +2736,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         gf = ia->second;
         gf2 = ib->second;
     } else if (cached) {
-        const Impl::GKey key { il, im.fin_pending ? 13 : 1, cap, (int64_t) n };
+        const Impl::GKey key { il, im.fin_pending ? 13 : 1, cap, (int64_t) n, im.seq };
         auto it = im.graphs.find(key);
         // a kept graph is a few hundred nodes: room for 2048 (the gctx holds hundreds of them: layers x caps x widths)
         if (it == im.graphs.end())
@@ -2752,7 +2779,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     double ts = 0;
     auto shexp = [&]() -> bool {   // queued now: it runs on this card while the tier's cards run the routed experts
         if (!(cached && split_shexp)) return true;
-        const Impl::GKey key { il, 7, 0, (int64_t) n };
+        const Impl::GKey key { il, 7, 0, (int64_t) n, im.seq };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_shexp(im, im.gctx, il, n)).first;
         const double ts0 = g_decprof_on ? dprof_now() : 0;
@@ -2786,7 +2813,7 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
     if (!fin_flush(im)) return false;
     if (im.n != 1 || n_top < 1 || n_top > 16) return false;
-    const Impl::GKey key { il, 3, 0, 1 };
+    const Impl::GKey key { il, 3, 0, 1, im.seq };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
         ggml_tensor * o = nullptr;
@@ -3108,12 +3135,42 @@ bool Ds41Dense::restore() {
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
+// larry (batch slots, patch-seqs-dense.py)
+bool Ds41Dense::bind_seq(int s) {
+    Impl & im = *p_;
+    if (s < 0 || (size_t) s >= im.seqs.size()) { im.err = "no conversation slot " + std::to_string(s); return false; }
+    if (s == im.seq) return true;
+    ggml_backend_synchronize(im.backend);
+    Impl::SeqT & O = im.seqs[(size_t) im.seq];
+    O.snap_pos = im.snap_pos; O.wr_lo = im.wr_lo; O.wr_hi = im.wr_hi; O.wr_changed = im.wr_changed;
+    const Impl::SeqT & N = im.seqs[(size_t) s];
+    for (size_t l = 0; l < im.ly.size(); ++l) {
+        Impl::Layer & L = im.ly[l];
+        const auto & a = N.t[l];
+        L.raw = a[0]; L.raw_snap = a[1]; L.comp = a[2]; L.idxk = a[3];
+        L.st_kv = a[4]; L.st_sc = a[5]; L.st_kv_snap = a[6]; L.st_sc_snap = a[7];
+    }
+    im.snap_pos = N.snap_pos; im.wr_lo = N.wr_lo; im.wr_hi = N.wr_hi; im.wr_changed = N.wr_changed;
+    im.span_memo_pos0 = -1;   // the span inputs' memo is the other conversation's
+    im.engram.bind_seq(s);
+    im.seq = s;
+    return true;
+}
+
+int Ds41Dense::n_seqs() const { return (int) std::max<size_t>(1, p_->seqs.size()); }
+int Ds41Dense::seq() const { return p_->seq; }
+
 void Ds41Dense::kv_bytes_for(int64_t positions, std::vector<size_t> & bytes) const {
     const Impl & im = *p_;
     bytes.clear();
-    for (const auto & u : im.kv_units) {   // row r of a ratio-k source holds a position >= r * k: rows [0, p / k] + a margin
+    for (size_t i = 0; i < im.kv_units.size(); ++i) {   // row r of a ratio-k source holds a position >= r * k: rows [0, p / k] + a margin
+        const auto & u = im.kv_units[i];
+        if (i < im.kv_unit_seq.size() && im.kv_unit_seq[i] != im.seq) { bytes.push_back(0); continue; }   // (batch slots)
         const int64_t k = u.second == 2 ? 2 : 1;
-        const int64_t rows = std::min<int64_t>(u.first->ne[1] - 1, positions / k + 2);
+        // larry, patch-kvbucket.py: the readers' cap bucket, not the positions - every scan reads next_pow2 rows
+        // (span_pass_caps, the TP core's caps and its replica growth / state sync from card 0); positions + 32K died at
+        // 524,288 where both ratios' buckets became the whole tensor (DEVICE_LOST, 2026-10-24)
+        const int64_t rows = std::min<int64_t>(u.first->ne[1] - 1, next_pow2(std::max<int64_t>(1024, positions / k + 2)) + 4);
         bytes.push_back((size_t) rows * u.first->nb[1]);
     }
 }
@@ -3135,22 +3192,29 @@ bool Ds41Dense::park(int64_t positions, int slot) {
     Impl::ParkSlot & S = im.pk[slot];
     S.rows.clear();
     S.bytes = 0;
+    int pl = 0, pkind = 0;   // (larry, batch slots: the region's layer and kind)
     auto put = [&](ggml_tensor * t, size_t off, size_t n) {
-        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
+        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n), pl, pkind };
         ggml_backend_tensor_get(t, r.b.data(), off, n);
         S.rows.push_back(std::move(r));
         S.bytes += n;
     };
     for (auto & L : im.ly) {
-        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+        pkind = 0;
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap }) {
             if (t) put(t, 0, ggml_nbytes(t));
-        for (ggml_tensor * t : { L.comp, L.idxk }) {
-            if (!t) continue;
-            const int64_t rows = t->ne[1];
-            const int64_t n = park_rows(t, L.ratio, positions);
-            put(t, 0, (size_t) n * t->nb[1]);
-            put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
+            ++pkind;
         }
+        for (ggml_tensor * t : { L.comp, L.idxk }) {
+            if (t) {
+                const int64_t rows = t->ne[1];
+                const int64_t n = park_rows(t, L.ratio, positions);
+                put(t, 0, (size_t) n * t->nb[1]);
+                put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
+            }
+            ++pkind;
+        }
+        ++pl;
     }
     S.pos = im.snap_pos;
     S.n = positions;
@@ -3178,9 +3242,17 @@ bool Ds41Dense::unpark(int slot) {
     if (slot < 0 || (size_t) slot >= im.pk.size() || im.pk[slot].pos < 0) return false;
     Impl::ParkSlot & S = im.pk[slot];
     ggml_backend_synchronize(im.backend);
-    for (auto & r : S.rows) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    for (auto & r : S.rows) {   // (larry, batch slots: into the BOUND conversation's tensor of that layer and kind)
+        ggml_tensor * t = r.t;
+        if (r.l >= 0 && (size_t) r.l < im.ly.size()) {
+            const Impl::Layer & L = im.ly[(size_t) r.l];
+            ggml_tensor * const by_kind[5] = { L.raw_snap, L.st_kv_snap, L.st_sc_snap, L.comp, L.idxk };
+            if (r.k >= 0 && r.k < 5 && by_kind[r.k]) t = by_kind[r.k];
+        }
+        ggml_backend_tensor_set(t, r.b.data(), r.off, r.b.size());
+    }
     ggml_backend_synchronize(im.backend);
-    im.wrote(0, 2 * (S.n + 1));   // the parked rows (rows [0, positions + 1] of either ratio)
+    im.wrote(0, S.n + 4);   // the parked positions (patch-kvbucket.py: was 2 * (positions + 1) - past card 0's lazy map)
     im.snap_pos = S.pos;
     drop_park(slot);
     return true;

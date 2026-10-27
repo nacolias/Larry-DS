@@ -40,6 +40,10 @@ public:
     int64_t row_dim() const { return dim_; }                    ///< 256
     /// Record token `tid` at position `pos` (history for the hashes; positions may be rewritten).
     void set_token(int64_t pos, int tid);
+    /// larry (batch slots, patch-seqs-dense.py): `n` conversations' histories, `ctx` positions each, sized now (a
+    /// prefetch's planner thread reads the history: no resize under it); bind_seq(s) = the one set_token / hash use
+    void set_seqs(int n, int64_t ctx);
+    void bind_seq(int s);
     /// Hash ids of the n-grams ending at `pos` for Engram slot `e` (0 = layer 1, 1 = layer 14): out[cols].
     void hash(int64_t pos, int e, int64_t * out) const;
     /// Rows for tokens at positions pos0..pos0+n-1, every Engram slot: out[e] = n * cols * dim floats (token-major).
@@ -97,6 +101,9 @@ private:
     uint64_t cache_hits_ = 0, cache_miss_ = 0;
     std::mutex cache_mu_;
     std::vector<int64_t> hist_;      // compressed ids by position
+    int64_t hbase_ = 0, hstride_ = 0;   // larry (batch slots): the bound conversation's region of hist_ (stride 0: one)
+    int nseq_ = 1;
+    void hash_at(int64_t base, int64_t pos, int e, int64_t * out) const;
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
     uint64_t bytes_ = 0, reads_ = 0;
@@ -116,7 +123,7 @@ private:
         void done() { std::lock_guard<std::mutex> lk(mu); if (--pending == 0) cv.notify_all(); }
     };
     void pump();
-    void prefetch_run(Batch * b, int64_t pos0, int n);   // larry: prefetch()'s planning + reads, on its own thread
+    void prefetch_run(Batch * b, int64_t pos0, int n, int64_t hbase);   // larry: prefetch()'s planning + reads, on its own thread
     void task_run(const std::shared_ptr<Task> & t);
     void fire(const std::shared_ptr<Task> & t, int64_t parts);
     void run_sync(const std::shared_ptr<Task> & t, int64_t parts);

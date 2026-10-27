@@ -95,6 +95,7 @@ struct Args {
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
 #endif
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
+    int batch_slots = 1;   // larry (patch-slots-serve.py): --batch-slots N (Strata's --batch N): the slot protocol
     int threads = 0, prefill_chunk = 0, prompt_batch = 16384;  // prompt_batch: layer-major batch B (0 = the chunk path); larry: 16384 (one pipelined batch up to 16K)
     int64_t ctx = 0;
     float temp = 0.0f;
@@ -197,6 +198,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--prompt-batch") a.prompt_batch = std::atoi(next().c_str());
+        else if (k == "--batch-slots" || k == "--batch") a.batch_slots = std::max(1, std::min(8, std::atoi(next().c_str())));
         // prompt experts on MMQ (int8 tensor cores; PTQ1_0 through its lossless Q2_0 transcode) - DEFAULT since
         // 2026-10-12: 8K prompt 219-220 -> 244-248 tok/s, 4096 code ppl 2.3799 -> 2.3790, KL 7.6e-3, deterministic
         // (8K --dump-last md5 ee31507a0e88; the MMVQ path's was 4d229102872a).  --no-chunk-mmq = the MMVQ kernels.
@@ -421,6 +423,10 @@ int main(int argc, char ** argv) {
     dc.backend = be;
     dc.n_threads = a.threads > 0 ? a.threads : 8;
     dc.ctx_max = ctx;
+    // larry (batch slots, patch-seqs-gen.py): STRATA_SERVE_SEQS conversations resident side by side (--serve only)
+    const int serve_seqs = std::max(a.serve ? a.batch_slots : 1,
+        a.serve && std::getenv("STRATA_SERVE_SEQS") ? std::max(1, std::min(8, std::atoi(std::getenv("STRATA_SERVE_SEQS")))) : 1);
+    dc.n_seqs = serve_seqs;
     // the layer-major batch B: --prompt-batch, capped to the prompt length for a one-shot run (the state tensors hold
     // B columns, so a short prompt must not pay for the flag's full size; --serve sizes for the largest request)
     const int PB = a.prompt_batch > 0 ? (a.serve ? a.prompt_batch : (int) std::min<int64_t>(a.prompt_batch, (int64_t) prompt.size())) : 0;
@@ -462,7 +468,8 @@ int main(int argc, char ** argv) {
     // larry (STRATA_DENSE_LAZY_KV=1, --serve): card 0's KV state mapped as the context grows (Ds41KvMap); declared
     // before the dense half too
     std::unique_ptr<Ds41KvMap> kvmap;
-    int64_t kv_pos = 0;   // positions the map covers
+    int64_t kv_pos = 0;   // positions the map covers (larry, batch slots: the bound conversation's; the others' in kv_pos_seq)
+    std::vector<int64_t> kv_pos_seq;
     // (opt-in: STRATA_TP_PAGE=1, the service's setting.  The p2k prompt row it first seemed to break goes wrong without
     // it too - a chaotic row, not a race: engine1/DESIGN.md)
     if (const char * tpv = std::getenv("STRATA_TP"); tpv && std::atoi(tpv) >= 2 && !ggml_backend_is_cpu(be) &&
@@ -505,9 +512,13 @@ int main(int argc, char ** argv) {
     if (kvmap && dense.kv_lazy()) {   // the first STRATA_DENSE_KV_INIT positions now (the VRAM the tier sees as taken)
         const int64_t init = std::min<int64_t>(ctx, std::getenv("STRATA_DENSE_KV_INIT") ? std::atoll(std::getenv("STRATA_DENSE_KV_INIT")) : 262144);
         std::vector<size_t> kb;
-        dense.kv_bytes_for(init, kb);
-        if (!kvmap->grow(kb, err)) { std::fprintf(stderr, "ds41_generate: KV map: %s\n", err.c_str()); return 1; }
+        for (int q = dense.n_seqs() - 1; q >= 0; --q) {   // (larry, batch slots: every conversation's first positions)
+            if (!dense.bind_seq(q)) { std::fprintf(stderr, "ds41_generate: KV map: no conversation slot %d\n", q); return 1; }
+            dense.kv_bytes_for(init, kb);
+            if (!kvmap->grow(kb, err)) { std::fprintf(stderr, "ds41_generate: KV map: %s\n", err.c_str()); return 1; }
+        }
         kv_pos = init;
+        kv_pos_seq.assign((size_t) dense.n_seqs(), init);
         std::fprintf(stderr, "kv map: card 0's KV state in virtual memory - %lld of %lld positions mapped (%.2f of %.2f GiB)\n",
                      (long long) init, (long long) ctx, kvmap->mapped() / 1073741824.0, kvmap->reserved() / 1073741824.0);
     } else if (kvmap) {
@@ -546,6 +557,7 @@ int main(int argc, char ** argv) {
         tc.gguf = a.model;
         tc.n_cards = tp_n;
         tc.ctx_max = ctx;
+        tc.n_seqs = dense.n_seqs();   // (larry, batch slots)
         tc.act_quant = a.act_quant;
         if (const char * c = std::getenv("STRATA_TP_CACHE")) tc.cache_dir = c;
         Ds41TpHooks th;
@@ -557,6 +569,19 @@ int main(int argc, char ** argv) {
             }
             th.state.push_back({ (float *) p[0], (uint16_t *) p[1], (uint16_t *) p[2], (float *) p[3], (float *) p[4] });
         }
+        for (int q = 1; q < dense.n_seqs(); ++q) {   // larry (batch slots): the other conversations' rank-0 state
+            th.seq_state.emplace_back();
+            if (!dense.bind_seq(q)) { std::fprintf(stderr, "ds41_generate: no conversation slot %d\n", q); return 1; }
+            for (int l = 0; l < n_layer; ++l) {
+                void * p[5] = {};
+                if (!dense.state_ptrs(l, &p[0], &p[1], &p[2], &p[3], &p[4])) {
+                    std::fprintf(stderr, "ds41_generate: STRATA_TP: conversation %d, layer %d: no state\n", q, l);
+                    return 1;
+                }
+                th.seq_state.back().push_back({ (float *) p[0], (uint16_t *) p[1], (uint16_t *) p[2], (float *) p[3], (float *) p[4] });
+            }
+        }
+        if (!dense.bind_seq(0)) return 1;
         th.engram = [&dense](const int * t, int n, int p0, float * const * o) { return dense.engram_rows(t, n, p0, o); };
         th.engram_slot = [&dense](const int * t, int n, int p0, int s, float * o) { return dense.engram_rows_slot(t, n, p0, s, o); };
         // rank 0 reads the dense half's weights in place where they are already in its layout: the reordered (planar)
@@ -1313,6 +1338,9 @@ int main(int argc, char ** argv) {
         ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
         std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
     };
+    // larry (patch-slots-serve.py): set while a BGEN reads its prompt with other slots decoding - their windows run
+    // between the layer-major batches (and between the short path's passes)
+    std::function<void()> feed_seam;
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
@@ -1668,6 +1696,7 @@ int main(int argc, char ** argv) {
                 if (Ds41XeTier::ptl_on()) tier.ptl_dump("batch");   // larry, STRATA_GPU_PTL
 #endif
                 c0 += B;
+                if (feed_seam && c0 < n) feed_seam();   // larry (batch slots): the other slots' windows
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
                 const int m = std::min(NP, n - c0);
@@ -1767,11 +1796,35 @@ int main(int argc, char ** argv) {
             q.pop_front();
             return true;
         };
-        auto stop_pending = [&]() -> bool {
-            std::lock_guard<std::mutex> lk(qm);
-            for (auto it = q.begin(); it != q.end(); ++it)
-                if (*it == "STOP") { q.erase(it); return true; }
-            return false;
+        // larry (patch-slots-serve.py): the command intake - control lines (GEN / GENI / BGEN / BGENI) queue in ctl_q, STOP /
+        // BSTOP / BYIELD / QUIT become flags; poll_cmds(true) blocks until a line comes
+        std::deque<std::string> ctl_q;
+        bool ctl_stop = false, quit_seen = false;
+        std::vector<char> bstop_req;   // BSTOP <slot> (sized with the slots below)
+        auto poll_cmds = [&](bool block) {
+            std::unique_lock<std::mutex> lk(qm);
+            if (block) qc.wait(lk, [&] { return !q.empty() || eof; });
+            while (!q.empty()) {
+                std::string ln = std::move(q.front());
+                q.pop_front();
+                if (ln == "QUIT") quit_seen = true;
+                else if (ln == "STOP") ctl_stop = true;
+                else if (ln.rfind("BSTOP ", 0) == 0) {
+                    const int k = std::atoi(ln.c_str() + 6);
+                    if (k >= 0 && (size_t) k < bstop_req.size()) bstop_req[(size_t) k] = 1;
+                } else if (ln.rfind("BYIELD ", 0) == 0) {
+                    std::fprintf(stderr, "serve: %s - not supported, the read goes on\n", ln.c_str());
+                } else if (!ln.empty()) {
+                    ctl_q.push_back(std::move(ln));
+                }
+            }
+            if (eof && q.empty()) quit_seen = true;
+        };
+        auto stop_pending = [&]() -> bool {   // the control-line request's STOP (the decode loop checks it every round)
+            poll_cmds(false);
+            const bool st = ctl_stop;
+            ctl_stop = false;
+            return st;
         };
         auto is_stop = [&](int t) { return std::find(a.stop.begin(), a.stop.end(), t) != a.stop.end() || t == (int) G.eos; };
         const int ctxv = (int) ctx;
@@ -1927,6 +1980,285 @@ int main(int argc, char ** argv) {
         const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 4;
         long sv_pass = 0, sv_acc = 0;
 #endif
+        // larry (batch slots, patch-seqs-gen.py): STRATA_SERVE_SEQS conversation slots, each holding a conversation on
+        // the cards (the dense half's and the TP core's per-conversation state).  The live variables above are the
+        // bound slot's; the others' wait in seq_stash (swapped in and out, no copies).
+        struct SeqStash {
+            std::vector<int> hist;
+            std::vector<ImgId> img;
+            int snap_len = -1;
+            std::vector<float> snap_logits, snap_seed;
+            int snap_seed_n = 0, dsp_next = -1;
+        };
+        const int n_seq = dense.n_seqs();
+        std::vector<SeqStash> seq_stash((size_t) n_seq);
+        std::vector<long> seq_used((size_t) n_seq, 0);
+        int cur_seq = 0;
+        long seq_tick = 0;
+        auto seq_swap = [&](SeqStash & o) {
+            std::swap(o.hist, hist);
+            std::swap(o.img, conv_img);
+            std::swap(o.snap_len, snap_len);
+            std::swap(o.snap_logits, snap_logits);
+            std::swap(o.snap_seed, snap_seed);
+            std::swap(o.snap_seed_n, snap_seed_n);
+#if defined(DS41_HAVE_DSPARK)
+            std::swap(o.dsp_next, dsp_next);
+#endif
+        };
+        auto seq_switch = [&](int q) -> bool {   // conversation slot q becomes the live one (between requests / passes)
+            if (q == cur_seq) return true;
+            if (!dense.bind_seq(q)) { err = "no conversation slot " + std::to_string(q); return false; }
+#if defined(DS41_TP)
+            if (tp && !tp->bind_seq(q)) { err = tp->last_error(); return false; }
+#endif
+            seq_swap(seq_stash[(size_t) cur_seq]);   // the live conversation into its own entry ...
+            seq_swap(seq_stash[(size_t) q]);         // ... and q's out of its entry
+            if (!kv_pos_seq.empty()) {
+                kv_pos_seq[(size_t) cur_seq] = kv_pos;
+                kv_pos = kv_pos_seq[(size_t) q];
+            }
+            cur_seq = q;
+            return true;
+        };
+        auto seq_hist = [&](int q) -> const std::vector<int> & { return q == cur_seq ? hist : seq_stash[(size_t) q].hist; };
+        auto seq_img = [&](int q) -> const std::vector<ImgId> & { return q == cur_seq ? conv_img : seq_stash[(size_t) q].img; };
+        if (n_seq > 1)
+            std::fprintf(stderr, "serve: %d conversation slots resident on the cards (STRATA_SERVE_SEQS)\n", n_seq);
+        // larry (patch-slots-serve.py): a request's decode state - one round a call (the request alone loops them, the
+        // batch slots' windows take one each).  slot -1: the control lines' request (T lines), else BT <slot> lines.
+        struct DecState {
+            int slot = -1;
+            int max_new = 0, tk = 0, gen = 0;
+            float temp = 1.0f, top_p = 1.0f, min_p = 0.0f;
+            std::mt19937_64 * rng = nullptr;
+            const char * finish = "length";
+            std::string ferr;
+            bool spec = false, skip_emit = false;   // DSpark (else the plain path); skip_emit: t was emitted already
+            int P = 0, t = -1, prev = 0;
+            bool dirty = false;
+            int sp_ids[5] = { 0, 0, 0, 0, 0 };
+            float sp_conf[5] = { 0, 0, 0, 0, 0 };
+            int lk_cool = 0, lk_back = 1;
+            long lk_pass = 0, lk_dr = 0, lk_acc = 0, rq_pass = 0, rq_acc = 0;
+            std::vector<float> lg;   // the plain path: the next token's logits
+            int pos = 0;
+        };
+        bool in_seam = false;   // windows inside a prompt read: no rebalance ticks (the read owns the flex regions)
+        auto emit_tok = [&](DecState & d, int tok) -> bool {   // false = the request ends here
+            if (d.slot < 0) std::printf("T %d\n", tok);
+            else std::printf("BT %d %d\n", d.slot, tok);
+            std::fflush(stdout);
+            ++d.gen;
+            if (is_stop(tok)) { d.finish = "stop"; return false; }
+            if (d.max_new > 0 && d.gen >= d.max_new) return false;
+            return true;
+        };
+#if defined(DS41_HAVE_DSPARK)
+        // ---- one DSpark round (as the one-shot loop: P = last fed position, t = the token for P+1, sp_ids = drafts for
+        // P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact): emit t, verify the drafts after
+        // it, emit the accepted ones.  false = the request ended (d.finish says how)
+        // STRATA_SERVE_LOOKUP=L (s6, opt-in until measured; mab776/Strata-DS4 M11's design): when the context's last G+1
+        // tokens (STRATA_LOOKUP_NGRAM=G, default 3) occurred earlier in this request (prompt + output), the tokens that
+        // followed them there are the verify pass's drafts instead of DSpark's - an agent's output copies its context
+        // (edits, rewrites, quoted tool results).  spec_accept treats every draft as a deterministic token (accept with p,
+        // else resample without it), so the output distribution is unchanged.  A match of M tokens drafts M - G + 1 (<= L,
+        // <= the pass width).  STRATA_LOOKUP_AGREE (default 1): only when the copy's first token is DSpark's own first
+        // draft.  A lookup pass with less than half accepted sits the lookup out 1, 2, 4 .. 64 passes.  DSpark steps on
+        // the verified rows either way.  kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_m
+        // splits the tier calls at kMaxMulti = 8 and the pass buffers hold 17).
+        constexpr int kVerify = 16;
+        auto dspark_cycle = [&](DecState & d, const std::function<bool()> & stopped) -> bool {
+            static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
+            static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;
+            static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
+            // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
+            // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
+            static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
+            // larry, STRATA_DSPARK_CUM=<c> (patch-dsparkcum.py; Project Maya's MAYA_DS4_DSPARK_CUM): also stop at the
+            // first draft where the product of the confidences so far drops below c
+            static const float cum_tau_s = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : 0.0f;
+            static const bool lk_tp = std::getenv("STRATA_LOOKUP_TP") && std::getenv("STRATA_LOOKUP_TP")[0] == '1';
+            static thread_local std::vector<int> vt;
+            static thread_local std::vector<std::pair<int, double>> dist;
+            int dr[kVerify] = { 0 };
+            if (!d.skip_emit && !emit_tok(d, d.t)) return false;
+            d.skip_emit = false;
+            if (stopped()) { d.finish = "cancel"; return false; }
+            int k = sp_depth_serve;
+            if (d.max_new > 0) k = std::min(k, d.max_new - d.gen);
+            k = std::min(k, ctxv - (d.P + 3));   // the pass writes P+1 .. P+1+k
+            if (k < 0) return false;
+            if (conf_tau_s >= 0 || cum_tau_s > 0) {
+                int kk = 0;
+                float cum = 1.0f;
+                while (kk < k) {
+                    const float p = 1.0f / (1.0f + std::exp(-d.sp_conf[kk]));
+                    if (p < conf_tau_s || (cum *= p) < cum_tau_s) break;
+                    ++kk;
+                }
+                k = kk;
+            }
+            const bool refeed = d.dirty && ((d.P + 1) & 1);
+            for (int i = 0; i < k; ++i) dr[i] = d.sp_ids[i];
+            bool is_lk = false;
+            if (lk_max > 0 && d.lk_cool > 0) --d.lk_cool;
+            else if (lk_max > 0) {
+                // the sequence is hist + t (t = the token for P+1, not in hist yet); find the latest earlier q with
+                // seq[q-G .. q] == seq[n-G .. n] (G+1 tokens, the last being t), then copy seq[q+1 ..]
+                const int n = (int) hist.size();
+                auto sq = [&](int i) { return i == n ? d.t : hist[(size_t) i]; };
+                int cap = std::min(lk_max, kVerify - 1 - (refeed ? 1 : 0));
+                // larry, engine1 (STRATA_LOOKUP_TP=1): the pass stays on the TP core (<= 7 rows) - a wider one
+                // takes the old path, which pages card 0's dense weights in every layer (~0.1-0.2 s a pass)
+                if (lk_tp && tp_on) cap = std::min(cap, 7 - 1 - (refeed ? 1 : 0));
+                if (d.max_new > 0) cap = std::min(cap, d.max_new - d.gen);
+                cap = std::min(cap, ctxv - (d.P + 3));
+                if (cap >= 2 && n > lk_g + 1) {
+                    for (int q = n - 1; q >= lk_g; --q) {
+                        if (hist[(size_t) q] != d.t) continue;
+                        int m = 1;
+                        while (m < 64 && q - m >= 0 && hist[(size_t) (q - m)] == sq(n - m)) ++m;
+                        if (m < lk_g + 1) continue;
+                        const int L = std::min({cap, m - lk_g + 1, n - q});
+                        if (L < 2) break;   // the latest match copies too little: not worth a pass
+                        if (lk_agree && sq(q + 1) != d.sp_ids[0]) break;
+                        for (int i = 0; i < L; ++i) dr[i] = sq(q + 1 + i);
+                        k = L;
+                        is_lk = true;
+                        break;
+                    }
+                }
+            }
+            vt.clear();
+            if (refeed) vt.push_back(d.prev);
+            vt.push_back(d.t);
+            for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
+            const int r0 = refeed ? 1 : 0, p0 = refeed ? d.P : d.P + 1;
+            if (!ensure_kv(p0 + (int64_t) vt.size() + 64)) { d.ferr = err; d.finish = "error"; return false; }
+            if (!pass_v(vt.data(), (int) vt.size(), p0)) { d.ferr = ferr; d.finish = "error"; return false; }
+            int acc = 0, tn = -1;
+            for (; acc < k; ++acc) {
+                sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, d.temp, d.tk, d.top_p, d.min_p, dist);
+                if (!spec_accept(dist, dr[acc], *d.rng, tn)) break;
+            }
+            if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, d.temp, d.tk, d.top_p, d.min_p, *d.rng);
+            ++d.rq_pass; d.rq_acc += acc;
+            if (is_lk) {
+                ++d.lk_pass; d.lk_dr += k; d.lk_acc += acc;
+                if (2 * acc < k) { d.lk_cool = d.lk_back; d.lk_back = std::min(64, d.lk_back * 2); }
+                else d.lk_back = 1;
+            }
+            int spos[kVerify + 1];
+            for (int i = 0; i <= acc; ++i) spos[i] = d.P + 1 + i;
+            int drafts[kVerify];
+            for (int i = 0; i < k; ++i) drafts[i] = dr[i];
+            if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, d.sp_ids, d.sp_conf, pv_tp ? r0 : -1)) {
+                d.ferr = "DSpark step: " + dsp->last_error(); d.finish = "error"; return false;
+            }
+            hist.push_back(d.t);
+            bool more = true;
+            for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit_tok(d, drafts[i]); }
+            d.prev = acc == 0 ? d.t : drafts[acc - 1];
+            d.dirty = acc < k;
+            d.P += 1 + acc;
+            d.t = tn;
+            if (!in_seam) tier.rebalance_tick();
+            return more;
+        };
+#endif
+        // ---- one round of the plain path (no DSpark): sample from d.lg, emit, feed it (its next logits)
+        auto plain_cycle = [&](DecState & d, const std::function<bool()> & stopped) -> bool {
+            if (d.max_new > 0 && d.gen >= d.max_new) return false;
+            if (stopped()) { d.finish = "cancel"; return false; }
+            const int tok = sample_p(d.lg.data(), nv, d.temp, d.tk, d.top_p, d.min_p, *d.rng);
+            if (!emit_tok(d, tok)) return false;
+            if (d.pos + 1 >= ctxv) return false;
+            if (!ensure_kv(d.pos + 64)) { d.ferr = err; d.finish = "error"; return false; }
+            if (!step(tok, d.pos) || !logits_rows(0, 1, d.lg.data())) { d.ferr = ferr; d.finish = "error"; return false; }
+            hist.push_back(tok);
+            ++d.pos;
+            if (!in_seam) tier.rebalance_tick();
+            return true;
+        };
+        // ---- the batch slots (--batch-slots N: Strata's protocol) - logical slot k decodes in conversation slot phys
+        struct SlotReq {
+            bool decoding = false;
+            int phys = 0;
+            double t0 = 0;
+            std::mt19937_64 rng;
+            DecState d;
+        };
+        const int n_slots = a.batch_slots > 1 ? n_seq : 0;
+        std::vector<SlotReq> slots((size_t) n_slots);
+        for (int k = 0; k < n_slots; ++k) slots[(size_t) k].phys = k;
+        bstop_req.assign((size_t) n_slots, 0);
+        auto any_decoding = [&]() {
+            for (const auto & sr : slots) if (sr.decoding) return true;
+            return false;
+        };
+        auto phys_busy = [&](int q) {   // conversation slot q holds a decoding slot's conversation
+            for (const auto & sr : slots) if (sr.decoding && sr.phys == q) return true;
+            return false;
+        };
+        auto finish_slot = [&](int k) {   // (its conversation slot is bound)
+            SlotReq & sr = slots[(size_t) k];
+            DecState & d = sr.d;
+            const double ms = now_ms() - sr.t0;
+            const bool bad = std::strcmp(d.finish, "error") == 0;
+#if defined(DS41_HAVE_DSPARK)
+            if (d.spec) {
+                dsp_next = bad ? -1 : d.P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
+                sv_pass += d.rq_pass; sv_acc += d.rq_acc;
+            }
+#endif
+            if (bad) {
+                std::fprintf(stderr, "serve: slot %d: decode failed: %s\n", k, d.ferr.c_str());
+                hist.clear();
+                conv_img.clear();
+                snap_len = -1;
+                d.finish = "length";
+            }
+            std::fprintf(stderr, "serve: slot %d (conversation slot %d): %d tokens in %.2f s = %.2f tok/s (%s)%s\n", k, sr.phys,
+                         d.gen, ms / 1000.0, 1000.0 * std::max(0, d.gen - 1) / std::max(ms, 1e-9), d.finish,
+                         d.rq_pass > 0 ? (", DSpark " + std::to_string(1.0 + (double) d.rq_acc / d.rq_pass).substr(0, 4) + " tokens/pass").c_str() : "");
+            std::printf("BDONE %d %d %s %.1f\n", k, d.gen, d.finish, ms);
+            std::fflush(stdout);
+            sr.decoding = false;
+            bstop_req[(size_t) k] = 0;
+        };
+        int win_rr = 0;
+        auto run_window = [&]() {   // one round of every decoding slot, each in its own conversation slot
+            if (!bias_now) { bias_now = true; apply_bias(); }   // (the decode biases)
+            for (int i = 0; i < n_slots; ++i) {
+                const int k = (win_rr + i) % n_slots;
+                SlotReq & sr = slots[(size_t) k];
+                if (!sr.decoding) continue;
+                if (!seq_switch(sr.phys)) { sr.d.ferr = err; sr.d.finish = "error"; finish_slot(k); continue; }
+                auto stopped = [&]() { poll_cmds(false); return bstop_req[(size_t) k] != 0; };
+#if defined(DS41_HAVE_DSPARK)
+                const bool more = sr.d.spec ? dspark_cycle(sr.d, stopped) : plain_cycle(sr.d, stopped);
+#else
+                const bool more = plain_cycle(sr.d, stopped);
+#endif
+                if (!more) finish_slot(k);
+            }
+            win_rr = n_slots ? (win_rr + 1) % n_slots : 0;
+        };
+        // the next control line; the decoding slots' windows run while none is waiting.  false: QUIT / end of input
+        auto next_request = [&](std::string & out) -> bool {
+            for (;;) {
+                poll_cmds(false);
+                if (!ctl_q.empty()) {
+                    out = std::move(ctl_q.front());
+                    ctl_q.pop_front();
+                    return true;
+                }
+                if (quit_seen) return false;
+                if (any_decoding()) { run_window(); continue; }
+                poll_cmds(true);
+            }
+        };
         // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs on the decode side - passes of
         // STRATA_SERVE_PASS_M tokens with the VRAM cache and the decode biases (~40 tok/s) - instead of the exact
         // layer-major batch (~16.8 s + n / 250 tok/s; measured crossover ~765 tokens); 0 = always the batch (every prompt
@@ -1934,25 +2266,35 @@ int main(int argc, char ** argv) {
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
-        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld conversation_cache_slots=%d conversation_cache_mib=%d\n",
+        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld conversation_cache_slots=%d conversation_cache_mib=%d%s\n",
                     ctxv, (long long) tier.resident(), (long long) tier.arena_experts(), park_on ? park_slots : 0,
-                    park_on ? (int) (park_gib * 1024) : 0);   // (0 MiB: no budget - the Monitor card then says "off")
+                    park_on ? (int) (park_gib * 1024) : 0,   // (0 MiB: no budget - the Monitor card then says "off")
+                    n_slots > 1 ? (" batch_slots=" + std::to_string(n_slots)).c_str() : "");   // (patch-slots-serve.py)
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
         std::string line;
-        while (next_line(line)) {
-            if (line == "QUIT") break;
-            if (line == "STOP" || line.empty()) continue;
+        (void) next_line;
+        while (next_request(line)) {   // larry (patch-slots-serve.py): the decoding slots' windows run in between
+            ctl_stop = false;          // (a STOP before this request is not for it)
             // larry (vision): GENI <max_new> [keys] [img_keys=k,..] <embeddings file> <ids csv> - a request with pictures
-            const bool geni = line.rfind("GENI ", 0) == 0;
-            if (!geni && line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            // larry (batch slots): BGEN / BGENI <slot> ... - read into batch slot <slot>, which then decodes in the windows
+            const bool bgen = line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0;
+            const bool geni = line.rfind("GENI ", 0) == 0 || line.rfind("BGENI ", 0) == 0;
+            if (!geni && !bgen && line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
             std::istringstream ss(line);
             std::string w, csv, img_path;
             std::vector<std::string> img_keys;
-            int max_new = 0, tk = 0;
+            int max_new = 0, tk = 0, admit = -1;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
-            ss >> w >> max_new;
+            ss >> w;
+            if (bgen) ss >> admit;
+            ss >> max_new;
+            if (bgen && (n_slots < 2 || admit < 0 || admit >= n_slots || slots[(size_t) admit].decoding)) {
+                std::printf("ERR BGEN: slot %d is not free\n", admit);
+                std::fflush(stdout);
+                continue;
+            }
             while (ss >> w) {
                 const size_t eq = w.find('=');
                 if (eq == std::string::npos) { if (geni && img_path.empty()) img_path = w; else csv = w; continue; }
@@ -2002,6 +2344,37 @@ int main(int argc, char ** argv) {
                     if (ierr.empty() && (k != img_recs.size() || j != 0)) ierr = "the prompt's image tokens and the image rows do not match";
                 }
                 if (!ierr.empty()) { std::printf("ERR %s\n", ierr.c_str()); std::fflush(stdout); continue; }
+            }
+            if (n_seq > 1) {   // larry (batch slots): the conversation slot this request continues best
+                int best = -1;
+                size_t bl = 0;
+                for (int q = 0; q < n_seq; ++q) {
+                    if (phys_busy(q)) continue;   // (patch-slots-serve.py: a decoding slot's)
+                    const std::vector<int> & h = seq_hist(q);
+                    size_t l = 0;
+                    while (l < h.size() && l < ids.size() && h[l] == ids[l]) ++l;
+                    l = img_cap(l, seq_img(q), req_img);
+                    // larry (patch-seqpick.py): only a continuation counts - it extends the slot's conversation, reaches
+                    // past its snapshot, or diverges within the last 16 positions of its last prompt (the rewind)
+                    const int sl = q == cur_seq ? snap_len : seq_stash[(size_t) q].snap_len;
+                    const size_t ev = l & ~(size_t) 1;
+                    const bool cont = l > 0 && ((l == h.size() && l < ids.size()) || (sl > 0 && l >= (size_t) sl) ||
+                                                (sl > 0 && ev >= 64 && (size_t) sl - ev <= 16));
+                    if (cont && l > bl) { bl = l; best = q; }
+                }
+                if (best < 0) {   // continues none: an empty slot, else the one used longest ago
+                    best = -1;
+                    for (int q = 0; q < n_seq && best < 0; ++q) if (!phys_busy(q) && seq_hist(q).empty()) best = q;
+                    if (best < 0)
+                        for (int q = 0; q < n_seq; ++q)
+                            if (!phys_busy(q) && (best < 0 || seq_used[(size_t) q] < seq_used[(size_t) best])) best = q;
+                }
+                if (best < 0) { std::printf("ERR %sno idle conversation slot\n", bgen ? "BGEN: " : ""); std::fflush(stdout); continue; }
+                if (admit >= 0 && slots[(size_t) admit].phys != best)   // (patch-slots-serve.py: logical slot -> this one)
+                    for (auto & sr : slots)
+                        if (sr.phys == best) { std::swap(sr.phys, slots[(size_t) admit].phys); break; }
+                if (!seq_switch(best)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
+                seq_used[(size_t) cur_seq] = ++seq_tick;
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
@@ -2093,6 +2466,20 @@ int main(int argc, char ** argv) {
                 hist.resize((size_t) snap_len);
                 conv_img = img_trim(conv_img, snap_len);   // (larry, vision)
                 reused = snap_len;
+            } else if (!unparked && snap_len > 0 && lcp < (size_t) snap_len && (lcp & ~(size_t) 1) >= 64 &&
+                       (size_t) snap_len - (lcp & ~(size_t) 1) <= 16 && (lcp & ~(size_t) 1) < ids.size() &&
+                       !(std::getenv("STRATA_SERVE_REWIND") && std::getenv("STRATA_SERVE_REWIND")[0] == '0') && dense.restore()) {
+                // larry (patch-rewind.py): the last prompt's tail re-rendered - resume at the even point under the
+                // divergence (the ring at the snapshot holds the 144 positions before it; restore() put it back)
+                const size_t s0 = lcp & ~(size_t) 1;
+                std::fprintf(stderr, "serve: rewound the live conversation to %zu (lcp %zu, its snapshot %d)\n", s0, lcp, snap_len);
+                hist.resize(s0);
+                conv_img = img_trim(conv_img, (int64_t) s0);   // (larry, vision)
+                reused = (int) s0;
+                snap_len = -1;   // the tail under it is re-fed: no snapshot survives this
+#if defined(DS41_HAVE_DSPARK)
+                dsp_next = -1;   // DSpark's window holds the old tail
+#endif
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK; park_live)
                 park_live((int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64, -1);
@@ -2100,9 +2487,9 @@ int main(int argc, char ** argv) {
                 conv_img.clear();   // (larry, vision)
                 snap_len = -1;
             }
-            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu/%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
+            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu/%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d seq=%d\n", lcp,
                          dense.parked(0) ? pk[0].hist.size() : (size_t) 0, dense.parked(1) ? pk[1].hist.size() : (size_t) 0, lp_show,
-                         hist.size(), snap_len, ids.size(), reused);
+                         hist.size(), snap_len, ids.size(), reused, cur_seq);
             if (unparked) {   // patch-parkpool.py: the server's Monitor card
                 size_t pb = 0;
                 const int pn = park_pool(pb);
@@ -2289,6 +2676,7 @@ int main(int argc, char ** argv) {
                     i += m;
                     last_rows = m;
                     if (i / 64 != before / 64 && i < dh) pp(i);
+                    if (feed_seam && i < dh && (i / m) % 4 == 0) feed_seam();   // (larry, batch slots)
                 }
                 if (!logits_rows(last_rows - 1, 1, last_logits.data())) return false;
                 pp(dh);
@@ -2336,6 +2724,17 @@ int main(int argc, char ** argv) {
                 if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
                                               frb / 1073741824.0, pb_cap, PB);
             }
+            // larry (patch-slots-serve.py): a BGEN read with other slots decoding: their windows between its batches
+            const int feed_seq = cur_seq;
+            if (admit >= 0 && any_decoding())
+                feed_seam = [&]() {
+                    const bool b0 = bias_now;
+                    in_seam = true;
+                    run_window();
+                    in_seam = false;
+                    if (!seq_switch(feed_seq)) std::fprintf(stderr, "serve: back to the read's conversation slot: %s\n", err.c_str());
+                    if (bias_now != b0) { bias_now = b0; apply_bias(); }
+                };
             const double tph0 = now_ms();
             btr("feed start (batch width)", pb_cap);
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
@@ -2352,6 +2751,7 @@ int main(int argc, char ** argv) {
                 dense.engram_tokens(reused - kb, ids.data() + reused - kb, kb);
             }
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            feed_seam = nullptr;
             dense.clear_images();
             bcap_n = 0;
             btr("feed end");
@@ -2540,151 +2940,51 @@ int main(int argc, char ** argv) {
             const char * finish = "length";
             std::vector<float> lg = last_logits;
 #if defined(DS41_HAVE_DSPARK)
-            // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
-            // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
-            if (sp_t >= 0) {
-                int P = total - 1, t = sp_t, prev = ids.back();
-                bool dirty = false;
-                std::vector<int> vt;
-                std::vector<std::pair<int, double>> dist;
-                // STRATA_SERVE_LOOKUP=L (s6, opt-in until measured; mab776/Strata-DS4 M11's design): when the context's
-                // last G+1 tokens (STRATA_LOOKUP_NGRAM=G, default 3) occurred earlier in this request (prompt + output),
-                // the tokens that followed them there are the verify pass's drafts instead of DSpark's - an agent's output
-                // copies its context (edits, rewrites, quoted tool results).  spec_accept treats every draft as a
-                // deterministic token (accept with p, else resample without it), so the output distribution is unchanged.
-                // A match of M tokens drafts M - G + 1 (<= L, <= the pass width).  STRATA_LOOKUP_AGREE (default 1): only
-                // when the copy's first token is DSpark's own first draft.  A lookup pass with less than half accepted
-                // sits the lookup out 1, 2, 4 .. 64 passes.  DSpark steps on the verified rows either way.
-                // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_m splits the tier calls at
-                // kMaxMulti = 8 and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the draft length
-                // was the limit at kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3% over DSpark's own).
-                constexpr int kVerify = 16;
-                static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
-                static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;
-                static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
-                int lk_cool = 0, lk_back = 1;
-                long lk_pass = 0, lk_dr = 0, lk_acc = 0;
-                int dr[kVerify] = {0};
-                auto emit = [&](int tok) -> bool {   // false = stop here
-                    std::printf("T %d\n", tok);
-                    std::fflush(stdout);
-                    ++gen;
-                    if (is_stop(tok)) { finish = "stop"; return false; }
-                    if (max_new > 0 && gen >= max_new) return false;
-                    return true;
-                };
-                while (emit(t)) {
-                    if (stop_pending()) { finish = "cancel"; break; }
-                    int k = sp_depth_serve;
-                    if (max_new > 0) k = std::min(k, max_new - gen);
-                    k = std::min(k, ctxv - (P + 3));   // the pass writes P+1 .. P+1+k
-                    if (k < 0) break;
-                    // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
-                    // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
-                    static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
-                    // larry, STRATA_DSPARK_CUM=<c> (patch-dsparkcum.py; Project Maya's MAYA_DS4_DSPARK_CUM): also stop at the
-                    // first draft where the product of the confidences so far drops below c
-                    static const float cum_tau_s = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : 0.0f;
-                    if (conf_tau_s >= 0 || cum_tau_s > 0) {
-                        int kk = 0;
-                        float cum = 1.0f;
-                        while (kk < k) {
-                            const float p = 1.0f / (1.0f + std::exp(-sp_conf[kk]));
-                            if (p < conf_tau_s || (cum *= p) < cum_tau_s) break;
-                            ++kk;
-                        }
-                        k = kk;
-                    }
-                    const bool refeed = dirty && ((P + 1) & 1);
-                    for (int i = 0; i < k; ++i) dr[i] = sp_ids[i];
-                    bool is_lk = false;
-                    if (lk_max > 0 && lk_cool > 0) --lk_cool;
-                    else if (lk_max > 0) {
-                        // the sequence is hist + t (t = the token for P+1, not in hist yet); find the latest earlier q with
-                        // seq[q-G .. q] == seq[n-G .. n] (G+1 tokens, the last being t), then copy seq[q+1 ..]
-                        const int n = (int) hist.size();
-                        auto sq = [&](int i) { return i == n ? t : hist[(size_t) i]; };
-                        int cap = std::min(lk_max, kVerify - 1 - (refeed ? 1 : 0));
-                        // larry, engine1 (STRATA_LOOKUP_TP=1): the pass stays on the TP core (<= 7 rows) - a wider one
-                        // takes the old path, which pages card 0's dense weights in every layer (~0.1-0.2 s a pass)
-                        static const bool lk_tp = std::getenv("STRATA_LOOKUP_TP") && std::getenv("STRATA_LOOKUP_TP")[0] == '1';
-                        if (lk_tp && tp_on) cap = std::min(cap, 7 - 1 - (refeed ? 1 : 0));
-                        if (max_new > 0) cap = std::min(cap, max_new - gen);
-                        cap = std::min(cap, ctxv - (P + 3));
-                        if (cap >= 2 && n > lk_g + 1) {
-                            for (int q = n - 1; q >= lk_g; --q) {
-                                if (hist[(size_t) q] != t) continue;
-                                int m = 1;
-                                while (m < 64 && q - m >= 0 && hist[(size_t) (q - m)] == sq(n - m)) ++m;
-                                if (m < lk_g + 1) continue;
-                                const int L = std::min({cap, m - lk_g + 1, n - q});
-                                if (L < 2) break;   // the latest match copies too little: not worth a pass
-                                if (lk_agree && sq(q + 1) != sp_ids[0]) break;
-                                for (int i = 0; i < L; ++i) dr[i] = sq(q + 1 + i);
-                                k = L;
-                                is_lk = true;
-                                break;
-                            }
-                        }
-                    }
-                    vt.clear();
-                    if (refeed) vt.push_back(prev);
-                    vt.push_back(t);
-                    for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
-                    const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
-                    if (!ensure_kv(p0 + (int64_t) vt.size() + 64)) { ferr = err; finish = "error"; break; }
-                    if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
-                    int acc = 0, tn = -1;
-                    for (; acc < k; ++acc) {
-                        sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
-                        if (!spec_accept(dist, dr[acc], rng, tn)) break;
-                    }
-                    if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
-                    ++rq_pass; rq_acc += acc;
-                    if (is_lk) {
-                        ++lk_pass; lk_dr += k; lk_acc += acc;
-                        if (2 * acc < k) { lk_cool = lk_back; lk_back = std::min(64, lk_back * 2); }
-                        else lk_back = 1;
-                    }
-                    int spos[kVerify + 1];
-                    for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
-                    int drafts[kVerify];
-                    for (int i = 0; i < k; ++i) drafts[i] = dr[i];
-                    if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf, pv_tp ? r0 : -1)) {
-                        ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
-                    }
-                    hist.push_back(t);
-                    bool more = true;
-                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
-                    prev = acc == 0 ? t : drafts[acc - 1];
-                    dirty = acc < k;
-                    P += 1 + acc;
-                    t = tn;
-                    tier.rebalance_tick();
-                    if (!more) break;
-                }
-                if (lk_pass > 0)
-                    std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", lk_acc, lk_dr, lk_pass);
-                dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
-                if (std::strcmp(finish, "error") == 0) dsp_next = -1;
-                sv_pass += rq_pass; sv_acc += rq_acc;
+#endif
+            // larry (patch-slots-serve.py): the decode as a state and its rounds - this request alone loops them here; a
+            // BGEN emits its own token (a GEN 1) and its slot takes the rounds in the windows from there
+            DecState dd;
+            dd.max_new = max_new; dd.tk = tk; dd.temp = temp; dd.top_p = top_p; dd.min_p = min_p;
+            dd.rng = &rng;
+            dd.spec = sp_t >= 0;
+            dd.P = total - 1; dd.t = sp_t; dd.prev = ids.back();
+            std::copy(sp_ids, sp_ids + 5, dd.sp_ids);
+            std::copy(sp_conf, sp_conf + 5, dd.sp_conf);
+            dd.lg = lg; dd.pos = pos;
+            bool slot_cont = false;
+            if (admit >= 0) {
+                SlotReq & sr = slots[(size_t) admit];
+                sr.rng.seed(rng());   // the slot's own sampler (from the request's seed= when it had one)
+                dd.rng = &sr.rng;
+                if (stop_pending()) dd.finish = "cancel";
+                else if (dd.spec) slot_cont = emit_tok(dd, dd.t);
+                else slot_cont = plain_cycle(dd, [] { return false; });
+                dd.skip_emit = dd.spec;   // the slot's first round verifies t's drafts without emitting t again
+#if defined(DS41_HAVE_DSPARK)
+                if (!slot_cont && dd.spec) dsp_next = dd.P + 1;
+#endif
+            }
+#if defined(DS41_HAVE_DSPARK)
+            else if (dd.spec) {
+                while (dspark_cycle(dd, stop_pending)) {}
+                if (dd.lk_pass > 0)
+                    std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", dd.lk_acc, dd.lk_dr, dd.lk_pass);
+                dsp_next = dd.P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
+                if (std::strcmp(dd.finish, "error") == 0) dsp_next = -1;
+                sv_pass += dd.rq_pass; sv_acc += dd.rq_acc;
             }
 #endif
-            while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
-                if (stop_pending()) { finish = "cancel"; break; }
-                const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
-                std::printf("T %d\n", tok);
-                std::fflush(stdout);
-                ++gen;
-                if (is_stop(tok)) { finish = "stop"; break; }
-                if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!ensure_kv(pos + 64)) { ferr = err; finish = "error"; break; }
-                if (!step(tok, pos) || !logits_rows(0, 1, lg.data())) { finish = "error"; break; }
-                hist.push_back(tok);
-                ++pos;
-                tier.rebalance_tick();
+            else {
+                while (plain_cycle(dd, stop_pending)) {}
             }
+            gen = dd.gen;
+            finish = dd.finish;
+            if (std::strcmp(finish, "error") == 0) ferr = dd.ferr;
+            pos = dd.pos;
+#if defined(DS41_HAVE_DSPARK)
+            rq_pass = dd.rq_pass; rq_acc = dd.rq_acc;
+#endif
             const double dec_ms = now_ms() - td0;
             const Ds41MoeStats st = tier.stats();
             if (std::strcmp(finish, "error") == 0) {
@@ -2706,6 +3006,20 @@ int main(int argc, char ** argv) {
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
+            if (admit >= 0) {   // larry (patch-slots-serve.py): BADM, and the slot decodes on in the windows
+                std::printf("BADM %d %d\n", admit, slot_cont ? 1 : 0);
+                std::fflush(stdout);
+                if (slot_cont) {
+                    SlotReq & sr = slots[(size_t) admit];
+                    sr.d = std::move(dd);
+                    sr.d.slot = admit;
+                    sr.d.rng = &sr.rng;
+                    sr.decoding = true;
+                    sr.phys = cur_seq;
+                    sr.t0 = now_ms();
+                    bstop_req[(size_t) admit] = 0;
+                }
+            }
         }
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits

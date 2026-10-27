@@ -48,6 +48,8 @@ struct Ds41TpShard {
 struct Ds41TpHooks {
     /// rank 0's state, one entry a layer (empty: the core owns rank 0's state too)
     std::vector<Ds41TpLayerState> state;
+    /// larry (batch slots, patch-seqs-tp.py): rank 0's state of conversations 1 .. n_seqs - 1, as `state` (conversation 0's)
+    std::vector<std::vector<Ds41TpLayerState>> seq_state;
     /// a pass's Engram rows (tids[0..n) at pos0..; out[e] = n * cols * dim floats, slot e = the e-th Engram layer),
     /// blocking - called right after the pass is launched; the cards wait for it at the Engram layers
     std::function<bool(const int * tids, int n, int pos0, float * const * out)> engram;
@@ -79,6 +81,7 @@ struct Ds41TpConfig {
     bool act_quant = true;          ///< model.py's activation roundings (window K FP8, compressed KV / indexer FP4)
     int n_layer = -1;               ///< blocks to run (-1 = all; a prefix for quick tests)
     bool shexp = true;              ///< the shared expert (off: timing experiments only)
+    int n_seqs = 1;                 ///< larry (batch slots): conversations held side by side (bind_seq)
     int bench_experts = 0;          ///< phase A: routed experts from this many real blobs (every card the same set;
                                     ///< expert (l, e) uses blob (l * NE + e) % count, held by rank (e + l) % N); 0 = none
 };
@@ -136,6 +139,11 @@ public:
     /// engram_kv, output.weight) when it is this core's own copy (false: not held, or read from the engine in place)
     bool shard_desc(const std::string & name, int rank, Ds41TpShard & d) const;
     int n_cards() const;
+    /// larry (batch slots, patch-seqs-tp.py): the conversation pass / sync_state / the draft work on from here on - its
+    /// KV replicas, rings, draft window and recorded graphs are its own (no copy, no re-recording).  Between passes only.
+    bool bind_seq(int s);
+    int n_seqs() const;
+    int seq() const;
 
     /// larry, engine1: DSpark's draft stack (the sidecar's mtp.0-2: ds41_dspark.hpp's contract) on the same N cards - its
     /// blocks split as the trunk's layers, its routed experts (Q2_K) e on rank e % N.  Loads the weights (VRAM on every

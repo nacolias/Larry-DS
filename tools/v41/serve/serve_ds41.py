@@ -383,7 +383,8 @@ import time as _time
 
 _TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", "/tmp/strata-ds41-text.log")
 _text_lock = _th.Lock()
-_text_state = {"kind": None}
+_text_tls = _th.local()   # larry (patch-textlog.py): each request's own section label and number (#n)
+_text_seq = [0]
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
 
 
@@ -406,9 +407,9 @@ def _note_ds41(self, n, evs, st=None, rate=None):
         if not ev.text:
             continue
         label = _KIND_LABEL.get(ev.kind, ev.kind)
-        if label != _text_state["kind"]:
-            _text_state["kind"] = label
-            out.append(f"\n--- {label} ---\n")
+        if label != getattr(_text_tls, "kind", None):
+            _text_tls.kind = label
+            out.append(f"\n--- #{getattr(_text_tls, 'rid', 0)} {label} ---\n")
         out.append(ev.text)
     if out:
         _text_write("".join(out))
@@ -417,8 +418,11 @@ def _note_ds41(self, n, evs, st=None, rate=None):
 
 def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)
     t0 = _time.time()
-    _text_state["kind"] = None
-    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
+    with _text_lock:
+        _text_seq[0] += 1
+        rid = _text_seq[0]
+    _text_tls.kind, _text_tls.rid = None, rid
+    _text_write(f"\n\n===== #{rid} {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
                 f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
     end = "(stream closed)"
     try:
@@ -428,7 +432,7 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                 end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"
             yield item
     finally:
-        _text_write(f"\n===== end: {end}, {_time.time() - t0:.1f} s =====\n")
+        _text_write(f"\n===== #{rid} end: {end}, {_time.time() - t0:.1f} s =====\n")
 
 
 S.Service._note = _note_ds41

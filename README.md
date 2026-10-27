@@ -21,6 +21,7 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 | agent-session replies (greedy) | 120-124 tok/s |
 | 984K-token prompt | 6 min, then 67 tok/s |
 | context window | 1,048,576 tokens |
+| two requests at once (`"parallel": 2`) | they take turns: two long answers at 35.6 + 35.8 tok/s; a 4K-token question arriving mid-answer answered 4.1 s later |
 | a new 800x600 picture | 7-8 s (~6 s of it the CPU encode); a follow-up question on it 0.2-1.2 s |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
@@ -204,7 +205,8 @@ and GPUs are untested.
   environment defaults. A variable already set wins. Each comment gives the A/B result that set the value.
 - **[`larry-ds41.json.in`](larry/deploy/larry-ds41.json.in)** holds the engine flags (`--ctx 1048576
   --prompt-batch 16384 --route-bias 0.5 --route-bias-file 0.3 --vision`), the sampling defaults (temperature 1.0,
-  top-p 0.95), the model paths and the `"vision"` section (the encoder script, the sidecar it reads, 6 CPU threads).
+  top-p 0.95), the model paths, the `"vision"` section (the encoder script, the sidecar it reads, 6 CPU threads) and
+  `"parallel": 2` (two requests at once; 1 or absent = one at a time).
   For a text-only server, delete the section and `--vision`. `bootstrap.sh` renders it as `larry-ds41.json`.
 - [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) ("Knobs") lists the tier's knobs.
 
@@ -219,9 +221,12 @@ The Larry-specific ones:
 
 ## Known limits
 
-- **One request at a time** (first in, first out). Up to 8 other conversations wait parked in host memory (at most
-  4 GiB together), so moving between chats or agents does not re-read their prompts. Concurrent sessions are the
-  next feature (engineering log, 2026-10-27).
+- **Two requests at once, taking turns** (`"parallel": 2`). Each slot holds a conversation of up to 1M tokens on the
+  cards; the two decode in turn, so together they get one stream's speed (two long answers ~36 tok/s each). A prompt
+  being read pauses the other session for its whole batch (up to 16K tokens, ~6 s). A third request waits for a free
+  slot; up to 8 more conversations wait parked in host memory (4 GiB), so moving between chats or agents does not
+  re-read them. Both slots' card-0 KV state is allocated at load (+3.1 GiB); the lazy map that would avoid it still
+  garbles a 970K conversation in a reused slot (engineering log, 2026-10-27).
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
 - **Pictures are encoded on the CPU.** A new 800x600 picture takes ~6 s on 6 threads (a repeat comes from the

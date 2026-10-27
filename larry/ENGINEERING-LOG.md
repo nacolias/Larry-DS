@@ -28,6 +28,8 @@ Clients: Larry's public endpoint, a reverse proxy to the server (OpenAI: `/v1/ch
 by default and comes back as `reasoning_content`; `"reasoning_effort": "none"` turns it off (`low`/`medium`/`high`/`max`
 or 1-100 are DeepSeek's numeric effort). Tool calls: DeepSeek's DSML, parsed into OpenAI/Anthropic tool calls.
 Pictures (since 2026-10-26): OpenAI `image_url` parts and Anthropic image blocks (end to end so far: one a request).
+Two requests at once (since 2026-10-27 19:04, `"parallel": 2`): they take turns, each at about half speed; a third
+waits for a free slot.
 Sampling defaults: temperature 1.0, top-p 0.95. Context: 1,048,576 tokens (since 2026-10-24 20:35; see below).
 
 ## Model provenance (verified 2026-10-26)
@@ -48,6 +50,83 @@ deepseek-ai/DeepSeek-V4.1-Flash-1017 with no fine-tune and no abliteration. The 
 So the weights are DeepSeek's official 1017 release; the metadata strings are mislabeled. dealignai's repo is an
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
+
+## Measured (2026-10-27 17:30 - 19:20: concurrent sessions, stage 1 - two conversations at once)
+
+**Two sessions at once, in the service since 19:04** (19:12 with the slot pick below; `patches/svc-slots.py`:
+larry-ds41.json `"parallel": 2`, backup `larry-ds41.json.pre-slots-20261027`; both slots' card-0 KV state allocated at
+load, +3.1 GiB on card 0). The server
+already had Strata's batch-slot client (`generate_batched`); the engine now speaks its lines. A request alone runs as
+before (GEN, DSpark); when a second one arrives the server stops the first, re-admits it into a slot (its prompt plus
+what it wrote: the engine continues from the state it holds) and admits the new one (`BGEN` -> `BADM`), and the two
+take turns until each ends (`BT` / `BDONE`).
+
+* **Conversation slots** (`patches/patch-seqs-tp.py`, `patch-seqs-dense.py`, `patch-seqs-gen.py`): the TP core, the dense
+  half and the Engram history hold N conversations side by side - per conversation the window rings, compressed KV and
+  indexer keys (card 0's in the lazy map when that is on, one set of units a conversation), compressor states, snapshot, written
+  range, the KV replicas on cards 1-3, DSpark's draft rings and the TP core's recorded graphs (they bake the state's
+  addresses: pre-recorded per conversation at attach, 28 graphs a card in ~1 s). `bind_seq(s)` swaps them in between
+  passes - no copy, no re-recording. A park now holds (layer, kind) regions, so a parked conversation comes back into
+  either slot. A request goes to the slot whose conversation it continues best, else an empty one, else the one used
+  longest ago (its conversation goes to the pool first).
+* **The protocol** (`patches/patch-slots-serve.py`): the decode loop became a state with one round a call (DSpark: emit,
+  verify the drafts, accept; or one plain step); the request alone loops it as before, the slots' windows take one round
+  each in turn. Every pass is still a single-sequence pass in its own conversation slot, so the kernels are unchanged and
+  each conversation decodes as it would alone. Windows run whenever no control line waits, and between the layer-major
+  batches of a prompt being read. `BYIELD` is accepted and not acted on (the read finishes).
+* **Card 0's KV state mapped on demand, fixed** (`patches/patch-kvbucket.py`, `patch-kvresident.py`): the 2026-10-24 and
+  17:34 DEVICE_LOSTs were ONE peer copy spanning two physical allocations of the VMM reservation - the TP core's replica
+  growth after a 131K prompt read rows [8192, 262144), mapped partly at load and partly just before the prompt
+  (`bench/conc/vmm_span_probe.cpp`: split at the boundary exact; one copy across with the new allocation made resident
+  on the peer exact; one copy across without - card 1's copy engine faulted, -ENOENT). The driver makes only a copy's
+  first allocation resident on the peer by itself. Every newly mapped range is now made resident on the other cards,
+  and the map follows the readers' power-of-two cap buckets - so a second slot's 1M would cost VRAM only when used,
+  but the lazy map is not in the service yet (see 1M below).
+* **A live rewind** (`patches/patch-rewind.py`): a prompt that diverges from the live conversation's last prompt within
+  its last 16 positions (a re-rendered tail) resumes there after `restore()` (the window ring at the snapshot holds the
+  144 positions before it) - the live counterpart of the partial unpark. reusetest: 9 tokens read instead of 2,439.
+* **The slot a request goes to** (`patches/patch-seqpick.py`): the one whose conversation it continues (extends it,
+  reaches past its snapshot, or rewinds into it), at any length; else an empty one, else the one used longest ago.
+  The first form wanted a 2,048-token match: a short chat's follow-up went to the other slot and read its prompt
+  again (tsvc2's tool turn 0.7 -> 1.9 s at 19:04).
+* The text log (`STRATA_TEXT_LOG`) numbers each request (`patches/patch-textlog.py`).
+
+The tests (`bench/conc/`): `seqtest.py` (two conversations resident), `concurtest.py` (requests at once through the
+server), `twoessays.py` (two long answers at once), `reusetest.py` (the pool, the rewind), `s1test.sh` (a private
+server: all of them + needles + the tool call), `r1m.sh` (long needles in either slot, with `STRATA_ADDR_LOG`).
+
+| two resident conversations (s1a, a private server, no protocol yet) | read | reused | time |
+| --- | ---: | ---: | ---: |
+| X (31K needle) and Y (6.6K needle), first turns | 31,157 / 6,640 | 0 | 10.5 / 3.9 s |
+| their next turns, alternating X, Y, X, Y | 19 each | the whole conversation | 0.3-0.5 s |
+| Z (a new 6K prompt): the slot used longest ago (X's) - X into the pool | 6,342 | 0 | 3.9 s |
+| X again (from the pool, Y's conversation pooled for it), then Y again (from the pool) | 29-31 | 31,216 / 6,675 | 0.4-0.7 s |
+
+`concurtest.py` on the service (19:14, `"parallel": 2`), every answer right:
+
+| | request | first token | done | tokens |
+| --- | --- | ---: | ---: | ---: |
+| round 1 | a 600-token essay, alone | 0.4 s | 12.3 s | 600 |
+| | a 4K-token needle arriving 3 s into it | 4.1 s | 4.3 s | 9 |
+| round 2 | the essay's follow-up, an 8K and a 12K needle at once (two slots) | 0.2 / 4.8 / 10.2 s (the 12K waited for a slot) | 11.5 / 5.0 / 10.4 s | 118 / 8 / 9 |
+| round 3 | both needles' follow-ups at once | 0.4 / 0.8 s (8,129 / 11,612 reused) | 0.9 s | 11 / 12 |
+
+`twoessays.py` on the service: one essay alone 72.4 tok/s; two at once 35.6 + 35.8 = 71.4 tok/s - the slots take turns,
+so two sessions share one stream's speed (batched decode would be stage 2). tsvc2 on the service (`logs/tsvc2-seqpick.log`):
+every needle found (8K 1484 / 1786, 16K 2510, 31K 3141 tok/s), svcbench 102.4 / 95.1, essay 76.6 / 72.7 tok/s, the tool call,
+the picture and its follow-up right, hidden RAM 34 GiB - within today's single-slot spread (8K 1452-1465 / 1873-1881,
+svcbench 104-108 / 88-101, essay 80-82 / 74-76).
+
+**1M in either slot** (`r1m.sh`, 18:41-19:01): with both slots' card-0 state allocated at load, a 131K needle in one slot
+then a 984K needle in the other (970K tokens, 345 s), its 400-token decode at 70.1 tok/s and a 12K turn (11.6 s) - all
+right, no fault. With card 0's state mapped lazily the same sequence garbled the 970K needle's decode (its first token
+right, then nonsense, DSpark at 1.08 tokens a pass) and the next request faulted every card (one fault: card 0 reading
+one of its expert-cache slabs freed when the cache was released for the prompt) - so the service allocates at load; a
+600K needle into a never-used slot passed either way. Not understood yet.
+
+**Limits now.** The slots take turns (two long answers ~36 tok/s each). A prompt being read pauses the other session
+for its whole layer-major batch (up to 16K tokens, ~6 s at 16K: windows run only between batches). `BYIELD` is not
+acted on. Pictures are read alone. A third request waits for a free slot.
 
 ## Measured (2026-10-27 17:00 - 17:30: concurrent sessions, stage 0 - the parked conversations become a pool, two resume bugs fixed)
 
@@ -2457,6 +2536,13 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-27 19:20: done - concurrent sessions, stage 1: two conversations of up to 1M at once, taking turns (Strata's
+  batch-slot protocol on the TP core's per-conversation state); a re-rendered tail rewinds the live conversation; card
+  0's lazy KV map's DEVICE_LOST found (a peer copy across two VMM allocations) and fixed. Next, in order: why the lazy map
+  garbles a 970K conversation in a slot that held another one (until then the state is allocated at load, +3.1 GiB on
+  card 0); batched decode measured (one pass with both slots' rows - stage 2, built only if it pays); windows inside a
+  long prompt's batch (today the other session waits for the whole batch, up to ~6 s).
 
 - 2026-10-27 17:30: done - concurrency stage 0 (the parked conversations as a pool of 8 in 4 GiB, the live one parked
   before another is taken back, two resume bugs). Next, in order: card 0's KV state mapped by the readers' cap buckets

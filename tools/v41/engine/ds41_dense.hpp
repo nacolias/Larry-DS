@@ -35,6 +35,7 @@ struct Ds41DenseConfig {
     ggml_backend_t backend = nullptr;   ///< NULL = create and own a CPU backend
     int     n_threads = 8;
     int64_t ctx_max = 65536;            ///< positions the caches hold (compressed rows = ctx_max / ratio)
+    int n_seqs = 1;                     ///< larry (batch slots): conversations held side by side (bind_seq)
     int     max_pass = 1;               ///< tokens a pass may carry (>= 1; prefill chunk size = the sub-batch size S)
     /// Layer-major prompt batch (0 = off): the state tensors hold this many token columns and a prompt of up to
     /// `prompt_batch` tokens is walked layer by layer, one dense sub-batch of `max_pass` tokens at a time, with the
@@ -228,6 +229,13 @@ public:
     /// larry (patch-parkpool.py): the host bytes parked slot `slot` holds / a park of `positions` would take
     size_t park_bytes(int slot) const;
     size_t park_bytes_for(int64_t positions) const;
+    /// larry (batch slots, patch-seqs-dense.py): cfg.n_seqs conversations side by side - each its own window ring,
+    /// compressed KV, indexer keys, compressor states, snapshot and written range.  bind_seq(s): every later call (prompt
+    /// batches, snapshot / restore, park / unpark, state_ptrs, kv_bytes_for, take_written, the Engram history) works on
+    /// conversation s.  Not inside a pass or a batch.
+    bool bind_seq(int s);
+    int n_seqs() const;
+    int seq() const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

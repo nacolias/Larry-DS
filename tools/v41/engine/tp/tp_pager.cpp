@@ -474,6 +474,7 @@ struct Ds41KvMap::Impl {
     size_t va_bytes = 0;
     struct Unit { size_t off = 0, bytes = 0, tail = 0, done = 0; };   // tail: the spare row's page (mapped to the end)
     std::vector<Unit> units;
+    std::vector<ze_device_handle_t> peers;   // larry (patch-kvresident.py): the context's other cards
     std::vector<std::pair<void *, size_t>> maps;
     std::vector<ze_physical_mem_handle_t> phys;
     bool map(size_t off, size_t bytes, std::string & err) {
@@ -487,6 +488,13 @@ struct Ds41KvMap::Impl {
         }
         phys.push_back(h);
         maps.emplace_back(va + off, bytes);
+        // larry (patch-kvresident.py): resident on the other cards too - their copy engines pull these rows (the TP
+        // core's replicas); a peer copy that spans into an allocation not resident there faults (vmm_span_probe E)
+        for (ze_device_handle_t pd : peers)
+            if (zeContextMakeMemoryResident(zc, pd, va + off, bytes) != ZE_RESULT_SUCCESS) {
+                err = "kv map: zeContextMakeMemoryResident on a peer failed";
+                return false;
+            }
         q0->memset(va + off, 0, bytes).wait();   // fresh pages: the indexer scores every row up to its cap before masking
         return true;
     }
@@ -506,6 +514,10 @@ bool Ds41KvMap::init(void * queue, std::string & err) {
     if (!im.q0) { err = "kv map: no queue"; return false; }
     im.zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(im.q0->get_context());
     im.zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(im.q0->get_device());
+    for (const auto & d : im.q0->get_context().get_devices()) {   // (larry, patch-kvresident.py)
+        ze_device_handle_t h = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(d);
+        if (h != im.zd) im.peers.push_back(h);
+    }
     size_t pg = 0;
     if (zeVirtualMemQueryPageSize(im.zc, im.zd, (size_t) 1 << 30, &pg) != ZE_RESULT_SUCCESS || !pg) { err = "kv map: page size query failed"; return false; }
     im.page = std::max<size_t>(pg, (size_t) 2 << 20);
