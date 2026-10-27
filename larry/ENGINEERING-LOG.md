@@ -29,7 +29,7 @@ by default and comes back as `reasoning_content`; `"reasoning_effort": "none"` t
 or 1-100 are DeepSeek's numeric effort). Tool calls: DeepSeek's DSML, parsed into OpenAI/Anthropic tool calls.
 Pictures (since 2026-10-26): OpenAI `image_url` parts and Anthropic image blocks (end to end so far: one a request).
 Two requests at once (since 2026-10-27 19:04, `"parallel": 2`): since 20:47 their decode shares the passes - two long
-answers at ~43 tok/s each, 82 in total (one alone ~71-81); a third waits for a free slot.
+answers at ~48 tok/s each, 92 in total since 23:08 (one alone ~71-85); a third waits for a free slot.
 Sampling defaults: temperature 1.0, top-p 0.95. Context: 1,048,576 tokens (since 2026-10-24 20:35; see below).
 
 ## Model provenance (verified 2026-10-26)
@@ -50,6 +50,58 @@ deepseek-ai/DeepSeek-V4.1-Flash-1017 with no fine-tune and no abliteration. The 
 So the weights are DeepSeek's official 1017 release; the metadata strings are mislabeled. dealignai's repo is an
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
+
+## Measured (2026-10-27 21:00 - 23:10: card 0's KV mapped on demand, in the service - the other cards' reads of its later pages; the CPU pool's ternary rows)
+
+**In the service since 23:08** (`patches/svc-lazykv.py`, backup `ds41-xe-engine.sh.pre-lazykv-20261027`): card 0's KV
+state mapped as the conversations grow (`STRATA_DENSE_LAZY_KV=1`, 65,536 positions of each conversation slot at load:
+0.84 instead of 6.28 GiB) - the rest of card 0 holds experts. On the same engine (`abw-lazyspeed`):
+
+| | both slots' KV at load | mapped on demand |
+| --- | ---: | ---: |
+| the agent replay (`agentx.py`) | 98.8 s (prompts 66.7, decode 30.7) | **90.5 s** (prompts 58.7, decode 30.4) |
+| CPU-pool experts a decode pass (the replay) | 7.5 | 5.7 |
+| fresh 2K / 4.4K / 8K / 16K | 3.43 / 4.05 / 4.93 / 6.54 s | 3.26 / 3.85 / 4.97 / 6.56 s |
+| decode: essay / code / math | 76.3 / 119.2 / 115.0 tok/s | 84.6 / 118.5 / 121.8 tok/s |
+| two long answers at once (the service, 800 tokens each) | 43.5 + 43.2 = 82.2 tok/s | 47.6 + 48.7 = **92.5** tok/s |
+
+tsvc2 on the service (`logs/tsvc2-lazy.log`): every needle found (8K 1519 / 1762, 16K 2459, 31K 3134 tok/s), svcbench
+103.3 / 101.3, essay 80.6 / 77.9 tok/s, the tool call, the picture and its follow-up right, hidden RAM 34 GiB;
+`concurtest.py` every answer right.
+
+* **Why it garbled a 984K conversation** (`patches/patch-tpsynclog.py`, diagnostic: `STRATA_TP_SYNC_LOG=1` logs every
+  replica sync, `STRATA_TP_SYNC_CHECK=1` compares sample rows of card 0's KV with each replica right after it): the TP
+  core's replicas on cards 1-3 came out different from card 0 exactly in the rows card 0 holds in a physical allocation
+  mapped after the first one (KV_INIT's pages end at ratio-1 row 133,120, ratio-2 row 67,584) - 24 of 216 sampled
+  regions after a 131K conversation's first turn already, 48 after the 984K prompt (its decode then 254 ms a pass, DSpark
+  1.26 tokens a pass, and faults on three cards at the next request). The replica's own rows all lay in one allocation,
+  so the other cards' READS of card 0's later pages were wrong. Alone the same mapping order reads right
+  (`bench/conc/vmm_span_probe3.cpp` - one allocation of 64 MiB to 1 GiB, filled by a kernel or a copy - and
+  `vmm_span_probe4.cpp` S1 - the engine's order: map, peers read, map more, write, peers read, in one copy across the
+  boundary or split: all exact; `vmm_span_probe2.cpp`'s "failure" was its own pattern bug). What in the engine breaks it is
+  not found - not BAR staging (`bench/conc/lazyab.sh`: the same 24 regions without it); the pager could not be switched
+  off (card 0 then runs out of VRAM).
+* **The fix** (`patches/patch-tpstage.py`): the other cards no longer read those pages. Card 0 copies the compressed-KV
+  and indexer-key rows (and the spare rows) into a plain 64 MiB device buffer of its own and every other card pulls them
+  from there, a chunk at a time - in the sync after a prompt and in the replicas' growth (`hooks.kv_stage`, set when card
+  0's KV is mapped lazily). With it every sync check finds 0 regions different; a 131K needle in one slot and then a 984K
+  one in the other are both found, the 984K's 400-token decode at 68.5 tok/s (32 ms a pass; allocated at load: 70.1),
+  its 12K turn 12.45 s, no fault (`bench/conc/r1m-stage.sh`). The first reply after a ~1M prompt still waits ~8 s for the
+  replicas' sync (6.7 s unstaged) - that is optimization #5's.
+* **The CPU pool's ternary rows** (`patches/patch-ptq1rows.py`): `bench_cpu_pool` (one cold expert a layer on 6 workers +
+  the host, against a streaming read of the same bytes on the same threads): Q3_K and Q2_0 already stream at the DRAM
+  ceiling for one token (33-36 GB/s; 2-3 tokens 7-24 % below it), PTQ1_0 does not - 22.0 / 16.8 / 14.7 GB/s at 1 / 2 / 3
+  tokens against 30.3. Its decode is now done in 8-bit lanes (x = byte ^ 0x80: multiplying by 3 mod 256 keeps the ^ 0x80,
+  so trit n of all 26 code bytes is two compares of 3^n x mod 256) and each token's fp16 scales are converted once a call,
+  not once a row: **27.1 / 20.3 / 17.5 GB/s (+20-23 %), bit-identical** (`bench/cpu/ptq1_rows_bench.cpp` compares every
+  output with the engine's kernel; the engine's entry point old vs new wrote identical files). The per-token half keeps
+  its exact order - it sets the engine's rounding. `STRATA_PTQ1_ROWS1=1`: the old decode.
+* **The CPU pool in decode** (`bench/conc/cpulog.sh` + `cpulog_stats.py`, `STRATA_XE_CPU_LOG`): a pass alone puts 5.8
+  experts on the pool (94 % of them for one token) - 74 MB of weights in 2.6 ms; two at once 18.9 (90 % one token) - 239
+  MB in 9.4 ms: 25-29 GB/s, what the host's memory gives. Faster kernels buy decode little; more experts on the cards (the
+  lazy map's VRAM) or fewer bytes a cold expert do.
+* `bench/conc/s2build.sh` now puts back the files the service ran when the build started (it put back the PRE-stage-2
+  engine after every build: the 21:46 restore started stage 1 for a minute, unnoticed until the checksums).
 
 ## Measured (2026-10-27 19:20 - 20:58: concurrent sessions, stage 2 - the two sessions' decode in shared passes)
 
@@ -107,16 +159,20 @@ both rounds' rows, and each accepts against its own rows. Two long answers at on
   pool's experts on 13-14 of its layers, a pass alone (2.1 rows) ~3 ms on 5-6: two conversations' hot experts do not
   fit the cards' caches together, more picks land in the RAM arena, and each such layer waits for the host. The width
   bench missed it: it repeated identical passes, and the tier promoted their experts into VRAM before the median.
-  Faster CPU-pool experts (the next optimization: multi-token rows kernels) are now the lever for two sessions as well.
+  `STRATA_XE_CPU_LOG` (21:02, `bench/conc/cpulog.sh`, 400-token answers): a pass alone puts 5.8 experts on the pool
+  (94 % of them for one token) - 74 MB of weights in 2.6 ms; two at once 18.9 experts (90 % one token) - 239 MB in 9.4
+  ms. The pool streams 25-29 GB/s, close to what the host's memory gives: faster kernels would buy little here; fewer
+  bytes a cold expert (a lower-bit RAM tier) or more of both conversations' experts on the cards would. One format
+  class (15.2 MB blobs, 95 % pageable) is half the picks.
 
 tsvc2 on the service (`logs/tsvc2-s2.log`): every needle found (8K 1446 / 1770, 16K 2457, 31K 3106 tok/s), svcbench
 84.0 (the first after the restart) / 96.5, again 97.9 / 92.8, essay 75.0 / 73.3 tok/s, the tool call, the picture and
 its follow-up right, hidden RAM 34 GiB.
 
-**Limits now.** Two sessions decode together at ~43 tok/s each. A prompt being read still pauses the other session for
-its whole layer-major batch (up to 16K tokens, ~6 s). `BYIELD` is not acted on. Pictures are read alone. A third
-request waits for a free slot. Both slots' card-0 KV state is allocated at load (the lazy map's garble in a reused slot
-is not understood yet).
+**Limits now.** Two sessions decode together at ~43 tok/s each (48 since the lazy map, next section). A prompt being read
+still pauses the other session for its whole layer-major batch (up to 16K tokens, ~6 s). `BYIELD` is not acted on.
+Pictures are read alone. A third request waits for a free slot. Both slots' card-0 KV state is allocated at load (mapped
+on demand since 23:08: next section).
 
 ## Measured (2026-10-27 17:30 - 19:20: concurrent sessions, stage 1 - two conversations at once)
 

@@ -21,7 +21,7 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 | agent-session replies (greedy) | 120-124 tok/s |
 | 984K-token prompt | 6 min, then 67 tok/s |
 | context window | 1,048,576 tokens |
-| two requests at once (`"parallel": 2`) | their decode shares the passes: two long answers at 43.5 + 43.2 tok/s (one alone 71-81); a 4K-token question arriving mid-answer answered 4.1 s later |
+| two requests at once (`"parallel": 2`) | their decode shares the passes: two long answers at 47.6 + 48.7 tok/s (one alone 71-85); a 4K-token question arriving mid-answer answered 4.0 s later |
 | a new 800x600 picture | 7-8 s (~6 s of it the CPU encode); a follow-up question on it 0.2-1.2 s |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
@@ -222,12 +222,12 @@ The Larry-specific ones:
 ## Known limits
 
 - **Two requests at once** (`"parallel": 2`). Each slot holds a conversation of up to 1M tokens on the cards; when
-  both decode, one pass verifies both (two long answers ~43 tok/s each, 82 in total: the CPU pool's experts bound it,
+  both decode, one pass verifies both (two long answers ~48 tok/s each, 92 in total: the CPU pool's experts bound it,
   two conversations' hot experts do not fit the cards' caches together). A prompt
   being read pauses the other session for its whole batch (up to 16K tokens, ~6 s). A third request waits for a free
   slot; up to 8 more conversations wait parked in host memory (4 GiB), so moving between chats or agents does not
-  re-read them. Both slots' card-0 KV state is allocated at load (+3.1 GiB); the lazy map that would avoid it still
-  garbles a 970K conversation in a reused slot (engineering log, 2026-10-27).
+  re-read them. Card 0's KV state is mapped as the conversations grow (0.84 GiB at load, up to 6.3 GiB for two 1M
+  conversations); the first reply after a ~1M prompt waits ~8 s for the other cards' copies of it.
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
 - **Pictures are encoded on the CPU.** A new 800x600 picture takes ~6 s on 6 threads (a repeat comes from the

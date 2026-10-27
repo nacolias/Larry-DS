@@ -206,6 +206,11 @@ export STRATA_SERVE_PARK_MAX="${STRATA_SERVE_PARK_MAX-262144}"
 # the oldest go first; patch-parkpool.py) - rotating several agents / chats no longer re-reads their prompts
 export STRATA_SERVE_PARK_SLOTS="${STRATA_SERVE_PARK_SLOTS-8}"
 export STRATA_SERVE_PARK_GIB="${STRATA_SERVE_PARK_GIB-4}"
+# card 0's KV state mapped as the conversations grow (patch-kvbucket.py / patch-kvresident.py / patch-tpstage.py):
+# 65536 positions of each conversation slot at load, the rest by the readers' power-of-two buckets when a prompt or a
+# pass reaches them (card 0's expert cache gives the VRAM back) - both slots' 1M at load took 6.28 GiB of card 0
+export STRATA_DENSE_LAZY_KV="${STRATA_DENSE_LAZY_KV-1}"
+export STRATA_DENSE_KV_INIT="${STRATA_DENSE_KV_INIT-65536}"
 # the TP cards' KV room beyond what 262K needs (0.8 GiB a card) holds experts until a long context needs it: then
 # their slabs go back (copies read from the model file) - without it a 1M context cost 757 experts on the cards
 export STRATA_XE_TP_EVICT="${STRATA_XE_TP_EVICT-1}"

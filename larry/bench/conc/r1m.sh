@@ -5,7 +5,8 @@
 # allocated at load.  Each: needle 200 (-> conversation slot 0), then a long needle (R1M_TOKENS, default 600000) + its
 # deep decode + a 12K turn (abx.py; -> slot 1).  A fault: its addresses matched against the engine log's "addr:" ranges,
 # then a GT reset of every card (bench/../logs/gtreset.sh) before the next variant.  An abw.sh "@" step.
-# R1M_VARIANTS (default "A B"), R1M_TOKENS (the needles, comma-separated, default 600000).
+# R1M_VARIANTS (default "A B"), R1M_TOKENS (the needles, comma-separated, default 600000), R1M_ENV (more environment for
+# both servers, e.g. a staged engine's XE_BIN / LD_LIBRARY_PATH and diagnostics).
 cd /opt/ai/dsv41
 for V in ${R1M_VARIANTS:-A B}; do
   N=r1m$V
@@ -20,6 +21,7 @@ json.dump(c, open(sys.argv[1], 'w'), indent=2)
 PY
   ENVV="STRATA_ADDR_LOG=1"
   [ $V = A ] && ENVV="$ENVV STRATA_DENSE_LAZY_KV=1 STRATA_DENSE_KV_INIT=65536"
+  ENVV="$ENVV ${R1M_ENV:-}"
   rm -f logs/engine-$N.log
   T0=$(date '+%F %T')
   mkdir -p /run/ds41-test
@@ -40,7 +42,7 @@ PY
   fi
   kill -TERM -$SP 2>/dev/null || kill -TERM $SP 2>/dev/null
   for i in $(seq 1 90); do pgrep -x ds41_generate_x > /dev/null || { kill -0 $SP 2>/dev/null || break; }; sleep 2; done
-  grep -a -E "serve: prompt [0-9]{6} |decode failed|DEVICE_LOST|KV replicas now|kv map:|gave .* back" logs/engine-$N.log | tail -12 | cut -c1-170
+  grep -a -E "serve: prompt [0-9]{6} |decode failed|DEVICE_LOST|KV replicas now|kv map:|gave .* back|tp sync|tp prof" logs/engine-$N.log | tail -40 | cut -c1-230
   f=$(journalctl -k --since "$T0" --no-pager | grep -c "Faulted Address")
   echo "[$N] faults in the kernel log since its start: $f"
   if [ "$f" -gt 0 ]; then

@@ -72,6 +72,10 @@ struct Ds41TpHooks {
     /// the CPU pool's share of layer l (the picks on no card) weighted into out [n][D] (zeroed by the callee when it
     /// runs any); returns how many experts it ran (0: out untouched)
     std::function<int(int l, int n, const int32_t * ids, const float * w, const float * x, float * out)> cpu_part;
+    /// larry (patch-tpstage.py): card 0's compressed KV / indexer keys live in virtual memory mapped as the context grows
+    /// (STRATA_DENSE_LAZY_KV) - the other cards pull those rows through a plain staging buffer on card 0, never from
+    /// the mapped pages themselves (their reads of pages mapped after the first allocation came back other data)
+    bool kv_stage = false;
 };
 
 struct Ds41TpConfig {

@@ -561,6 +561,7 @@ int main(int argc, char ** argv) {
         tc.act_quant = a.act_quant;
         if (const char * c = std::getenv("STRATA_TP_CACHE")) tc.cache_dir = c;
         Ds41TpHooks th;
+        th.kv_stage = kvmap && dense.kv_lazy();   // larry (patch-tpstage.py): peers pull card 0's lazily mapped KV staged
         for (int l = 0; l < n_layer; ++l) {
             void * p[5] = {};
             if (!dense.state_ptrs(l, &p[0], &p[1], &p[2], &p[3], &p[4])) {
