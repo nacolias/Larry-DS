@@ -56,6 +56,9 @@ struct Ds41TpHooks {
     /// optional: the same for one slot (0 / 1) - the first Engram layer's gate opens before the second's rows are read
     /// (engram is then only the fallback); the tokens are recorded by the slot 0 call
     std::function<bool(const int * tids, int n, int pos0, int slot, float * out)> engram_slot;
+    /// larry (batched decode, patch-batch-tp.py): engram_slot for conversation `seq`'s history - a pass of several
+    /// conversations reads each run's rows from its own (required by pass_multi when the Engram is on)
+    std::function<bool(int seq, const int * tids, int n, int pos0, int slot, float * out)> engram_slot_seq;
     /// the expert tier's pinned residency table (RtEnt [n_layer * n_expert]: blob on its card, offsets, types, card or
     /// -1) and its change counter: the cards' copies are refreshed when it moved (between passes)
     const void * rtab = nullptr;
@@ -118,6 +121,12 @@ public:
     bool pass(const int * tids, int n, int pos0, float * logits, bool graph) { return pass(tids, n, pos0, logits, nullptr, graph); }
     /// main_hidden (optional): n * 3 * n_embd floats - DSpark's taps, the HC-mean of the state leaving layers 36 / 37 / 38
     bool pass(const int * tids, int n, int pos0, float * logits, float * main_hidden, bool graph);
+    /// larry (batched decode, patch-batch-tp.py): one pass over several conversations - run u: ns[u] tokens of
+    /// conversation seqs[u] at positions pos0s[u].. (tids: the runs' tokens back to back, sum ns <= 7, a conversation at
+    /// most once).  Each run reads and writes its own conversation's state (window ring, compressor, indexer); every
+    /// row shares the weights' work.  Logits / main_hidden rows in tids' order (DSpark's draft_step takes its taps by row
+    /// as after a plain pass).  Its own graphs (recorded at the first pass of its shape).  The bound conversation stays bound.
+    bool pass_multi(const int * tids, const int * seqs, const int * ns, const int * pos0s, int nrun, float * logits, float * main_hidden);
     /// debug: every card's intermediate buffers of the last pass (its last layer) -> dir/r<k>_<name>.bin (floats)
     bool dump(const std::string & dir, int n);
     /// the last pass's per-card GPU time (us, from the first to the last command; eager mode with profiling off: 0)
@@ -144,6 +153,9 @@ public:
     bool bind_seq(int s);
     int n_seqs() const;
     int seq() const;
+    /// larry (batched decode, patch-batch-check.py; diagnostic): the bound conversation's ratio-2 compressor states (every
+    /// card) copied aside (restore false) or back (true) - a check pass at the same positions then leaves them as they were
+    bool st_keep(bool restore);
 
     /// larry, engine1: DSpark's draft stack (the sidecar's mtp.0-2: ds41_dspark.hpp's contract) on the same N cards - its
     /// blocks split as the trunk's layers, its routed experts (Q2_K) e on rank e % N.  Loads the weights (VRAM on every

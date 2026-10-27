@@ -28,8 +28,8 @@ Clients: Larry's public endpoint, a reverse proxy to the server (OpenAI: `/v1/ch
 by default and comes back as `reasoning_content`; `"reasoning_effort": "none"` turns it off (`low`/`medium`/`high`/`max`
 or 1-100 are DeepSeek's numeric effort). Tool calls: DeepSeek's DSML, parsed into OpenAI/Anthropic tool calls.
 Pictures (since 2026-10-26): OpenAI `image_url` parts and Anthropic image blocks (end to end so far: one a request).
-Two requests at once (since 2026-10-27 19:04, `"parallel": 2`): they take turns, each at about half speed; a third
-waits for a free slot.
+Two requests at once (since 2026-10-27 19:04, `"parallel": 2`): since 20:47 their decode shares the passes - two long
+answers at ~43 tok/s each, 82 in total (one alone ~71-81); a third waits for a free slot.
 Sampling defaults: temperature 1.0, top-p 0.95. Context: 1,048,576 tokens (since 2026-10-24 20:35; see below).
 
 ## Model provenance (verified 2026-10-26)
@@ -50,6 +50,73 @@ deepseek-ai/DeepSeek-V4.1-Flash-1017 with no fine-tune and no abliteration. The 
 So the weights are DeepSeek's official 1017 release; the metadata strings are mislabeled. dealignai's repo is an
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
+
+## Measured (2026-10-27 19:20 - 20:58: concurrent sessions, stage 2 - the two sessions' decode in shared passes)
+
+**In the service since 20:47** (`bench/conc/s2install.sh` in a window; the engine before it kept in
+`build-xe/pre-s2`). When both slots decode, each plans its DSpark round in its own conversation, ONE TP pass verifies
+both rounds' rows, and each accepts against its own rows. Two long answers at once now decode at 43.5 + 43.2 = 82.2 tok/s
+(stage 1, taking turns: 35.6 + 35.8 = 71.4); a request alone runs as before.
+
+* **The measurement first** (`patches/patch-widthbench.py`, diagnostic: `STRATA_TP_WIDTH_BENCH=R` - after each request
+  of a test server, R passes of every width 1..7 through `pass_v`; `bench/conc/wb.sh`, `wbessay.py`). Rows of two real
+  conversations in one pass (the conversation's own last tokens + the previous request's) cost what one conversation's
+  rows of that width cost; random token ids were a bad proxy (they route to cold experts). The solo round in the same
+  run: 2.0-2.16 rows verified, the verify pass 19.1-20.7 ms, DSpark's step 2.2-2.4 ms. The model said ~+55 % over
+  taking turns, over the +25 % bar set for building it - too optimistic (below).
+
+| median ms a pass (8K context) | 1 row | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one conversation's own rows | 13.5 | 17.2 | 18.5 | 21.6 | 24.0 | 26.7 | 29.9 |
+| two conversations' rows (half each) | - | 17.3 | 18.4 | 21.1 | 23.8 | 26.1 | 29.2 |
+| random token ids | 16.0 | 26.1 | 27.8 | 30.5 | 31.1 | 38.1 | 41.8 |
+
+  (At 31K the same: own 13.6 / 17.6 / 18.9 / 21.8 / 24.0 / 26.7 / 29.6, two conversations' - / 17.5 / 18.5 / 21.7 /
+  24.6 / 27.0 / 29.5.)
+* **One pass, several conversations** (`patches/patch-batch-tp.py`, `patch-batch-kern.py`): `Ds41Tp::pass_multi` takes
+  runs - consecutive positions of one conversation each, rows back to back, <= 7 in all. The weights' work (every
+  mat-vec, the shared and routed experts, the CPU pool, the LM head) takes all rows at once; the state kernels (the
+  window row, the compressor, the indexer's scan and top-k, the attention) run once a run on views from the run's
+  first row, each in its own conversation's state (only attn_dec's grouped q8 output needs the run's place in the
+  pass: `row0` / `n_rows`). A plain pass is the one-run case of the same code (offsets 0: the same kernels with the
+  same arguments). A pass of runs has its own recorded graphs (keyed by the runs' conversations, widths and scan
+  buckets; recorded at first use). Each run's Engram rows come from its own conversation's n-gram history
+  (`patch-batch-dense.py`).
+* **The serve loop** (`patches/patch-batch-serve.py`): a DSpark round is split into plan (emit t, the drafts, the
+  verify rows) and accept (against the pass's rows, DSpark's step on the run's taps, emit the accepted drafts). With
+  two slots decoding, each plans (the drafts capped so every row fits the 7), one `pass_multi` runs them, each accepts;
+  `STRATA_SERVE_JOINT=0` makes them take turns again. A request alone runs plan, its own pass, accept, as before.
+* **Checked** (`patches/patch-batch-check.py`, diagnostic: `STRATA_SERVE_JOINT_CHECK=1` runs every run's rows through
+  a pass of its own first - its ratio-2 compressor state kept aside and put back - and compares the joint pass's
+  logits with them): KL(own || joint) 0.0006-0.008 a row, the same argmax in 96.5-100 % of the rows. The baseline
+  (`=2`: a conversation's rows against the same rows with one more row after them, no joint pass) gives 0.0012-0.0015
+  and 98.7-100 % - the joint pass differs from a conversation's own pass as much as two widths of its own pass do
+  (the kernels' forms go by width; DSpark's verify widths vary the same way every day). With the expert promotions
+  frozen (`STRATA_TP_PROMOTE_CHUNKS=0`) a request alone is byte-deterministic: two runs of a 400-token answer
+  identical. `concurtest.py`: every answer right (two needles read and decoded side by side, both follow-ups from
+  their own slots); the tool call right. Tests: `bench/conc/s2test.sh` (the staged engine: `s2build.sh` builds into
+  `/opt/ai/dsv41/s2bin` and puts the service's files back), `jointcheck.py`.
+
+| two long answers at once | taking turns | one pass |
+| --- | ---: | ---: |
+| test server, the same engine (`STRATA_SERVE_JOINT=0` / 1), 1,500 tokens each | 37.4 + 38.9 = 74.6 tok/s | 43.9 + 48.2 = 83.7 tok/s (+12 %) |
+| the service, 500 / 800 tokens each (stage 1 / stage 2) | 35.6 + 35.8 = 71.4 | 43.5 + 43.2 = 82.2 (+15 %) |
+| one answer alone | 72-81 | 71-81 |
+
+* **Why not +55 %: the CPU pool.** With `STRATA_TP_PROF=1` a joint pass (3.9 rows) spends 9.5-10.5 ms in the CPU
+  pool's experts on 13-14 of its layers, a pass alone (2.1 rows) ~3 ms on 5-6: two conversations' hot experts do not
+  fit the cards' caches together, more picks land in the RAM arena, and each such layer waits for the host. The width
+  bench missed it: it repeated identical passes, and the tier promoted their experts into VRAM before the median.
+  Faster CPU-pool experts (the next optimization: multi-token rows kernels) are now the lever for two sessions as well.
+
+tsvc2 on the service (`logs/tsvc2-s2.log`): every needle found (8K 1446 / 1770, 16K 2457, 31K 3106 tok/s), svcbench
+84.0 (the first after the restart) / 96.5, again 97.9 / 92.8, essay 75.0 / 73.3 tok/s, the tool call, the picture and
+its follow-up right, hidden RAM 34 GiB.
+
+**Limits now.** Two sessions decode together at ~43 tok/s each. A prompt being read still pauses the other session for
+its whole layer-major batch (up to 16K tokens, ~6 s). `BYIELD` is not acted on. Pictures are read alone. A third
+request waits for a free slot. Both slots' card-0 KV state is allocated at load (the lazy map's garble in a reused slot
+is not understood yet).
 
 ## Measured (2026-10-27 17:30 - 19:20: concurrent sessions, stage 1 - two conversations at once)
 

@@ -1729,7 +1729,7 @@ diff --git a/ggml/src/ggml-sycl/dsv41-dec.hpp b/ggml/src/ggml-sycl/dsv41-dec.hpp
 new file mode 100644
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/dsv41-dec.hpp
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,796 @@
 +// ggml-sycl/dsv41-dec.hpp - larry (DeepSeek-V4.1 on Intel Arc B70): the decode / verify-width (< 8 queries) attention
 +// core as three kernels, pointer-based (dsv41-fused.cpp wraps them as ggml ops; an engine without ggml can call them).
 +//
@@ -2031,6 +2031,9 @@ new file mode 100644
 +    // its scales [K8 / 32][8]
 +    sycl::half * oT = nullptr;
 +    float * odT = nullptr;
++    // larry (batched decode, patch-batch-kern.py): this launch is rows row0 .. row0 + n - 1 of a pass of n_rows (0: n) -
++    // the q8 outputs above are indexed by the pass's rows (the other row-major pointers point at the run's first row)
++    int row0 = 0, n_rows = 0;
 +};
 +
 +inline int n_chunks(int M) { return (M + XKC - 1) / XKC; }
@@ -2283,7 +2286,8 @@ new file mode 100644
 +        }
 +        if (A.hpg) {   // q8: a 32-value block is 4 lanes x 8 dims (lanes 4 j .. 4 j + 3 of one g)
 +            const int K8 = A.hpg * D;
-+            const size_t r8 = (size_t) (hh / A.hpg) * n + b;
++            const int NR = A.n_rows > 0 ? A.n_rows : n, B8 = b + A.row0;   // (larry: a run's rows in the pass's q8)
++            const size_t r8 = (size_t) (hh / A.hpg) * NR + B8;
 +            const int koff = (hh % A.hpg) * D;
 +#pragma unroll
 +            for (int g = 0; g < 4; ++g) {
@@ -2301,8 +2305,8 @@ new file mode 100644
 +                if (A.oT) {
 +                    const size_t gb = (size_t) (hh / A.hpg) * K8;
 +#pragma unroll
-+                    for (int e = 0; e < 8; ++e) A.oT[(gb + k + e) * 8 + b] = (sycl::half) sycl::rint(acc[8 * g + e] * id);
-+                    if ((lane & 3) == 0) A.odT[(gb + k) / 32 * 8 + b] = am / 127.0f;
++                    for (int e = 0; e < 8; ++e) A.oT[(gb + k + e) * 8 + B8] = (sycl::half) sycl::rint(acc[8 * g + e] * id);
++                    if ((lane & 3) == 0) A.odT[(gb + k) / 32 * 8 + B8] = am / 127.0f;
 +                }
 +            }
 +        }

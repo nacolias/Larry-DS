@@ -3323,6 +3323,28 @@ bool Ds41Dense::engram_rows_slot(const int * tids, int n, int pos0, int slot, fl
     return b && im.engram.wait(b, im.err);
 }
 
+bool Ds41Dense::engram_rows_slot_seq(int s, const int * tids, int n, int pos0, int slot, float * out) {
+    Impl & im = *p_;
+    if (s == im.seq) return engram_rows_slot(tids, n, pos0, slot, out);
+    if (!im.engram.enabled() || slot < 0 || slot >= im.engram.n_slots()) return true;
+    if (s < 0 || (size_t) s >= im.seqs.size()) { im.err = "Engram rows: no conversation slot " + std::to_string(s); return false; }
+    if (slot == 0) {
+        if (!engram_ready_all(im)) return false;
+        if (im.eng_pf) {
+            std::string e2;
+            im.engram.wait(im.eng_pf, e2);
+            im.eng_pf.reset();
+        }
+    }
+    im.engram.bind_seq(s);   // its history: the tokens' record and the hashes (start_into hashes before it returns)
+    if (slot == 0)
+        for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
+    float * outp[2] = { slot == 0 ? out : nullptr, slot == 1 ? out : nullptr };
+    auto b = im.engram.start_into(pos0, n, outp, im.err);
+    im.engram.bind_seq(im.seq);
+    return b && im.engram.wait(b, im.err);
+}
+
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;
     const auto & L = im.ly[(size_t) il];

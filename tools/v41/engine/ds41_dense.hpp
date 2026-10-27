@@ -276,6 +276,8 @@ public:
     /// larry, engine1: one slot's rows (slot 0 first: it records the tokens) - the first Engram layer can start before
     /// the second's rows are read
     bool engram_rows_slot(const int * tids, int n, int pos0, int slot, float * out);
+    /// larry (batched decode, patch-batch-dense.py): the same for conversation s's history (s need not be bound)
+    bool engram_rows_slot_seq(int s, const int * tids, int n, int pos0, int slot, float * out);
 
 private:
     std::unique_ptr<Impl> p_;

@@ -21,7 +21,7 @@ RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B chan
 | agent-session replies (greedy) | 120-124 tok/s |
 | 984K-token prompt | 6 min, then 67 tok/s |
 | context window | 1,048,576 tokens |
-| two requests at once (`"parallel": 2`) | they take turns: two long answers at 35.6 + 35.8 tok/s; a 4K-token question arriving mid-answer answered 4.1 s later |
+| two requests at once (`"parallel": 2`) | their decode shares the passes: two long answers at 43.5 + 43.2 tok/s (one alone 71-81); a 4K-token question arriving mid-answer answered 4.1 s later |
 | a new 800x600 picture | 7-8 s (~6 s of it the CPU encode); a follow-up question on it 0.2-1.2 s |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
@@ -221,8 +221,9 @@ The Larry-specific ones:
 
 ## Known limits
 
-- **Two requests at once, taking turns** (`"parallel": 2`). Each slot holds a conversation of up to 1M tokens on the
-  cards; the two decode in turn, so together they get one stream's speed (two long answers ~36 tok/s each). A prompt
+- **Two requests at once** (`"parallel": 2`). Each slot holds a conversation of up to 1M tokens on the cards; when
+  both decode, one pass verifies both (two long answers ~43 tok/s each, 82 in total: the CPU pool's experts bound it,
+  two conversations' hot experts do not fit the cards' caches together). A prompt
   being read pauses the other session for its whole batch (up to 16K tokens, ~6 s). A third request waits for a free
   slot; up to 8 more conversations wait parked in host memory (4 GiB), so moving between chats or agents does not
   re-read them. Both slots' card-0 KV state is allocated at load (+3.1 GiB); the lazy map that would avoid it still

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""twoessays.py - the decode rate of two long answers at once (each 500 tokens, greedy, different topics), against one
-alone: per stream and in total.  Server: DS41_URL (ds41api.py)."""
+"""twoessays.py [N] - the decode rate of two long answers at once (each N tokens, default 500, greedy, different topics),
+against one alone: per stream and in total.  Server: DS41_URL (ds41api.py)."""
 import json, sys, threading, time, urllib.request
 import ds41api
 
@@ -8,7 +8,10 @@ TOPICS = ["how virtual memory works in modern operating systems", "how TCP conge
           "how a garbage collector with generations works"]
 
 
-def run(topic, out, n=500):
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 500
+
+
+def run(topic, out, n=N):
     body = {"model": "larry", "max_tokens": n, "temperature": 0, "reasoning_effort": "none", "stream": True,
             "stream_options": {"include_usage": True},
             "messages": [{"role": "user", "content": "Write a detailed technical essay (at least 600 words) on " + topic + "."}]}
