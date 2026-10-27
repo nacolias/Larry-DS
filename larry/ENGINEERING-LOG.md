@@ -49,6 +49,48 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-27 17:00 - 17:30: concurrent sessions, stage 0 - the parked conversations become a pool, two resume bugs fixed)
+
+**Concurrent sessions are the next feature** (the owner, 2026-10-27; the plan: two sessions of up to 1M each, resident on
+the cards and taking turns pass by pass, then a measured decision on batched decode). Why not before: Project Maya's
+`--parallel` exists only for its GLM engine - its DeepSeek engine answers one request at a time and keeps the others in
+RAM / disk slots - and upstream Xolotl's ds41 batch slots (NektoDron, 2026-10-20, after this fork) run on the one-card
+ggml path, while larry decodes on its own four-card TP core, whose state and recorded graphs are one sequence's. The
+server already has Strata's batch-slot client (`generate_batched`), dormant until an engine announces `batch_slots`.
+
+Stage 0, **in the service since 17:16** (`patches/patch-parkpool.py`, `patches/svc-parkpool.py`, backup
+`ds41-xe-engine.sh.pre-parkpool-20261027`):
+
+* **Two resume bugs fixed**, as upstream Xolotl's dffa55a3 found them on its side:
+  - a *partial* unpark (`STRATA_SERVE_PARK_PARTIAL`: a prompt that continues most of a parked conversation) resumed at
+    any point from 3/4 of it with the side request's window ring and compressor state still live. That is exact only
+    within the ring: an even resume point at most 16 positions before the park's end, after `restore()`. Now exactly
+    that; otherwise the prompt is read fresh. engine.log had no partial unpark in its 2,014 requests, so no answer is
+    known to have been affected.
+  - the Engram history (kept by position, not parked) still held the side request's tokens before the resume point,
+    which the first new positions' hashes read. Every resume now writes the 8 tokens before it back (the picture
+    path did, for pictures only).
+* **Taking a parked conversation back no longer throws the live one away**: it is parked first (`park_live`). Before,
+  rotating three conversations re-read one of them every time.
+* **A pool:** `STRATA_SERVE_PARK_SLOTS` up to 64 (was 2) and `STRATA_SERVE_PARK_GIB`, their host memory together (the
+  oldest go first). A park now copies positions / 2 + 2 rows of a ratio-2 source (it copied positions + 1): ~3,200 bytes
+  a position instead of 5,120, a 100K-token conversation ~0.33 GB. The service: 8 slots, 4 GiB. The engine prints the
+  server's "conversation cache:" lines and INFO `conversation_cache_mib` / `_slots`, so the Monitor's Conversation
+  cache card shows the pool.
+
+`bench/conc/s0test.sh` (a private server, 8 slots / 4 GiB; `bench/conc/reusetest.py`):
+
+| | read | reused | time | answer |
+| --- | ---: | ---: | ---: | --- |
+| turn 1 of four conversations A-D (~3-4K tokens each, one passphrase each) | 3,094-4,071 | 0 | 3.5-4.6 s | right |
+| turn 2 of each, in turn: taken back from the pool | 23-24 | 3,094-4,071 | **0.4-0.5 s** | right |
+| E after an unrelated side request, its last words re-rendered (the partial resume) | 9 | 2,560 | 0.2 s | right |
+| E with a change ~200 tokens before the end (read fresh now) | 2,737 | 0 | 3.2 s | right |
+
+tsvc2 on the service (`logs/tsvc2-parkpool.log`): every needle found (8K 1443 / 1895, 16K 2443, 31K 3158 tok/s),
+svcbench 103.2 / 102.0, essay 80.5 / 71.1 tok/s, the tool call, the picture and its follow-up right, hidden RAM 34 GiB at
+most.
+
 ## Measured (2026-10-26 22:40 - 23:45: pictures - DeepSeek-V4.1's vision path on the Intel engine)
 
 **What was there.** The sidecar GGUF (`V41-MTP-Vision-1017.Q2_K.gguf`) carries the vision tower: 266 tensors, 485M
@@ -2415,6 +2457,13 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-27 17:30: done - concurrency stage 0 (the parked conversations as a pool of 8 in 4 GiB, the live one parked
+  before another is taken back, two resume bugs). Next, in order: card 0's KV state mapped by the readers' cap buckets
+  (`STRATA_DENSE_LAZY_KV` died at 524,288 because the scans read whole power-of-two buckets past what was mapped), then
+  stage 1 - two resident sessions of up to 1M taking turns pass by pass (per-slot state on the four cards, the TP core's
+  graphs keyed by slot, the serve loop speaking Strata's batch-slot protocol the server already has), then a measurement
+  of batched decode. After it: short tier calls, big prompts on both sides, the long-context indexer.
 
 - 2026-10-25 12:05: done - layers 0-19's attention through oneDNN's fused SDPA (fresh 16K -0.2 s, 31K -0.5 s).
   Next: the tier calls now bound layers 0-19 at 16K as well as 8K (their GEMM phase ~2x xe_dqgemm alone; the first call

@@ -219,7 +219,9 @@ The Larry-specific ones:
 
 ## Known limits
 
-- **One request at a time** (first in, first out). A side request can park one long conversation.
+- **One request at a time** (first in, first out). Up to 8 other conversations wait parked in host memory (at most
+  4 GiB together), so moving between chats or agents does not re-read their prompts. Concurrent sessions are the
+  next feature (engineering log, 2026-10-27).
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
 - **Pictures are encoded on the CPU.** A new 800x600 picture takes ~6 s on 6 threads (a repeat comes from the

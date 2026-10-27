@@ -202,6 +202,10 @@ export STRATA_XE_BAR_STAGE="${STRATA_XE_BAR_STAGE-1}"
 # request inside a long conversation may write up to 262,144 positions and still park the conversation (~0.8 GB of host
 # memory; was 65,536)
 export STRATA_SERVE_PARK_MAX="${STRATA_SERVE_PARK_MAX-262144}"
+# the parked conversations: a pool of 8 beside the live one, at most 4 GiB of host memory together (~3.2 KB a token;
+# the oldest go first; patch-parkpool.py) - rotating several agents / chats no longer re-reads their prompts
+export STRATA_SERVE_PARK_SLOTS="${STRATA_SERVE_PARK_SLOTS-8}"
+export STRATA_SERVE_PARK_GIB="${STRATA_SERVE_PARK_GIB-4}"
 # the TP cards' KV room beyond what 262K needs (0.8 GiB a card) holds experts until a long context needs it: then
 # their slabs go back (copies read from the model file) - without it a 1M context cost 757 experts on the cards
 export STRATA_XE_TP_EVICT="${STRATA_XE_TP_EVICT-1}"

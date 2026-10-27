@@ -217,7 +217,7 @@ public:
     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
     /// memory; unpark() writes them back and re-arms the snapshot, so restore() resumes the parked conversation.  Valid
     /// only while no request has written past position n since park (the caller checks).
-    /// larry: `slot` (0 / 1): two conversations can be parked (STRATA_SERVE_PARK_SLOTS)
+    /// larry: `slot` 0 .. 63: a pool of parked conversations (STRATA_SERVE_PARK_SLOTS; patch-parkpool.py)
     bool park(int64_t positions, int slot = 0);
     /// larry (cfg.kv_alloc): per KV unit (kv_alloc's order) the bytes from its start that `positions` positions use
     void kv_bytes_for(int64_t positions, std::vector<size_t> & bytes) const;
@@ -225,6 +225,9 @@ public:
     bool unpark(int slot = 0);
     void drop_park(int slot = 0);
     bool parked(int slot = 0) const;
+    /// larry (patch-parkpool.py): the host bytes parked slot `slot` holds / a park of `positions` would take
+    size_t park_bytes(int slot) const;
+    size_t park_bytes_for(int64_t positions) const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
