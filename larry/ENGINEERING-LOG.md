@@ -102,6 +102,16 @@ tsvc2 on the service (`logs/tsvc2-lazy.log`): every needle found (8K 1519 / 1762
   lazy map's VRAM) or fewer bytes a cold expert do.
 * `bench/conc/s2build.sh` now puts back the files the service ran when the build started (it put back the PRE-stage-2
   engine after every build: the 21:46 restore started stage 1 for a minute, unnoticed until the checksums).
+* **What an agent's follow-up prompt waits on now** (23:15-23:45, the agent replay; `STRATA_XE_CALL_TL` timelines through
+  `bench/speed/calltl_stats.py`, `STRATA_XE_LOCK_PROF`): the tier's calls stream next to nothing to the cards any more
+  (0-0.9 experts a card a call) - they are host-bound. A ~380-token call: 21.9 ms, its CPU-light part (23 experts) 19.7
+  ms and last 60 % of the time; card 1 does 21 GEMM experts (621 rows) and 32 small-expert jobs - ~0.5 GB of VRAM reads,
+  2-3 ms of GPU work - in 16.3 ms of its thread. ~1,500-token calls: 34.7 ms, the cards last (~21 ms), the CPU part 5.6
+  ms. Per 400 calls the submit lock is waited for ~8.8 s (summed over the threads) and held ~2.5 s - ~5 ms of each card
+  thread's call; one site (`hot_put`, a take per 1 MiB chunk of the prefetch's copies) takes it ~170 times a call.
+  Knobs, the agent replay's prompts: base 60.0 s, `STRATA_XE_ZCOPY=2` 61.3, `STRATA_XE_CPU_LIGHT=4` 60.9, `=2` 60.1,
+  `STRATA_XE_GEMM_MIN=4` 61.5 - all within the noise. What is left there is the calls' structure (far fewer enqueues
+  and lock takes a card, no lock where nothing pageable is copied) - not a knob.
 
 ## Measured (2026-10-27 19:20 - 20:58: concurrent sessions, stage 2 - the two sessions' decode in shared passes)
 
