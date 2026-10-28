@@ -78,6 +78,11 @@ the routed experts (quantized too coarsely for a clean test). Refusal behavior w
 * tsvc2 on the service (`logs/tsvc2-dq2.log`): every needle found (8K 1526 / 1918, 16K 2605, **31K 3433** tok/s), decode
   107.8 / 102.6 tok/s, essay 80.9 / 77.7, the tool call, the picture and its follow-up right, hidden RAM 34 GiB at most;
   concurtest PASS.
+* **The front page's tables on this config** (abwT165 / T166, 19:20-19:30: `tabx.sh` fresh prompts from empty, two of
+  each size; a 256K needle): 530 / 1,021 / 2,003 / 3,003 / 4,519 / 8,054 tokens in 1.90 / 2.17 / 2.77 / 3.20 / 3.49 /
+  4.46 s (the faster of two), 16K 5.97-7.23 s, 31K 9.82-11.37 s and once 14.51 (that run's expert-card waits 6.0 s against
+  2.5-3.9: big single prompts vary 10-15 % window to window - the same-window A/Bs above are the comparisons); the 256K
+  needle 67.6 s (3,756 tok/s; Oct 26: 74 s), found, decode at that depth 87.4 tok/s, its 12K turn 6.2 s.
 
 ## Measured (2026-10-28 15:00 - 18:20: big prompts, part 1 - the prompt attention as one kernel that reads each query's keys where they lie; the expert cards' X in fp16 again)
 

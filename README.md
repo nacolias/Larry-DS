@@ -8,25 +8,26 @@ the 163 GiB GSQ quant through an OpenAI- and Anthropic-compatible API, pictures 
 It is a fork of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whose `ds41` engine runs this model on one
 NVIDIA card. This fork adds the Intel side: SYCL / Level Zero code that spreads the model over four Arc cards, system
 RAM, the CPU and two NVMe drives. Everything was measured on Larry, one A/B change at a time, between 2026-10-19 and
-10-27. [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) is that record.
+10-28. [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) is that record.
 
 ## Headline numbers
 
-| | Larry, 2026-10-26 |
+| | Larry, 2026-10-28 |
 | --- | --- |
-| fresh 8K-token prompt | 4.48 s |
-| fresh 31K-token prompt | 10.5 s (2,946 tok/s) |
+| fresh 8K-token prompt | 4.46 s |
+| fresh 31K-token prompt | 9.8 s (3,159 tok/s; single runs up to 11.4 s) |
+| fresh 131K-token prompt | 38.5 s (3,450 tok/s) |
 | follow-up turn of 500 new tokens at 38K context | 1.6 s |
-| chat replies (temperature 1, speculative decoding) | 95-103 tok/s |
+| chat replies (temperature 1, speculative decoding) | 95-108 tok/s |
 | agent-session replies (greedy) | 120-124 tok/s |
-| 984K-token prompt | 6 min, then 67 tok/s |
+| 967K-token prompt | 5 min (301 s), its first reply ~0.7 s later, then 70 tok/s |
 | context window | 1,048,576 tokens |
 | two requests at once (`"parallel": 2`) | their decode shares the passes: two long answers at 47.6 + 48.7 tok/s (one alone 71-85); a 4K-token question arriving mid-answer answered 4.0 s later |
 | a new 800x600 picture | 7-8 s (~6 s of it the CPU encode); a follow-up question on it 0.2-1.2 s |
 | perplexity vs DeepSeek's own FP8/FP4 release | 1.15x overall (code 1.06x, math 1.08x) |
 
-Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 3,017 tok/s on Oct 26 (~3,020 when
-repeated warm). The full tables
+Through the server, fresh 31K-token prompts went from 1,673 tok/s on Oct 23 to 3,017 tok/s on Oct 26 and 3,159 on
+Oct 28. The full tables
 are under [Results](#results).
 
 ## How it works
@@ -66,37 +67,42 @@ About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
   - the lightning indexer on XMX, a prompt's as one fused kernel whose score matrix never leaves the registers;
   - the prompt's hyper-connection mixes in one pass over the 4-stream state, wo_a's 8 slices as one product fed by
     the attention's fp16 output;
-  - layers 0-19's prompt attention through oneDNN's fused SDPA;
+  - layers 0-19's prompt attention as one kernel that reads each query's window and selected compressed keys where
+    they lie (no gathered copy), with an online softmax and the heads' sinks;
+  - the indexer's top-k over long rows in two stages (the blocks' maxima first, then the radix select over the
+    blocks that can hold the top k);
   - an AVX2 Q2_0 dot for the CPU pool;
   - an op profiler (off by default).
 
-The multi-card expert tier is [`tools/v41/engine/xe/ds41_xe_tier.cpp`](tools/v41/engine/xe/ds41_xe_tier.cpp), and
-engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN.md).
+The multi-card expert tier is [`tools/v41/engine/xe/ds41_xe_tier.cpp`](tools/v41/engine/xe/ds41_xe_tier.cpp) (its
+prompt GEMMs, [`xe_dqgemm.cpp`](tools/v41/engine/xe/xe_dqgemm.cpp), decode the experts' ternary, 2-bit and 3-bit weights
+inside the XMX product), and engine1's design is [`tools/v41/engine/tp/DESIGN.md`](tools/v41/engine/tp/DESIGN.md).
 
 ## Results
 
-**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-26 ~23:20, the
+**Service check** ([`larry/checks/tsvc2.sh`](larry/checks/tsvc2.sh) through the server; 2026-10-28 ~19:05, the
 current build):
 
 | check | result |
 | --- | --- |
-| fresh needle prompts (prompt tok/s) | 8K 1,422 then 1,899, 16K 2,506, 31K 3,185 - all four passphrases found |
-| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 105.2 tok/s, 102.4 after the long prompts |
-| essays (3 x 800 tokens) | 80.6 tok/s, 78.0 after the long prompts |
+| fresh needle prompts (prompt tok/s) | 8K 1,526 then 1,918, 16K 2,605, 31K 3,433 - all four passphrases found |
+| chat replies (4 prompts x 300 tokens, temperature 1, DSpark) | 107.8 tok/s, 102.6 after the long prompts |
+| essays (3 x 800 tokens) | 80.9 tok/s, 77.7 after the long prompts |
 | tool-call round trip | correct |
-| pictures ([`larry/bench/vision/vtest.py`](larry/bench/vision/vtest.py): two test cards, OpenAI and Anthropic APIs) | both described right (shapes, colours, the text on them); 7-8 s with the encode, a follow-up on the same picture 0.2 s |
+| pictures ([`larry/bench/vision/vtest.py`](larry/bench/vision/vtest.py): two test cards, OpenAI and Anthropic APIs; tsvc2's `imagetest.py`) | described right (shapes, colours, the text on them); 7.8 s with the encode, a follow-up on the same picture 1.2 s |
 | host memory held by the GPU driver | 34 GiB at most (the watchdog acts at 54) |
 
 Decode speed varies from run to run (sampling, draft acceptance, what the cards hold). Over the last 19 checks, the
 first chat pass ran 93.3-102.7 tok/s and the first essay 69.7-81.3 tok/s. In every check the first 8K needle, which
 follows the decode tests, is slower than the second.
 
-**Fresh prompts from an empty context** (A/B windows abwT94, abwT86, abwT102 and, from 8K up, abwT133 in the log,
-2026-10-25/26: a server with the service's settings on a side port, greedy):
+**Fresh prompts from an empty context** (abwT165 / abwT166 in the log, 2026-10-28: a server with the service's settings
+on a side port, greedy; the faster of two prompts of each size - for 16K and 31K the median of three windows' faster
+runs: single runs vary, 31K 9.7-11.4 s and once 14.5):
 
 | prompt tokens | 530 | 1,021 | 2,003 | 3,003 | 4,519 | 8,054 | 16,099 | 31,008 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| seconds | 1.96 | 2.10 | 2.81 | 3.49 | 4.02 | 4.48 | 6.39 | 10.53 |
+| seconds | 1.90 | 2.17 | 2.77 | 3.20 | 3.49 | 4.46 | 5.97 | 9.82 |
 
 **Follow-up turns** in a replayed agent session (synthetic, [`larry/bench/speed/agentx.py`](larry/bench/speed/agentx.py);
 context 8K-38K; abwT124, with the fused hc path since turned off - ~1 % slower without it):
@@ -107,15 +113,15 @@ context 8K-38K; abwT124, with the fused hc path since turned off - ~1 % slower w
 - 6.5K: 3.95 s.
 - Agent replies: 120-124 tok/s (greedy).
 
-**Long contexts** (needles from empty, prompt then decode; 131K / 256K: abwT130, 2026-10-26 with the fused hc path,
-as now; 973K: abwT144, the current config; 490K: Oct 24's build):
+**Long contexts** (needles from empty, prompt then decode; 2026-10-28: 131K abwT164 and 256K abwT165 as the service
+runs now, 967K abwT160 after a 131K one, before the expert GEMMs' v2 - card 0 bounds it; 490K: Oct 24's build):
 
 | context | prompt | decode after it |
 | --- | --- | --- |
-| 131K | 41 s (3,192 tok/s; Oct 24: 80 s) | 86 tok/s |
-| 256K | 74 s (3,466 tok/s) | 82 tok/s |
+| 131K | 38.5 s (3,450 tok/s; Oct 24: 80 s) | 86 tok/s; a 12K-token turn on it 5.9 s |
+| 256K | 67.6 s (3,756 tok/s; Oct 26: 74 s) | 87 tok/s; a 12K-token turn on it 6.2 s |
 | 490K | 393 s (Oct 24) | 81 tok/s |
-| 973K | 346 s (2,815 tok/s; Oct 24: 1,140 s) | 67 tok/s; an 11.7K-token turn on it 10-15 s (once out of card 0's memory before `STRATA_SERVE_KEEP_LEARN_DEPTH_GIB`) |
+| 967K | 301 s (3,213 tok/s; Oct 24: 1,140 s), its first reply ~0.7 s later | 70 tok/s; a 12K-token turn on it 8.5 s |
 
 **Fidelity against DeepSeek's own release** (2026-10-22). The original FP8/FP4 model was teacher-forced on Larry's
 CPU with DeepSeek's `inference/model.py`, and compared on 36,846 tokens across 18 x 2,048-token sequences
@@ -227,7 +233,8 @@ The Larry-specific ones:
   being read pauses the other session for its whole batch (up to 16K tokens, ~6 s). A third request waits for a free
   slot; up to 8 more conversations wait parked in host memory (4 GiB), so moving between chats or agents does not
   re-read them. Card 0's KV state is mapped as the conversations grow (0.84 GiB at load, up to 6.3 GiB for two 1M
-  conversations); the first reply after a ~1M prompt waits ~8 s for the other cards' copies of it.
+  conversations); the other cards' copies of a long prompt's KV are read ahead near its end, so its first reply comes
+  ~0.7 s after a ~1M prompt.
 - **One engine per box.** The service holds every card and ~35 GiB of driver-held host memory. `run.sh` refuses to
   start beside it.
 - **Pictures are encoded on the CPU.** A new 800x600 picture takes ~6 s on 6 threads (a repeat comes from the
