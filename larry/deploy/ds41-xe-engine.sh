@@ -263,4 +263,7 @@ export STRATA_ATTN_SDPA="${STRATA_ATTN_SDPA-1}"
 # 2.37 -> 1.44 ms a 512-column span at 30K; and the expert cards' X in fp16 by peer loads (card 0 waits on them now)
 export STRATA_ATTN_FSA="${STRATA_ATTN_FSA-1}"
 export STRATA_XE_FN16="${STRATA_XE_FN16-2}"
+# the expert GEMMs, v2 (patch-dqv2.py: weights decoded into local memory VNNI-packed, a sub-group 32 tokens x 64 rows;
+# the same bits): fresh 16K -5 %, 64K -4 %, 131K -6 %
+export STRATA_XE_DQ2="${STRATA_XE_DQ2-1}"
 exec "$XE_BIN/ds41_generate_xe" "${ARGS[@]}"

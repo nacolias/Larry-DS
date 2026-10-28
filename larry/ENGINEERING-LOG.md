@@ -51,6 +51,34 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-28 18:20 - 19:10: big prompts, part 2 - the expert GEMMs, v2)
+
+**In the service since 18:57** (`bench/longctx/xinstall.sh dq2` in a window, the engine before it in `build-xe/pre-dq2`;
+`patches/svc-dq2.py`, backup `ds41-xe-engine.sh.pre-dq2-20261028`): `STRATA_XE_DQ2=1` (`patches/patch-dqv2.py` +
+`dqv2_kernel.inc`). The same bits; with part 1, fresh prompts against the morning's service: **16K 6.48 -> 5.84 s, 31K
+~11.0 -> ~9.9, 64K 21.3 -> 19.0, a 131K needle 45.4 -> 38.5 s** (-10..-15 %).
+
+* **Where an expert card's call went** (abwT161: the service's engine under unitrace, `bench/speed/utdrive.py` - one fresh
+  16K prompt traced after a 16K warm-up - and `utcall.py`, per call segmented at the X widening): an 8K-token call ran
+  ~81 xe_dqgemm launches, ~35 ms of the card's GPU time (~29 TFLOPS), the X widening (FN16's peer reads over card 0's
+  link) ~9 ms, the push ~4 ms, the row gathers and the deterministic sum ~7 ms, the shared expert (oneMKL) ~3.5 ms, the
+  small experts' jobs ~3 ms. Bigger GEMM batches (`STRATA_XE_GEMM_RB` 2048 / 4096, abwT162): within the noise.
+* **xe_dqgemm v2** (`bench/dqb/xe_dqgemm_v2.cpp` + `bench_dqgemm_v2.cpp`, `dqv2.sh`): v1's sub-groups each owned 16
+  weight rows x all 128 tokens of a tile - the decoded weights in registers, every one of the 16 activation fragments a
+  k-step read from local memory by hand (256 B a multiply). v2 keeps the tiles (128 rows x 128 tokens: the tier's tables
+  as they are) but decodes each 64-value chunk of the 128 rows once into local memory VNNI-packed - B fragments by
+  `joint_matrix_load` ext_intel_packed, the fast path - and gives a sub-group 32 tokens x 64 rows (4 x 4 accumulators)
+  with its activation rows by 2D block loads from global memory: 128 B of local memory a multiply. The same decode, the
+  same k order: **0 values differ** at every size. 96 experts at 128 tokens, planar: Q3_K **44 -> 63** TFLOPS, Q2_0 **51
+  -> 89**, PTQ1_0 **48 -> 87**; the file layout (prefetched experts) 37 / 43 / 47 -> 50 / 62 / 77; 64 tokens 34 / 42 / 33
+  -> 40 / 56 / 53; 160 tokens 37 / 45 / 39 -> 48 / 63 / 64; 32 tokens about even (abwT163).
+* **In the engine** (abwT164, the same binary `STRATA_XE_DQ2` off / on): 16K 6.14 -> **5.84 s**, 31K 9.87 / 11.19 ->
+  **9.67 / 10.12**, 64K 19.80 / 19.80 -> **18.82 / 19.15**, a 131K needle 40.75 -> **38.45 s** (found; its 12K turn 6.09 ->
+  5.94 s). The tier waits fell (31K 3.82 -> 3.01 s, 131K 11.08 -> 8.43): card 0 bounds again.
+* tsvc2 on the service (`logs/tsvc2-dq2.log`): every needle found (8K 1526 / 1918, 16K 2605, **31K 3433** tok/s), decode
+  107.8 / 102.6 tok/s, essay 80.9 / 77.7, the tool call, the picture and its follow-up right, hidden RAM 34 GiB at most;
+  concurtest PASS.
+
 ## Measured (2026-10-28 15:00 - 18:20: big prompts, part 1 - the prompt attention as one kernel that reads each query's keys where they lie; the expert cards' X in fp16 again)
 
 **In the service since 17:59** (`bench/longctx/xinstall.sh fsa` in a window, the engine before it in `build-xe/pre-fsa`;
@@ -124,8 +152,8 @@ runs; the 984K needle after a 131K one, `bench/longctx/lt1m.sh`):
   2's 3108), decode 84.3 / 104.9 tok/s, essay 79.6 / 76.2, the tool call, the picture and its follow-up right, hidden
   RAM 34 GiB at most; concurtest PASS.
 
-Next for big prompts: the expert cards bound 16K-131K now - inside a call their GEMMs run at about half of xe_dqgemm's
-own speed (to trace: `bench/speed/utdrive.py` + `utcall.py` on an expert card); at 1M card 0 bounds (the indexer).
+Next for big prompts (after part 2): card 0 bounds again - its span's remaining ~4.3 ms (the fused attention 1.44, the
+weight GEMMs ~1.5, the hc steps ~1); at 1M card 0 bounds (the indexer).
 
 ## Measured (2026-10-28 02:50 - 05:10: long contexts, part 2 - the 1M prompt's indexer: its top-k in two stages, its queries shared with the expert cards)
 
@@ -2729,6 +2757,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
 | `STRATA_XE_FN16` (`_MIN` 0) | 2 (service since 10-28 17:59; engine 0) | prompt calls: the call's X converted to fp16 once on the dense card; 1: the expert cards copy it (copy engine), 2: they read it by peer loads - half the bytes over the dense card's link |
+| `STRATA_XE_DQ2` | 1 (service since 10-28 18:57; engine 0) | the prompt path's expert GEMMs, xe_dqgemm v2 (patch-dqv2.py): each chunk's weights decoded once into local memory VNNI-packed, a sub-group 32 tokens x 64 rows - the same bits, 1.4-1.8x |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |
 | `STRATA_XE_PREFETCH_DEPTH` | 5000 (service; engine 0) | prompt: a batch that ends before this context position takes no prefetch (its arena experts stream on demand, light ones on the CPU pool; the promotion cache stays) |
 | `STRATA_XE_DENSE_LITE` (`_MIN` 0) | 1 (service; engine 0) | pipelined prompt calls: the dense card reads X in place, queues its part without host waits, and (in calls of >= _MIN tokens) takes no streamed experts |
