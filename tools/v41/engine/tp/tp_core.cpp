@@ -387,6 +387,12 @@ struct Ds41Tp::Impl {
     bool lazy = false;
     int64_t rows_done[3] = { 0, 0, 0 };
     std::function<bool(int, size_t)> make_room;   // the tier: room for that many more bytes on that GPU
+    // larry (patch-roomahead.py): the tier's room on every card in one call; its read-ahead of a coming growth's
+    // evictions (room_ahead: for conversation ahead_seq up to ahead_want rows - dropped once its replicas get there)
+    std::function<bool(const std::vector<std::pair<int, size_t>> &)> make_room_all;
+    std::function<void(const std::vector<std::pair<int, size_t>> &)> room_ahead;
+    int ahead_seq = -1;
+    int64_t ahead_want[3] = { 0, 0, 0 };
     // larry (batch slots, patch-seqs-tp.py): NS conversations, `seq` bound; the others' rows_done / draft maps here
     int NS = 1, seq = 0;
     std::vector<std::array<int64_t, 3>> rows_done_seq;
@@ -2232,6 +2238,17 @@ struct Ds41Tp::Impl {
         }
         return true;
     }
+    // larry (patch-roomahead.py): the bytes card c's replicas map to hold want[r] rows of every ratio-r source
+    size_t extra_of(const Card & c, const int64_t want[3]) const {
+        size_t extra = 0;
+        for (int l = 0; l < NL; ++l) {
+            const LInfo & L = li[(size_t) l];
+            if (!L.kv_src) continue;
+            const LS & s = c.ls[(size_t) l];
+            extra += s.vcomp.grow_bytes((size_t) (want[L.ratio] * DH) * 2) + s.vidxk.grow_bytes((size_t) (want[L.ratio] * ID) * 2);
+        }
+        return extra;
+    }
     // STRATA_TP_LAZY_KV: ranks >= 1 map the pages of rows [0, want[r]) of every ratio-r source (up to cmax[r]) before
     // anything touches them, the tier making room first (its flex region gives VRAM back); the newly mapped rows are
     // copied from card 0, so the mapped rows of a replica always mirror card 0's.  Between passes only.
@@ -2247,17 +2264,21 @@ struct Ds41Tp::Impl {
         ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
         const Card & c0 = *cards[0];
         size_t total = 0;
+        // larry (patch-roomahead.py): every card's extra bytes first - the tier makes room on all of them in one call
+        std::vector<size_t> extra_k((size_t) N, 0);
+        std::vector<std::pair<int, size_t>> reqs;
+        for (int k = 1; k < N; ++k) {
+            extra_k[(size_t) k] = extra_of(*cards[(size_t) k], want);
+            if (extra_k[(size_t) k]) reqs.emplace_back(cards[(size_t) k]->gpu, extra_k[(size_t) k]);
+        }
+        const double tr0 = now_us();
+        if (!reqs.empty() && make_room_all && !make_room_all(reqs)) { err = "tp: no VRAM on the expert cards for the KV rows"; return false; }
+        const double tr1 = now_us();
         for (int k = 1; k < N; ++k) {
             Card & c = *cards[(size_t) k];
             ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(c.dev);
-            size_t extra = 0;
-            for (int l = 0; l < NL; ++l) {
-                const LInfo & L = li[(size_t) l];
-                if (!L.kv_src) continue;
-                const LS & s = c.ls[(size_t) l];
-                extra += s.vcomp.grow_bytes((size_t) (want[L.ratio] * DH) * 2) + s.vidxk.grow_bytes((size_t) (want[L.ratio] * ID) * 2);
-            }
-            if (extra && make_room && !make_room(c.gpu, extra)) { err = "tp: no VRAM on GPU " + std::to_string(c.gpu) + " for the KV rows"; return false; }
+            const size_t extra = extra_k[(size_t) k];
+            if (extra && !make_room_all && make_room && !make_room(c.gpu, extra)) { err = "tp: no VRAM on GPU " + std::to_string(c.gpu) + " for the KV rows"; return false; }
             total += extra;
             for (int l = 0; l < NL; ++l) {
                 const LInfo & L = li[(size_t) l];
@@ -2287,9 +2308,14 @@ struct Ds41Tp::Impl {
                 const LInfo & L = li[(size_t) l];
                 if (L.kv_src && !pull_rows_staged(l, rows_done[L.ratio], want[L.ratio])) return false;
             }
-        std::fprintf(stderr, "tp: KV replicas now %lld / %lld rows (ratio 1 / 2), +%.0f MiB on the other cards\n",
-                     (long long) want[1], (long long) want[2], total / 1048576.0);
+        std::fprintf(stderr, "tp: KV replicas now %lld / %lld rows (ratio 1 / 2), +%.0f MiB on the other cards (room %.0f ms, "
+                     "maps + rows %.0f ms)\n", (long long) want[1], (long long) want[2], total / 1048576.0, (tr1 - tr0) / 1e3,
+                     (now_us() - tr1) / 1e3);
         for (int r = 1; r <= 2; ++r) rows_done[r] = want[r];
+        if (ahead_seq == seq && rows_done[1] >= ahead_want[1] && rows_done[2] >= ahead_want[2]) {   // (patch-roomahead.py)
+            ahead_seq = -1;
+            if (room_ahead) room_ahead({});   // the tier's read-ahead this growth did not take goes
+        }
         return true;
     }
     // the VRAM a rank's lazy replicas have not mapped yet (what the tier's flex region can hold meanwhile)
@@ -2456,6 +2482,36 @@ std::vector<std::pair<int, size_t>> Ds41Tp::deferred_vram() const {
 }
 
 void Ds41Tp::set_vram_hook(std::function<bool(int, size_t)> make_room) { p_->make_room = std::move(make_room); }
+
+void Ds41Tp::set_room_hooks(std::function<bool(const std::vector<std::pair<int, size_t>> &)> make_room_all,
+                            std::function<void(const std::vector<std::pair<int, size_t>> &)> ahead) {
+    p_->make_room_all = std::move(make_room_all);
+    p_->room_ahead = std::move(ahead);
+}
+
+// larry (patch-roomahead.py)
+void Ds41Tp::room_ahead(int64_t hi) {
+    Impl & im = *p_;
+    if (!im.room_ahead || !im.lazy || im.N < 2) return;
+    std::vector<std::pair<int, size_t>> reqs;
+    if (hi >= 0) {   // the bucket sync_state / the first pass will map (as ensure_rows: never below what is mapped)
+        int64_t want[3] = { 0, 0, 0 };
+        bool any = false;
+        for (int r = 1; r <= 2; ++r) {
+            want[r] = std::min<int64_t>(im.cmax[r], std::max<int64_t>(im.rows_done[r], next_pow2(std::max<int64_t>(1024, (hi + r - 1) / r + 1))));
+            any = any || want[r] > im.rows_done[r];
+        }
+        if (any) {
+            for (int k = 1; k < im.N; ++k) {
+                const size_t e = im.extra_of(*im.cards[(size_t) k], want);
+                if (e) reqs.emplace_back(im.cards[(size_t) k]->gpu, e);
+            }
+            for (int r = 1; r <= 2; ++r) im.ahead_want[r] = want[r];
+        }
+    }
+    im.ahead_seq = reqs.empty() ? -1 : im.seq;
+    im.room_ahead(reqs);
+}
 
 std::vector<void *> Ds41Tp::queues() const {
     std::vector<void *> v;
@@ -2969,9 +3025,13 @@ bool Ds41Tp::sync_state(int64_t lo, int64_t hi, bool all) {
     // larry (patch-tpsynclog.py, diagnostic)
     static const bool sync_log = std::getenv("STRATA_TP_SYNC_LOG") != nullptr, sync_check = std::getenv("STRATA_TP_SYNC_CHECK") != nullptr;
     const double ts0 = now_us();
+    // larry (patch-roomahead.py): the rows ensure_rows maps here it copies from card 0 (the prompt has written them) -
+    // the copies below stop where they start (a fresh 967K prompt's rows went twice: 0.34 s more before its first reply)
+    int64_t fresh0[3] = { INT64_MAX, INT64_MAX, INT64_MAX };
     if (im.lazy && !every) {   // the replicas' pages for the rows up to hi first (as a pass there would: a cap bucket)
         int64_t want[3] = { 0, 0, 0 };
         for (int r = 1; r <= 2; ++r) want[r] = std::min<int64_t>(im.cmax[r], next_pow2(std::max<int64_t>(1024, (hi + r - 1) / r + 1)));
+        for (int r = 1; r <= 2; ++r) fresh0[r] = im.rows_done[r];
         if (!im.ensure_rows(want)) return false;
     }
     const Card & c0 = *im.cards[0];
@@ -2985,7 +3045,7 @@ bool Ds41Tp::sync_state(int64_t lo, int64_t hi, bool all) {
             if (!L.kv_src) continue;
             const int64_t r = L.ratio, rows = im.cmax[r] + 1;
             const int64_t top = im.lazy ? im.rows_done[r] : rows - 1;   // rows past the mapped ones: copied when mapped
-            int64_t r0 = every ? 0 : std::max<int64_t>(0, lo / r), r1 = every ? top : std::min<int64_t>(top, (hi + r - 1) / r + 1);
+            int64_t r0 = every ? 0 : std::max<int64_t>(0, lo / r), r1 = every ? top : std::min<int64_t>({ top, (hi + r - 1) / r + 1, fresh0[r] });
             if (!im.hooks.kv_stage) {   // (patch-tpstage.py: else staged below)
             if (r1 > r0) {
                 c.q.memcpy(b.comp + r0 * im.DH, a.comp + r0 * im.DH, (size_t) ((r1 - r0) * im.DH) * 2);
@@ -3013,7 +3073,7 @@ bool Ds41Tp::sync_state(int64_t lo, int64_t hi, bool all) {
             if (!L.kv_src) continue;
             const int64_t r = L.ratio, rows = im.cmax[r] + 1;
             const int64_t top = im.lazy ? im.rows_done[r] : rows - 1;
-            const int64_t r0 = every ? 0 : std::max<int64_t>(0, lo / r), r1 = every ? top : std::min<int64_t>(top, (hi + r - 1) / r + 1);
+            const int64_t r0 = every ? 0 : std::max<int64_t>(0, lo / r), r1 = every ? top : std::min<int64_t>({ top, (hi + r - 1) / r + 1, fresh0[r] });
             if (!im.pull_rows_staged(l, r0, r1) || !im.pull_rows_staged(l, rows - 1, rows)) return false;
         }
     if (sync_log)   // (patch-tpsynclog.py)

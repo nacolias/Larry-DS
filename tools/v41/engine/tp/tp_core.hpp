@@ -144,6 +144,14 @@ public:
     /// the tier's side of that: make room for `bytes` more on GPU `gpu` (called between passes, before a mapping);
     /// false = no room (the pass fails)
     void set_vram_hook(std::function<bool(int gpu, size_t bytes)> make_room);
+    /// larry (patch-roomahead.py): the tier's room on every expert card in one call (it evicts on all of them at once;
+    /// ensure_rows then takes it instead of set_vram_hook's), and its read-ahead of a coming growth's evictions (an
+    /// empty list: none coming - it drops what it read ahead)
+    void set_room_hooks(std::function<bool(const std::vector<std::pair<int, size_t>> & reqs)> make_room_all,
+                        std::function<void(const std::vector<std::pair<int, size_t>> & reqs)> ahead);
+    /// larry (patch-roomahead.py): the bound conversation's replicas will grow to position hi's cap bucket (a prompt
+    /// that ends there) - each card's extra bytes to the read-ahead hook; hi < 0: nothing coming.  Between passes.
+    void room_ahead(int64_t hi);
     /// rank `rank`'s rows [r0, r1) of the LM head ("output.weight") or an Engram projection ("blk.<l>.engram_kv.weight")
     /// as one Q6_K planar slice on GPU `gpu` (the dense half's reordered layout, its rows only) - or null.  The expert
     /// tier's head split reads these instead of copying the same rows again.

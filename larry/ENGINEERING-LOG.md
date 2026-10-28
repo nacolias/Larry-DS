@@ -51,6 +51,60 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-28 01:20 - 02:50: long contexts, part 1 - the wait before the first reply after a long prompt; where a 1M prompt's time goes)
+
+**In the service since 02:33** (`bench/longctx/xinstall.sh ra` in a window, the engine before it in `build-xe/pre-ra`;
+`patches/patch-roomahead.py`): after a long prompt the first reply comes almost at once.
+
+| the first reply after the prompt (the needle's 9-token decode) | before (10-27, `r1m-stage.sh`) | now (`bench/longctx/r1m-ra.sh`) |
+| --- | ---: | ---: |
+| a 131K needle (its conversation's KV replicas 1K -> 262K rows: a slab a card) | 2.22 s | **0.33-0.36 s** |
+| a 967K needle (-> 1M rows: three slabs a card) | 8.09 s | **0.72 s** |
+| - its cards' evictions | 1.15 + 4.97 + 0.99 s, in turn | 2-5 ms, side by side, read ahead |
+| - its replicas' sync | 7.89 s | 0.44 s |
+
+* **What the wait was**: the first pass after a long prompt grows the conversation's KV replicas on the expert cards to the
+  prompt's cap bucket, and each card first gives VRAM back - its evictable last slabs go back to the arena with the
+  experts' host copies read from the model file then (`STRATA_XE_TP_EVICT`): one card after another, ~0.6 s a GiB and
+  worse under host memory pressure (card 2's 5 s). Then the rows were copied twice (the growth copied them from card 0,
+  the sync again: 0.34 s at 967K).
+* **The read-ahead** (`STRATA_TP_AHEAD_S`, 30): once a prompt's batches left look shorter than 30 s, the engine tells the
+  TP core where the prompt ends, the core tells the tier each card's coming growth, and the tier works out the slabs
+  `evict_slabs` would free and reads their experts on a helper thread (2 readers; `STRATA_XE_TP_AHEAD_MEM_GIB`, 8, of
+  MemAvailable must stay over), re-checked at every batch. The eviction takes a slab's copy when its experts are the ones
+  read; what the growth does not take is dropped when the replicas reach the target (or at the next request).
+* **Side by side** (`tier.tp_make_room_multi`): the cards' evictions a thread each (their bookkeeping under a lock), the
+  driver waited for once a round of slabs instead of once a slab; the sync copies only the rows below where its own
+  growth began.
+* **What it costs the prompt: nothing measurable** (`bench/longctx/ra-ab.sh`: the same engine, two fresh 131K needles
+  each - conversation slots 1 and 0): read-ahead off 48.44 / 40.98 s, on 49.41 / 40.97 s; the first reply 3.52 / 1.41 s
+  against 0.35 / 0.36 s. Without it the side-by-side evictions alone took 3.1 and 1.1 s - the fresh host memory, not the
+  reads. The first big prompt after an engine start is the slow one either way (its expert phase 14 s against ~8;
+  `bench/speed/vmwatch.sh`: kswapd, direct reclaim and compaction all through it), which my first reading took for the
+  read-ahead's cost. At 967K: 342.7 s (344.5 before) and once 363.0 s (its expert phase 47 s against ~32; not seen again).
+* **A deadlock the first test found** (a test server, killed; no user request): the tier's `init()` calls `close()` first,
+  and that set the helper's stop flag for good - its thread quit at once and the evictions waited for reads that never
+  came. Fixed; an eviction now waits for a read at most `STRATA_XE_TP_AHEAD_WAIT_S` (60 s), then reads it itself.
+* tsvc2 on the service (`logs/tsvc2-ra.log`): every needle found (8K 1333 / 1750, 16K 2453, 31K 3110 tok/s), svcbench
+  100.9 / 96.3, essay 78.8 / 77.1 tok/s, the tool call and the picture right, hidden RAM 34 GiB at most;
+  `concurtest.py` PASS. The 967K replica checks (`STRATA_TP_SYNC_CHECK=1`): 0 regions differ.
+
+**Where a 967K prompt's time goes** (`bench/longctx/prof1m.sh`: card 0's ggml-sycl time op by op, `GGML_SYCL_OP_PROF`'s
+cumulative dumps every 250K marks split by `bench/longctx/profdiff.py`; that run's prompt 346.9 s):
+
+| card 0, s (the prompt's tokens) | 0-180K | 180-360K | 360-524K | 524-704K | 704-868K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| card time | 49.1 | 53.5 | 58.4 | 63.8 | 67.8 |
+| `LIGHTNING_INDEXER` (the prompt indexer: layers 2 / 8 / 14 run every token) | 1.8 | 5.5 | 8.7 | 12.5 | 15.8 |
+| `TOP_K` (each query's 512 best visible rows) | 1.0 | 3.3 | 4.6 | 8.6 | 9.0 |
+| weight GEMMs / oneDNN attention / key gather / `HC_FA` | 9.4 / 7.5 / 5.1 / 4.7 | 9.4 / 7.6 / 5.3 / 4.6 | 9.4 / 7.7 / 5.6 / 4.7 | 8.9 / 7.2 / 5.3 / 4.4 | 8.9 / 7.2 / 5.4 / 4.4 |
+| idle before a graph | 7.7 | 6.5 | 6.4 | 6.1 | 6.4 |
+
+Only the indexer and its top-k grow with depth: ~86 s of the prompt's ~347 together, 37 % of the deepest interval. The
+indexer runs near the XMX peak (~137 TFLOPS: 256 queries x 512K keys x 32 heads x 128 in ~8 ms a call - past 256K rows
+the slices halve the queries, two calls a span) and converts the whole key table to fp16 on every call (~0.45 ms of the
+8); the top-k reads each 2 MB row up to five times (~4.5 ms a call: the card's read bandwidth).
+
 ## Measured (2026-10-27 21:00 - 23:10: card 0's KV mapped on demand, in the service - the other cards' reads of its later pages; the CPU pool's ternary rows)
 
 **In the service since 23:08** (`patches/svc-lazykv.py`, backup `ds41-xe-engine.sh.pre-lazykv-20261027`): card 0's KV
@@ -2469,6 +2523,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `run.sh NAME [args]`, `tok.py enc/dec`, `xe-env.sh`, `vt.sh` | one-shot runs (logs/NAME.*), prompt <-> ids, the environment, VTune |
 | `dev-hold.sh on` | free all four cards for development without a layout (`larry-mode small` undoes it) |
 | `bench/speed/` | the standard speed table: `run_all.sh` (the service held, a DSpark and a plain private copy, the service back), `tspeed.sh NAME [VAR=..]` (one copy: warm-up, `vbench.sh` = `vllm bench serve` on MT-Bench, `speedtab.py` = llama-bench's pp512 / tg128 at depths), `patch_vllm_chat.py`, `hf/` (tokenizer + MT-Bench cache), results in `out/`; the prompt A/B: `tab_all.sh NAME:VAR=v,.. ...` (the service held, `tab.sh` a config: speedtab's `TAB_SPECS`, then the service back; `TAB_PPL=1` adds `tlppl.sh` = one-shot prompt-path logits KL via `lkl.py`), `tabsum.py` (the table), `tpg_light.sh`, `ab*.sh` (the night's A/B windows, each after the AIME client's current problem), `run_all2.sh` + `sttab.py` (the speed table again; old vs new as markdown); the afternoon A/B window `abw.sh NAME:TESTS[:VAR=v,..] ..` (waits until the service has been idle `AB_IDLE_MIN` minutes, `yieldsrv.py` answers 503 on :18080 and ends the window if a request comes; `tabx.sh` one configuration, `abx.py` prompts from empty / the edit / decode tasks, `abxsum.py` the table), `turns.py ENGINE_LOG [LINE]` (per request: prompt, decode, ms and CPU-pool experts a pass); the evening's `agentx.py` (an agent session replayed: the test "agent", `AGENT_ARGS`), `abx.py --needles N,..` (the test "needles", `AB_NEEDLES`), `AB_CTX` (the config's `--ctx`), a window step `@COMMAND` (a probe or tpg.sh run as it is); `bench/dqb/stage_ring.cpp` (pageable -> cards: the tier's stage vs rings in the L3) |
+| `bench/longctx/` | long contexts: `xbuild.sh NAME PATCH..` (an engine change built at low priority and staged in `NAMEbin`, the service's build put back), `xinstall.sh NAME` (staged -> `build-xe`, an abw step), `r1m-ra.sh` (131K + 984K needles on a staged engine with the replica check), `ra-ab.sh` (the read-ahead off / on, with vmwatch), `prof1m.sh` + `profdiff.py` (card 0's op profile over a long prompt, by depth), `tsvc2-ra.sh` (tsvc2 + concurtest after an install) |
 | `bench/quality/` | AIME 2026 through the service at DeepSeek's settings (DeepInfer `eval/aime`: its prompt and rule judge, effort 100, top-p 1.0, 144K, one sample a problem): `aime.py [--deadline HH:MM] [--score]` (resumable; a `STOP` file in `out/` ends it after the current problem), `data/aime_2026.jsonl` (MathArena/aime_2026), `out/aime-1.jsonl` + `.log`, `encchk.py` / `effchk.py` (the prompt matches DeepSeek's encoder; the effort reaches the engine); `gpqa.py` + `mkgpqa.py` + `data/gpqa_diamond.jsonl` (GPQA Diamond the same way: DeepInfer's prompt and rule judge, the public mirror hendrydong/gpqa_diamond_mc; not run yet). Both clients YIELD: when the server's /metrics shows another request queued they cancel their own and stop (`fakesrv.py` tests that) |
 
 ## Knobs (environment of `ds41-xe-engine.sh`; `larry-mode restart` after a change)
@@ -2577,12 +2632,14 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `GGML_SYCL_DSV4_MQA_QV`, `_SM` (`_V2` = both) | 1 (service; engine 0) | the DSV4 MQA prompt attention: Q conversion four floats a work-item; the softmax a sub-group a row |
 | `STRATA_XE_CALL_TL`, `STRATA_BATCH_TRACE` | 0 | diagnostics: a prompt call's timeline per card (ms into the call at the card threads' own waits); a served prompt's steps outside the layer pipeline |
 | `STRATA_LOOKUP_TP` | 1 (service; engine 0) | serve: lookup drafts (`STRATA_SERVE_LOOKUP` 14) capped to the TP core's 7-row pass - a wider pass took the old dense path (~0.16 s a pass) |
-| `STRATA_XE_TP_EVICT` (`_KEEP_GIB` 1.5, `_MEM_GIB` 4), `STRATA_XE_TP_DEFER_FLEX_GIB` 0.8 | 1 (service; engine 0) | the TP cards' future KV room beyond 0.8 GiB holds experts (each card's last slabs) until a long context needs it; then a slab at a time goes back (its experts read from the model file into host memory) |
+| `STRATA_XE_TP_EVICT` (`_KEEP_GIB` 0.25, `_MEM_GIB` 4, `_PAR` 1, `_ROUND` 1), `STRATA_XE_TP_DEFER_FLEX_GIB` 0.8 | 1 (service; engine 0) | the TP cards' future KV room beyond 0.8 GiB holds experts (each card's last slabs) until a long context needs it; then the slabs it takes go back (their experts read from the model file into host memory - ahead, below), the cards side by side (`_PAR`), the driver waited for once a round of slabs (`_ROUND`) |
+| `STRATA_TP_AHEAD_S` | 30 | serve: once a long prompt's batches left look shorter than this, the evictions its KV replicas will need are read ahead (0 = off) |
+| `STRATA_XE_TP_AHEAD` (`_READERS` 2, `_CPUS`, `_MEM_GIB` 8, `_WAIT_S` 60) | 1 | the tier's side of it: the slabs' experts read on a helper thread by `_READERS` threads (on `_CPUS`, else the process's CPUs) while `_MEM_GIB` of MemAvailable stays over; an eviction waits for a read at most `_WAIT_S` |
 | `STRATA_LI_CHUNK_MIB` | 512 | the prompt indexer's [cap, n] tensors in column slices of at most this many MiB (1M context: ~9 GiB a span otherwise) |
 | `STRATA_SERVE_PARK_MAX` | 262144 (service; engine 65536) | positions a parked conversation may save |
 | `STRATA_SERVE_PARK_SLOTS` | 2 | conversations kept beside the live one (1 = the old single park) |
 | `STRATA_XE_PIN_SKIP_GIB` | 0 | the first GiB of the ranked arena stay pageable (18 measured worse) |
-| `STRATA_DENSE_LAZY_KV` (`STRATA_DENSE_KV_INIT` 262144) | 0 | **unsafe** (card 0 faults past 524,288 positions when mapped after load): card 0's KV state mapped as the context grows |
+| `STRATA_DENSE_LAZY_KV` (`STRATA_DENSE_KV_INIT` 262144 engine / 65536 service) | 1 (service since 2026-10-27 23:08; engine 0) | card 0's KV state mapped as the context grows (the other cards pull those rows through a staging buffer: `patch-tpstage.py`) |
 | `STRATA_XE_HOTRING` (`_KB` 1024, `_N` 4 engine / 2 service, `_NOSTAGE` 1, `_CHECK` 0) | 1 (service; engine 0) | prompt: pageable arena experts onto the cards through small pinned rings that stay in the L3 (each chunk DMA'd as soon as it is copied), the prefetch's stagers queue their own copies, no pinned layer stages (their budget goes to the arena); `_CHECK=1` compares every streamed / prefetched expert with its source |
 | `STRATA_QKV_FUSE` | 1 (service; engine 0) | each layer's q_a + kv as one weight (one mat-vec / GEMM) |
 | `STRATA_CONT_SKIP` | 1 | no ggml_cont (a copy op) of tensors that are contiguous already |
@@ -2669,6 +2726,12 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-28 02:50: done - long contexts, part 1: the first reply after a long prompt (131K 2.2 -> 0.35 s, 967K 8.1 ->
+  0.7 s: the expert cards' evictions read ahead and side by side, the replica rows copied once). Next, part 2: the 1M
+  prompt itself - its indexer and top-k (~86 of ~347 s): the top-k in two stages first (a row's block maxima, then the
+  radix select over the blocks that can hold its 512 best only - the same set), then the indexer (bf16 keys read as they
+  are, int8 on the FP4 values, or over the expert cards).
 
 - 2026-10-27 19:20: done - concurrent sessions, stage 1: two conversations of up to 1M at once, taking turns (Strata's
   batch-slot protocol on the TP core's per-conversation state); a re-rendered tail rewinds the live conversation; card

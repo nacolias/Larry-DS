@@ -742,6 +742,10 @@ int main(int argc, char ** argv) {
     if (tp) {
         for (const auto & d : tp->deferred_vram()) tier.tp_defer_vram(d.first, d.second);
         tp->set_vram_hook([&tier](int gpu, size_t bytes) { return tier.tp_make_room(gpu, bytes); });
+        // larry (patch-roomahead.py): every expert card's room in one call (the evictions side by side); a long
+        // prompt's evictions read ahead while it runs
+        tp->set_room_hooks([&tier](const std::vector<std::pair<int, size_t>> & r) { return tier.tp_make_room_multi(r); },
+                           [&tier](const std::vector<std::pair<int, size_t>> & r) { tier.tp_room_ahead(r); });
         // the head split (the DSpark draft's LM head, small dense passes' Engram projections) reads the TP core's row
         // slices of those weights instead of copying the same rows onto the expert cards again
         std::vector<std::string> hn = { "output.weight" };
@@ -1400,6 +1404,7 @@ int main(int argc, char ** argv) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
                 btr("batch start", B);
+                const double tb0 = now_ms();   // larry (patch-roomahead.py)
                 // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
                 // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
                 // desktop's STT server, DSpark's 2.9 GB, the dense half).  A batch that does not fit is retried at
@@ -1748,6 +1753,15 @@ int main(int argc, char ** argv) {
                 if (Ds41XeTier::ptl_on()) tier.ptl_dump("batch");   // larry, STRATA_GPU_PTL
 #endif
                 c0 += B;
+#if defined(DS41_TP)
+                // larry (patch-roomahead.py): once the batches left look shorter than STRATA_TP_AHEAD_S (30 s; 0 = off),
+                // the expert cards' evictions for this prompt's KV replicas are read ahead (re-checked every batch)
+                if (tp && c0 < n) {
+                    static const double ahead_s = std::getenv("STRATA_TP_AHEAD_S") ? std::atof(std::getenv("STRATA_TP_AHEAD_S")) : 30.0;
+                    const double left_ms = (now_ms() - tb0) * (double) (n - c0) / (double) B;
+                    if (ahead_s > 0 && left_ms <= ahead_s * 1000.0) tp->room_ahead((int64_t) pos0 + n + 64);
+                }
+#endif
                 if (feed_seam && c0 < n) feed_seam();   // larry (batch slots): the other slots' windows
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
@@ -2975,6 +2989,9 @@ int main(int argc, char ** argv) {
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             if (!ensure_kv(total + 64)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
+#if defined(DS41_TP)
+            if (tp) tp->room_ahead(-1);   // larry (patch-roomahead.py): an earlier prompt's read-ahead left over goes
+#endif
             g_kl_min_free = kept && keep_learn && kl_free0 > 0 ? 1e30 : -1;   // larry, patch-keeplearn2
             if (!img_spans.empty()) dense.set_images(img_spans);   // larry (vision): the pictures' rows for the feed
             if (reused > 0) {
