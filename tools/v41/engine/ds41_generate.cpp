@@ -3001,7 +3001,21 @@ int main(int argc, char ** argv) {
                 const int kb = std::min(reused, 8);
                 dense.engram_tokens(reused - kb, ids.data() + reused - kb, kb);
             }
+            // larry, STRATA_LI_REMOTE=N (patch-litopk.py, default 0; with STRATA_LI_TOPK): a prompt of >= N tokens shares its
+            // indexer's queries with the expert cards - their buffers sized for its end (its last ratio-2 cap bucket, every
+            // source that ranks all rows, a span's share) before its first batch, freed once it is read
+            static const int64_t lir_min = std::getenv("STRATA_LI_REMOTE") ? std::atoll(std::getenv("STRATA_LI_REMOTE")) : 0;
+            bool lir = false;
+            if (lir_min > 0 && !by_step && dh > 0 && total >= lir_min) {
+                int64_t nkv = 1024;
+                while (nkv < (int64_t) (total + 64) / 2 + 1) nkv <<= 1;
+                int nlay = 0;
+                for (int l = 0; l < n_layer; ++l) if (G.is_index_source(l) && (G.cand_layer < 0 || l < G.cand_layer)) ++nlay;
+                lir = nlay > 0 && ggml_backend_sycl_li_remote_prepare(ggml_backend_sycl_get_queue(dense.backend()), nkv, nlay, (SB + 3) / 4 + 8);
+                if (lir) ggml_backend_sycl_li_remote(1);
+            }
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            if (lir) ggml_backend_sycl_li_remote_release();   // (patch-litopk.py)
             feed_seam = nullptr;
             dense.clear_images();
             bcap_n = 0;

@@ -23,7 +23,7 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
  
          GGML_OP_UNARY,
  
-@@ -2679,6 +2694,16 @@
+@@ -2679,6 +2694,29 @@
          struct ggml_tensor  * weights,
          struct ggml_tensor  * mask);
  
@@ -37,10 +37,23 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 +        struct ggml_tensor  * weights,
 +        struct ggml_tensor  * nvis);
 +
++    // larry (patch-litopk.py): ggml_lightning_indexer_nvis's scores straight into their top-k (never a tensor): I32
++    // [top_k, n_batch], every query's top_k best visible rows in no particular order (as ggml_top_k).  rows_final: the
++    // rows of k already written for good when it runs (>= every nvis; the other cards copy no further).  ggml-sycl only
++    // (op_params[0] = 2, op_params[1] = top_k, op_params[2] = rows_final; k BF16 rows of 128).
++    GGML_API struct ggml_tensor * ggml_lightning_indexer_topk(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * weights,
++        struct ggml_tensor  * nvis,
++        int                   top_k,
++        int                   rows_final);
++
      // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
      // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
      // using a richer representation through streams.
-@@ -2751,6 +2776,308 @@
+@@ -2751,6 +2789,308 @@
              struct ggml_tensor  * base,
              float                 eps);
  
@@ -352,7 +365,7 @@ diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 --- a/ggml/include/ggml-sycl.h
 +++ b/ggml/include/ggml-sycl.h
-@@ -21,6 +21,40 @@
+@@ -21,6 +21,47 @@
  
  GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
  
@@ -389,11 +402,18 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
 +                                              float * dst, int64_t dst_col_stride);
 +// larry: free the fp16 weight copies the prompt GEMMs keep (GGML_SYCL_LARRY_F16CACHE_MB) - their VRAM back for decode
 +GGML_BACKEND_API void ggml_backend_sycl_larry_f16cache_release(void);
++// larry (patch-litopk.py): the prompt indexer's top-k op (ggml_lightning_indexer_topk) shares its calls' queries with the
++// other cards of card 0's context.  prepare: card 0's queue (the dense backend's: ggml_backend_sycl_get_queue), their buffers
++// for calls of up to nkv keys, `layers` keys tensors and nq queries a card (before a long prompt's first batch; false: no
++// room - nothing shared); on: share (1) or not (0); release: their buffers freed (after the prompt).
++GGML_BACKEND_API bool ggml_backend_sycl_li_remote_prepare(void * queue0, int64_t nkv, int layers, int64_t nq);
++GGML_BACKEND_API void ggml_backend_sycl_li_remote(int on);
++GGML_BACKEND_API void ggml_backend_sycl_li_remote_release(void);
 +
  // devide buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
  
-@@ -46,6 +80,10 @@
+@@ -46,6 +87,10 @@
  GGML_BACKEND_API int  ggml_backend_sycl_get_device_count();
  GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t *free, size_t *total);
  
@@ -469,10 +489,46 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -6461,6 +6491,40 @@
+@@ -6461,6 +6491,76 @@
      return result;
  }
  
++// larry (patch-litopk.py): ggml_lightning_indexer_nvis's scores straight into their top-k: I32 [top_k, n_batch]
++struct ggml_tensor * ggml_lightning_indexer_topk(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * weights,
++        struct ggml_tensor  * nvis,
++        int                   top_k,
++        int                   rows_final) {
++
++    GGML_ASSERT(       q->type == GGML_TYPE_F32);
++    GGML_ASSERT( weights->type == GGML_TYPE_F32);
++    GGML_ASSERT(    nvis->type == GGML_TYPE_F32);
++    GGML_ASSERT(      q->ne[0] == k->ne[0]);
++    GGML_ASSERT(      q->ne[1] == weights->ne[0]);
++    GGML_ASSERT(      k->ne[1] == 1);
++    GGML_ASSERT(      q->ne[2] == weights->ne[1]);
++    GGML_ASSERT(ggml_nelements(nvis) == q->ne[2]);
++    GGML_ASSERT(ggml_is_contiguous(nvis));
++    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && weights->ne[3] == 1);
++    GGML_ASSERT(top_k > 0 && top_k <= k->ne[2]);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, q->ne[2]);
++
++    int32_t params[3] = { 2, top_k, rows_final };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op   = GGML_OP_LIGHTNING_INDEXER;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = weights;
++    result->src[3] = nvis;
++
++    return result;
++}
++
 +// larry: ggml_lightning_indexer with nvis F32 [n_batch] (rows i < nvis[t] visible to query t) for the mask
 +struct ggml_tensor * ggml_lightning_indexer_nvis(
 +        struct ggml_context * ctx,
@@ -510,7 +566,7 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
  // ggml_dsv4_hc_comb
  
  struct ggml_tensor * ggml_dsv4_hc_comb(
-@@ -6588,6 +6652,643 @@
+@@ -6588,6 +6688,643 @@
      return result;
  }
  
@@ -7059,7 +7115,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  int ggml_backend_sycl_get_device_count() {
      return ggml_sycl_info().device_count;
  }
-@@ -6469,6 +7601,42 @@
+@@ -6469,7 +7601,47 @@
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -7100,9 +7156,14 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 +            return op->ne[2] < 8 && op->src[1]->nb[1] % 16 == 0 && op->src[2]->nb[1] % 16 == 0 &&
 +                   (!op->src[5] || op->src[5]->nb[1] % 16 == 0);
          case GGML_OP_LIGHTNING_INDEXER:
++            if (op->op_params[0] == 2)   // larry (patch-litopk.py): the top-k mode
++                return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_BF16 &&
++                       op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 128 &&
++                       op->src[0]->ne[1] == 32;
              return op->src[0]->type == GGML_TYPE_F32 &&
                  (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
-@@ -6477,7 +7645,10 @@
+                  op->src[1]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_Q8_0 ||
+@@ -6477,7 +7649,10 @@
                   op->src[1]->type == GGML_TYPE_Q4_1 || op->src[1]->type == GGML_TYPE_Q4_0 ||
                   op->src[1]->type == GGML_TYPE_IQ4_NL) &&
                  op->src[2]->type == GGML_TYPE_F32 &&
@@ -7117,7 +7178,8 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/lightning-indexer.cpp
 --- a/ggml/src/ggml-sycl/lightning-indexer.cpp
 +++ b/ggml/src/ggml-sycl/lightning-indexer.cpp
-@@ -1,4 +1,7 @@
+@@ -1,4 +1,8 @@
++#include <cstring>
  #include "lightning-indexer.hpp"
 +#include <algorithm>
 +#include <vector>
@@ -7125,7 +7187,7 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
  #include "dequantize.hpp"
  
  static void lightning_indexer_f32_sycl(
-@@ -144,7 +147,393 @@
+@@ -144,7 +148,753 @@
          });
  }
  
@@ -7339,8 +7401,6 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +// (element i = row i), so the relu-weighted head sum is lane-local.  Steps whose 32 keys are all masked for the query
 +// write -inf without the multiplies.
 +
-+using lif_A = li_mx::joint_matrix<sycl::sub_group, sycl::half, li_mx::use::a, 8, 16, li_mx::layout::row_major>;
-+using lif_B = li_mx::joint_matrix<sycl::sub_group, sycl::half, li_mx::use::b, 16, 16, li_mx::layout::col_major>;
 +using lif_C = li_mx::joint_matrix<sycl::sub_group, float, li_mx::use::accumulator, 8, 16>;
 +
 +static int lif_mode() {
@@ -7379,9 +7439,14 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +    }
 +
 +// qh: fp16 [B][32][128]; kh: the keys in fp16 [NKVp][128] (zero rows past NKV, NKVp a multiple of 32)
-+static void lif_run(const sycl::half * qh, const sycl::half * kh, int64_t NKV, const float * w, int64_t ldw,
-+                    const sycl::half * m, int64_t ldm, const float * nvis, float * od, int64_t ldo, int64_t B, int QW, int64_t KR,
-+                    queue_ptr stream) {
++// larry (patch-lifbf16.py): T = sycl::half (those copies, ld_k 128) or li_bf16 (GGML_SYCL_LI_FUSED=2: the queries in bf16,
++// the BF16 keys read where they are, rows ld_k apart, NKV a multiple of 32)
++template <typename T>
++static void lif_run_t(const T * qh, const T * kh, int64_t ld_k, int64_t NKV, const float * w, int64_t ldw,
++                      const sycl::half * m, int64_t ldm, const float * nvis, float * od, int64_t ldo, int64_t B, int QW, int64_t KR,
++                      queue_ptr stream) {
++    using lif_A = li_mx::joint_matrix<sycl::sub_group, T, li_mx::use::a, 8, 16, li_mx::layout::row_major>;
++    using lif_B = li_mx::joint_matrix<sycl::sub_group, T, li_mx::use::b, 16, 16, li_mx::layout::col_major>;
 +    const int64_t nkr = (NKV + KR - 1) / KR, nqb = (B + QW - 1) / QW;
 +    stream->parallel_for(sycl::nd_range<1>((size_t) (nqb * nkr * QW * 16), (size_t) (QW * 16)),
 +                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -7391,7 +7456,7 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +        const int64_t kr = g % nkr, b = (g / nkr) * QW + (int64_t) sg.get_group_linear_id();
 +        if (b >= B) return;
 +        const float wl0 = w[b * ldw + lane], wl1 = w[b * ldw + 16 + lane];
-+        const sycl::half * qr = qh + b * 32 * 128;
++        const T * qr = qh + b * 32 * 128;
 +        const sycl::half * mr = m + b * ldm;
 +        const float nv = nvis ? nvis[b] : 0.0f;   // nvis: rows j < nv visible (patch-linvis.py)
 +        float * orow = od + b * ldo;
@@ -7418,8 +7483,8 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +                li_mx::joint_matrix_load(sg, a1, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(qr + 1 * 1024 + ks * 16), 128);
 +                li_mx::joint_matrix_load(sg, a2, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(qr + 2 * 1024 + ks * 16), 128);
 +                li_mx::joint_matrix_load(sg, a3, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(qr + 3 * 1024 + ks * 16), 128);
-+                li_mx::joint_matrix_load(sg, b0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(kh + j0 * 128 + ks * 16), 128);
-+                li_mx::joint_matrix_load(sg, b1, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(kh + (j0 + 16) * 128 + ks * 16), 128);
++                li_mx::joint_matrix_load(sg, b0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(kh + j0 * ld_k + ks * 16), ld_k);
++                li_mx::joint_matrix_load(sg, b1, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(kh + (j0 + 16) * ld_k + ks * 16), ld_k);
 +                li_mx::joint_matrix_mad(sg, c00, a0, b0, c00); li_mx::joint_matrix_mad(sg, c01, a0, b1, c01);
 +                li_mx::joint_matrix_mad(sg, c10, a1, b0, c10); li_mx::joint_matrix_mad(sg, c11, a1, b1, c11);
 +                li_mx::joint_matrix_mad(sg, c20, a2, b0, c20); li_mx::joint_matrix_mad(sg, c21, a2, b1, c21);
@@ -7444,6 +7509,59 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +    const ggml_type kt = k->type;
 +    queue_ptr stream = ctx.stream();
 +    ggml_sycl_pool & pool = ctx.pool();
++    // larry (patch-lifbf16.py, GGML_SYCL_LI_FUSED=2): BF16 keys in rows of 128, a multiple of 32 of them, read as they are
++    if (lif_mode() == 2 && kt == GGML_TYPE_BF16 && nbk2 == 256 && NKV % 32 == 0 && ((uintptr_t) k->data) % 64 == 0) {
++        ggml_sycl_pool_alloc<li_bf16> Qb(pool, (size_t) B * 32 * 128);
++        li_bf16 * qb = Qb.get();
++        const char * qd = (const char *) q->data;
++        stream->parallel_for(sycl::range<1>((size_t) B * 32 * 128), [=](sycl::id<1> id) {
++            const size_t i = id[0];
++            const int64_t e = (int64_t) (i % 128), hh = (int64_t) ((i / 128) % 32), b = (int64_t) (i / 4096);
++            qb[i] = (li_bf16) *(const float *) (qd + b * nbq2 + hh * nbq1 + e * sizeof(float));
++        });
++        static const int qw_env2 = [] { const char * v = std::getenv("GGML_SYCL_LI_FUSED_QW"); return v && *v ? std::atoi(v) : 0; }();
++        static const int64_t kr_env2 = [] { const char * v = std::getenv("GGML_SYCL_LI_FUSED_KR"); return v && *v ? std::atoll(v) : 0; }();
++        const int qw2 = qw_env2 > 0 ? qw_env2 : NKV > 131072 ? 16 : 8;
++        const int64_t KR2 = kr_env2 > 0 ? (kr_env2 + 31) / 32 * 32 : NKV <= 16384 ? 128 : NKV <= 65536 ? 256 : 512;
++        const bool nvm2 = dst->op_params[0] == 1;
++        const float * wd = (const float *) w->data;
++        const int64_t ldw = (int64_t) (w->nb[1] / sizeof(float)), ldo = (int64_t) (dst->nb[1] / sizeof(float));
++        const sycl::half * md = nvm2 ? nullptr : (const sycl::half *) m->data;
++        const int64_t ldm = nvm2 ? 0 : (int64_t) (m->nb[1] / sizeof(sycl::half));
++        const float * nv = nvm2 ? (const float *) m->data : nullptr;
++        lif_run_t<li_bf16>(qb, (const li_bf16 *) k->data, 128, NKV, wd, ldw, md, ldm, nv, (float *) dst->data, ldo, B, qw2, KR2, stream);
++        static const int check16 = [] { const char * v = std::getenv("GGML_SYCL_LI_FUSED_CHECK16"); return v && *v ? std::atoi(v) : 0; }();
++        static int nchk16 = 0;
++        if (check16 && nchk16 < check16) {   // debug: the same call through mode 1 (fp16 copies) into scratch, compared bit for bit
++            ++nchk16;
++            ggml_sycl_pool_alloc<sycl::half> Q16(pool, (size_t) B * 32 * 128);
++            ggml_sycl_pool_alloc<sycl::half> K16(pool, (size_t) NKV * 128);
++            ggml_sycl_pool_alloc<char> ref(pool, (size_t) B * dst->nb[1]);
++            sycl::half * q16 = Q16.get();
++            sycl::half * k16 = K16.get();
++            const li_bf16 * kb = (const li_bf16 *) k->data;
++            stream->parallel_for(sycl::range<1>((size_t) B * 32 * 128), [=](sycl::id<1> id) { q16[id[0]] = (sycl::half) (float) qb[id[0]]; });
++            stream->parallel_for(sycl::range<1>((size_t) NKV * 128), [=](sycl::id<1> id) { k16[id[0]] = (sycl::half) (float) kb[id[0]]; });
++            lif_run_t<sycl::half>(q16, k16, 128, NKV, wd, ldw, md, ldm, nv, (float *) ref.get(), ldo, B, qw2, KR2, stream);
++            stream->wait();
++            std::vector<float> a((size_t) NKV), r((size_t) NKV);
++            int64_t differ = 0;
++            double md2 = 0;
++            for (int64_t b = 0; b < B; ++b) {
++                stream->memcpy(a.data(), (const char *) dst->data + b * dst->nb[1], NKV * sizeof(float)).wait();
++                stream->memcpy(r.data(), ref.get() + b * dst->nb[1], NKV * sizeof(float)).wait();
++                for (int64_t j = 0; j < NKV; ++j)
++                    if (std::memcmp(&a[(size_t) j], &r[(size_t) j], sizeof(float)) != 0) {
++                        ++differ;
++                        if (std::isfinite(a[(size_t) j]) && std::isfinite(r[(size_t) j]))
++                            md2 = std::max(md2, (double) std::fabs(a[(size_t) j] - r[(size_t) j]));
++                    }
++            }
++            GGML_LOG_INFO("larry li_fused bf16 check %d: %lld queries x %lld keys: %lld of %lld scores differ from the fp16 path "
++                          "(max |diff| %.3e)\n", nchk16, (long long) B, (long long) NKV, (long long) differ, (long long) (B * NKV), md2);
++        }
++        return true;
++    }
 +    ggml_sycl_pool_alloc<sycl::half> Qh(pool, (size_t) B * 32 * 128);
 +    ggml_sycl_pool_alloc<sycl::half> Kh(pool, (size_t) NKVp * 128);
 +    sycl::half * qh = Qh.get();
@@ -7474,7 +7592,7 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +    const int qw = qw_env > 0 ? qw_env : NKV > 131072 ? 16 : 8;
 +    const int64_t KR = kr_env > 0 ? (kr_env + 31) / 32 * 32 : NKV <= 16384 ? 128 : NKV <= 65536 ? 256 : 512;
 +    const bool nvm = dst->op_params[0] == 1;
-+    lif_run(qh, kh, NKV, (const float *) w->data, (int64_t) (w->nb[1] / sizeof(float)), nvm ? nullptr : (const sycl::half *) m->data,
++    lif_run_t<sycl::half>(qh, kh, 128, NKV, (const float *) w->data, (int64_t) (w->nb[1] / sizeof(float)), nvm ? nullptr : (const sycl::half *) m->data,
 +            nvm ? 0 : (int64_t) (m->nb[1] / sizeof(sycl::half)), nvm ? (const float *) m->data : nullptr, (float *) dst->data,
 +            (int64_t) (dst->nb[1] / sizeof(float)), B, qw, KR, stream);
 +    static const int check = [] { const char * v = std::getenv("GGML_SYCL_LI_FUSED_CHECK"); return v && *v ? std::atoi(v) : 0; }();
@@ -7509,7 +7627,311 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
 +    return true;
 +}
 +
++// ---- larry (patch-litopk.py): the top-k mode - ggml_lightning_indexer_topk (op_params[0] = 2, [1] = k).  Mode 2's
++// scores (the BF16 keys as stored) a slice of queries at a time into scratch (<= GGML_SYCL_LI_TOPK_MIB, 512), each slice's
++// top-k taken there.  With ggml_backend_sycl_li_remote(1) a call of >= GGML_SYCL_LI_REMOTE_MIN_KEYS keys (65536) and >= 64
++// queries keeps one share of its queries (1 / (1 + the other cards)) and hands the others to the other cards of card 0's
++// context: card 0 stages the keys' rows they lack and their queries / weights / visible rows in a plain buffer of its own
++// (card 0's KV pages and ggml's pool are never read by a peer), each card pulls its part, scores and ranks it on its own
++// queue, and card 0 pulls their ids after its own share - all in queue order, no host wait.
++#include "topk-radix.hpp"
++#include "ggml-sycl.h"
++
++namespace {
++struct LirKeys {   // a card's copy of one keys tensor of the prompt: rows [0, have), in fp16 (the faster kernel at depth)
++    const void * src = nullptr;
++    sycl::half * dev = nullptr;
++    int64_t have = 0;
++};
++struct LirCard {
++    std::unique_ptr<sycl::queue> q;
++    int bsz = 1024;
++    std::vector<LirKeys> keys;
++    sycl::half * kpool = nullptr;    // [layers][nkv][128] - the keys' copies, a layer each (fp16)
++    li_bf16 * kin = nullptr;         // rows as they arrive (bf16, a stage-full), converted into kpool
++    li_bf16 * qb = nullptr;          // its queries as they arrive, bf16 [nq][32][128]
++    sycl::half * qh = nullptr;       // the same in fp16
++    float * w = nullptr;             // their weights [nq][32]
++    float * nv = nullptr;            // their visible rows [nq]
++    float * sc = nullptr;            // their scores [nq][nkv]
++    int32_t * sel = nullptr;         // their ids [nq][k <= 512]
++    sycl::event done;
++};
++struct Lir {
++    int on = 0;
++    bool ready = false;
++    int64_t nkv = 0, nq = 0;
++    int layers = 0;
++    sycl::context * ctx = nullptr;   // card 0's
++    std::vector<LirCard> cards;
++    uint8_t * stage = nullptr;       // card 0, plain device memory: what the others pull
++    size_t stage_cap = 0;
++};
++Lir g_lir;
++sycl::queue * g_lir_q0 = nullptr;   // card 0's queue (the dense backend's), set at the first top-k call
++
++constexpr size_t kLirKeyChunk = (size_t) 32 << 20;   // a key catch-up a stage-full at a time
++constexpr int kLirMaxK = 512;
++
++void lir_free() {
++    for (LirCard & c : g_lir.cards) {
++        c.q->wait();
++        for (void * p : { (void *) c.kpool, (void *) c.kin, (void *) c.qb, (void *) c.qh, (void *) c.w, (void *) c.nv, (void *) c.sc,
++                          (void *) c.sel })
++            if (p) sycl::free(p, *c.q);
++        c.kpool = nullptr; c.kin = nullptr; c.qb = nullptr; c.qh = nullptr; c.w = nullptr; c.nv = nullptr; c.sc = nullptr; c.sel = nullptr;
++        c.keys.clear();
++    }
++    if (g_lir.stage && g_lir_q0) { g_lir_q0->wait(); sycl::free(g_lir.stage, *g_lir_q0); }
++    g_lir.stage = nullptr;
++    g_lir.stage_cap = 0;
++    g_lir.ready = false;
++}
++
++// the other cards of card 0's context, a queue each (once)
++bool lir_cards(sycl::queue & q0) {
++    if (!g_lir.cards.empty()) return true;
++    const sycl::context ctx = q0.get_context();
++    for (const sycl::device & d : ctx.get_devices()) {
++        if (d == q0.get_device() || !d.is_gpu()) continue;
++        LirCard c;
++        // GGML_SYCL_LI_REMOTE_PRIO=1: its queue at low priority (the card's own work - the prompt's expert calls - first);
++        // measured at 984K worse: card 0 then waited longer for the shares (322.3 s against 313.2 at the default 0)
++        static const int prio = [] { const char * e = std::getenv("GGML_SYCL_LI_REMOTE_PRIO"); return e && *e ? std::atoi(e) : 0; }();
++        if (prio) c.q = std::make_unique<sycl::queue>(ctx, d, sycl::property_list{ sycl::property::queue::in_order(),
++                                                                                    sycl::ext::oneapi::property::queue::priority_low() });
++        else c.q = std::make_unique<sycl::queue>(ctx, d, sycl::property::queue::in_order());
++        c.bsz = (int) d.get_info<sycl::info::device::max_work_group_size>();
++        g_lir.cards.push_back(std::move(c));
++    }
++    return !g_lir.cards.empty();
++}
++
++int lir_min_keys() { static const int v = [] { const char * e = std::getenv("GGML_SYCL_LI_REMOTE_MIN_KEYS"); return e && *e ? std::atoi(e) : 65536; }(); return v; }
++
++// queries [n0, n) of the call to the other cards (false: not taken - no room, a shape it was not prepared for)
++// (the keys' rows past `fin` are not written yet - the cards copy rows [have, fin) only; every query sees fewer)
++bool lir_begin(sycl::queue & q0, const li_bf16 * kd, int64_t NKV, int64_t fin, const li_bf16 * qb, const float * w, const float * nv,
++               int64_t B, int K, int qw, int64_t KR, int64_t & n0, std::vector<int64_t> & bnd) {
++    const int nc = (int) g_lir.cards.size();
++    if (!g_lir.ready || NKV > g_lir.nkv || K > kLirMaxK) return false;
++    // card 0's share: GGML_SYCL_LI_REMOTE_SHARE % of the queries (default 25); the rest evenly over the others
++    static const int pct = [] { const char * e = std::getenv("GGML_SYCL_LI_REMOTE_SHARE"); return e && *e ? std::atoi(e) : 25; }();
++    const int64_t share = std::max<int64_t>(0, std::min<int64_t>(B - nc, (B * pct + 50) / 100));
++    if (B - share > (int64_t) nc * g_lir.nq) return false;
++    n0 = share;
++    bnd.assign((size_t) nc + 1, 0);
++    for (int c = 0; c <= nc; ++c) bnd[(size_t) c] = n0 + (B - n0) * c / nc;
++    // the keys tensor's copy on every card (the same rows on each)
++    int64_t have = fin;
++    for (LirCard & c : g_lir.cards) {
++        LirKeys * e = nullptr;
++        for (LirKeys & k : c.keys) if (k.src == kd) e = &k;
++        if (!e) {
++            if ((int) c.keys.size() >= g_lir.layers) return false;
++            LirKeys k;
++            k.src = kd;
++            k.dev = c.kpool + (size_t) c.keys.size() * (size_t) g_lir.nkv * 128;
++            c.keys.push_back(k);
++            e = &c.keys.back();
++        }
++        have = std::min(have, e->have);
++    }
++    // the stage: [the keys' new rows][queries n0..B][weights n0..B][visible rows n0..B] - rows that do not fit beside the
++    // queries go first, a stage at a time (a prompt that starts deep: its first call per keys tensor), the host waiting
++    const size_t qbytes = (size_t) (B - n0) * 8192, wbytes = (size_t) (B - n0) * 128, vbytes = (size_t) (B - n0) * 4;
++    const size_t tail = ((qbytes + 255) & ~(size_t) 255) + ((wbytes + 255) & ~(size_t) 255) + vbytes + 256;
++    if (tail + 256 > g_lir.stage_cap) return false;
++    const int64_t fit = (int64_t) ((g_lir.stage_cap - tail) / 256), full = (int64_t) (g_lir.stage_cap / 256);
++    while (fin - have > fit) {
++        const int64_t nr = std::min<int64_t>(full, fin - have);
++        q0.memcpy(g_lir.stage, kd + have * 128, (size_t) nr * 256);
++        const sycl::event e0 = q0.ext_oneapi_submit_barrier();
++        for (LirCard & c : g_lir.cards) {
++            LirKeys * k = nullptr;
++            for (LirKeys & x : c.keys) if (x.src == kd) k = &x;
++            c.q->ext_oneapi_submit_barrier({ e0 });
++            c.q->memcpy(c.kin, g_lir.stage, (size_t) nr * 256);
++            sycl::half * kdst = k->dev + have * 128;
++            const li_bf16 * kin = c.kin;
++            c.q->parallel_for(sycl::range<1>((size_t) nr * 128), [=](sycl::id<1> i) { kdst[i[0]] = (sycl::half) (float) kin[i[0]]; });
++        }
++        for (LirCard & c : g_lir.cards) {
++            c.q->wait();
++            for (LirKeys & x : c.keys) if (x.src == kd) x.have = have + nr;
++        }
++        have += nr;
++    }
++    const size_t kb = (size_t) std::max<int64_t>(0, fin - have) * 256;
++    const size_t qo = (kb + 255) & ~(size_t) 255, wo = qo + ((qbytes + 255) & ~(size_t) 255), vo = wo + ((wbytes + 255) & ~(size_t) 255);
++    if (kb) q0.memcpy(g_lir.stage, kd + have * 128, kb);
++    q0.memcpy(g_lir.stage + qo, qb + n0 * 4096, qbytes);
++    q0.memcpy(g_lir.stage + wo, w + n0 * 32, wbytes);
++    q0.memcpy(g_lir.stage + vo, nv + n0, vbytes);
++    const sycl::event es = q0.ext_oneapi_submit_barrier();
++    for (int ci = 0; ci < nc; ++ci) {
++        LirCard & c = g_lir.cards[(size_t) ci];
++        LirKeys * k = nullptr;
++        for (LirKeys & x : c.keys) if (x.src == kd) k = &x;
++        const int64_t b0 = bnd[(size_t) ci], nq = bnd[(size_t) ci + 1] - b0, off = b0 - n0;
++        c.q->ext_oneapi_submit_barrier({ es });
++        if (kb) {
++            c.q->memcpy(c.kin, g_lir.stage, kb);
++            sycl::half * kdst = k->dev + have * 128;
++            const li_bf16 * kin = c.kin;
++            c.q->parallel_for(sycl::range<1>(kb / 2), [=](sycl::id<1> i) { kdst[i[0]] = (sycl::half) (float) kin[i[0]]; });
++        }
++        c.q->memcpy(c.qb, g_lir.stage + qo + (size_t) off * 8192, (size_t) nq * 8192);
++        c.q->memcpy(c.w, g_lir.stage + wo + (size_t) off * 128, (size_t) nq * 128);
++        c.q->memcpy(c.nv, g_lir.stage + vo + (size_t) off * 4, (size_t) nq * 4);
++        if (nq > 0) {
++            const li_bf16 * qin = c.qb;
++            sycl::half * qh = c.qh;
++            c.q->parallel_for(sycl::range<1>((size_t) nq * 4096), [=](sycl::id<1> i) { qh[i[0]] = (sycl::half) (float) qin[i[0]]; });
++            lif_run_t<sycl::half>(c.qh, k->dev, 128, NKV, c.w, 32, nullptr, 0, c.nv, c.sc, NKV, nq, qw, KR, c.q.get());
++            ggml_sycl_top_k_rows(*c.q, c.bsz, c.sc, c.sel, NKV, nq, K);
++        }
++        c.done = c.q->ext_oneapi_submit_barrier();
++        k->have = std::max(k->have, fin);
++    }
++    return true;
++}
++
++void lir_end(sycl::queue & q0, int32_t * out, int K, const std::vector<int64_t> & bnd) {
++    std::vector<sycl::event> ev;
++    for (LirCard & c : g_lir.cards) ev.push_back(c.done);
++    q0.ext_oneapi_submit_barrier(ev);
++    for (size_t ci = 0; ci < g_lir.cards.size(); ++ci) {
++        const int64_t b0 = bnd[ci], nq = bnd[ci + 1] - b0;
++        if (nq > 0) q0.memcpy(out + b0 * K, g_lir.cards[ci].sel, (size_t) nq * K * 4);
++    }
++}
++}  // namespace
++
++bool ggml_backend_sycl_li_remote_prepare(void * queue0, int64_t nkv, int layers, int64_t nq) {
++    if (queue0) g_lir_q0 = (sycl::queue *) queue0;   // card 0's: the dense backend's
++    if (!g_lir_q0) return false;
++    sycl::queue & q0 = *g_lir_q0;
++    if (!lir_cards(q0)) return false;
++    nkv = (nkv + 31) / 32 * 32;
++    if (g_lir.ready && nkv <= g_lir.nkv && layers <= g_lir.layers && nq <= g_lir.nq) return true;
++    lir_free();
++    g_lir.nkv = nkv; g_lir.layers = layers; g_lir.nq = nq;
++    // the stage: a key chunk, or one call's new rows + the others' queries (nc * nq of them), whichever is larger
++    const size_t call = (size_t) 2 * 1024 * 256 + (size_t) g_lir.cards.size() * (size_t) nq * (8192 + 128 + 4) + 4096;
++    g_lir.stage_cap = std::max(kLirKeyChunk, call);
++    bool ok = true;
++    for (LirCard & c : g_lir.cards) {
++        c.kpool = sycl::malloc_device<sycl::half>((size_t) layers * (size_t) nkv * 128, *c.q);
++        c.kin = sycl::malloc_device<li_bf16>(g_lir.stage_cap / 2, *c.q);
++        c.qb = sycl::malloc_device<li_bf16>((size_t) nq * 4096, *c.q);
++        c.qh = sycl::malloc_device<sycl::half>((size_t) nq * 4096, *c.q);
++        c.w = sycl::malloc_device<float>((size_t) nq * 32, *c.q);
++        c.nv = sycl::malloc_device<float>((size_t) nq, *c.q);
++        c.sc = sycl::malloc_device<float>((size_t) nq * (size_t) nkv, *c.q);
++        c.sel = sycl::malloc_device<int32_t>((size_t) nq * kLirMaxK, *c.q);
++        ok = ok && c.kpool && c.kin && c.qb && c.qh && c.w && c.nv && c.sc && c.sel;
++    }
++    g_lir.stage = sycl::malloc_device<uint8_t>(g_lir.stage_cap, q0);
++    ok = ok && g_lir.stage;
++    if (!ok) { lir_free(); GGML_LOG_INFO("larry li remote: no room for %lld keys x %d layers, %lld queries a card\n", (long long) nkv, layers, (long long) nq); return false; }
++    g_lir.ready = true;
++    GGML_LOG_INFO("larry li remote: %zu cards, %lld keys x %d layers, %lld queries a card (%.0f MiB a card)\n", g_lir.cards.size(),
++                  (long long) nkv, layers, (long long) nq,
++                  ((double) layers * nkv * 256 + (double) g_lir.stage_cap + (double) nq * (16384 + 132 + 4.0 * nkv + 4.0 * kLirMaxK)) / 1048576.0);
++    return true;
++}
++
++void ggml_backend_sycl_li_remote(int on) { g_lir.on = on; }
++
++void ggml_backend_sycl_li_remote_release(void) {
++    g_lir.on = 0;
++    if (!g_lir.cards.empty() || g_lir.stage) lir_free();
++}
++
++static void li_topk(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * w = dst->src[2];
++    const ggml_tensor * nvt = dst->src[3];
++    const int K = dst->op_params[1];
++    const int64_t B = q->ne[2], NKV = k->ne[2];
++    const size_t nbq1 = q->nb[1], nbq2 = q->nb[2];
++    GGML_ASSERT(k->type == GGML_TYPE_BF16 && k->nb[2] == 256 && NKV % 32 == 0 && ((uintptr_t) k->data) % 64 == 0);
++    GGML_ASSERT(w->nb[1] == 32 * sizeof(float) && dst->nb[1] == (size_t) K * sizeof(int32_t));
++    queue_ptr stream = ctx.stream();
++    ggml_sycl_pool & pool = ctx.pool();
++    if (!g_lir_q0) g_lir_q0 = stream;
++    ggml_sycl_pool_alloc<li_bf16> Qb(pool, (size_t) B * 4096);
++    li_bf16 * qb = Qb.get();
++    const char * qd = (const char *) q->data;
++    stream->parallel_for(sycl::range<1>((size_t) B * 4096), [=](sycl::id<1> id) {
++        const size_t i = id[0];
++        const int64_t e = (int64_t) (i % 128), hh = (int64_t) ((i / 128) % 32), b = (int64_t) (i / 4096);
++        qb[i] = (li_bf16) *(const float *) (qd + b * nbq2 + hh * nbq1 + e * sizeof(float));
++    });
++    static const int qw_env = [] { const char * v = std::getenv("GGML_SYCL_LI_FUSED_QW"); return v && *v ? std::atoi(v) : 0; }();
++    static const int64_t kr_env = [] { const char * v = std::getenv("GGML_SYCL_LI_FUSED_KR"); return v && *v ? std::atoll(v) : 0; }();
++    const int qw = qw_env > 0 ? qw_env : NKV > 131072 ? 16 : 8;
++    const int64_t KR = kr_env > 0 ? (kr_env + 31) / 32 * 32 : NKV <= 16384 ? 128 : NKV <= 65536 ? 256 : 512;
++    const li_bf16 * kd = (const li_bf16 *) k->data;
++    const float * wd = (const float *) w->data;
++    const float * nv = (const float *) nvt->data;
++    int32_t * out = (int32_t *) dst->data;
++    int64_t n0 = B;
++    std::vector<int64_t> bnd;
++    if (g_lir.on && g_lir.ready && B >= 64 && NKV >= lir_min_keys() && stream == g_lir_q0)
++        if (!lir_begin(*stream, kd, NKV, std::min<int64_t>(NKV, dst->op_params[2] > 0 ? dst->op_params[2] : NKV), qb, wd, nv, B, K, qw,
++                       KR, n0, bnd)) n0 = B;
++    static const int64_t mib = [] { const char * v = std::getenv("GGML_SYCL_LI_TOPK_MIB"); return v && *v ? std::atoll(v) : 512; }();
++    const int64_t slice = std::max<int64_t>(16, std::min<int64_t>(std::max<int64_t>(n0, 1), (mib << 20) / (NKV * 4)));
++    ggml_sycl_pool_alloc<float> S(pool, (size_t) slice * (size_t) NKV);
++    const int bsz0 = ggml_sycl_info().max_work_group_sizes[ctx.device];
++    for (int64_t b0 = 0; b0 < n0; b0 += slice) {
++        const int64_t nq = std::min(slice, n0 - b0);
++        lif_run_t<li_bf16>(qb + b0 * 4096, kd, 128, NKV, wd + b0 * 32, 32, nullptr, 0, nv + b0, S.get(), NKV, nq, qw, KR, stream);
++        ggml_sycl_top_k_rows(*stream, bsz0, S.get(), out + b0 * K, NKV, nq, K);
++    }
++    if (n0 < B) lir_end(*stream, out, K, bnd);
++    // debug, GGML_SYCL_LI_TOPK_CHECK=N: the first N calls of <= GGML_SYCL_LI_TOPK_CHECK_KEYS keys (131072) that shared
++    // their queries (or every call when sharing is off) against card 0's scores of every query: a query's ids must be
++    // distinct, in range, and a top-k of its row - all at or above its k-th score, as many above it as the row has
++    static const int chk = [] { const char * v = std::getenv("GGML_SYCL_LI_TOPK_CHECK"); return v && *v ? std::atoi(v) : 0; }();
++    static const int64_t chk_keys = [] { const char * v = std::getenv("GGML_SYCL_LI_TOPK_CHECK_KEYS"); return v && *v ? std::atoll(v) : 131072; }();
++    static int nchk = 0;
++    if (chk && nchk < chk && NKV <= chk_keys && (n0 < B || !g_lir.on)) {
++        ++nchk;
++        ggml_sycl_pool_alloc<float> SC(pool, (size_t) B * (size_t) NKV);
++        lif_run_t<li_bf16>(qb, kd, 128, NKV, wd, 32, nullptr, 0, nv, SC.get(), NKV, B, qw, KR, stream);
++        std::vector<int32_t> ids((size_t) B * K);
++        std::vector<float> sc((size_t) B * (size_t) NKV);
++        stream->memcpy(ids.data(), out, ids.size() * 4).wait();
++        stream->memcpy(sc.data(), SC.get(), sc.size() * 4).wait();
++        int64_t bad = 0;
++        std::vector<float> v;
++        std::vector<int32_t> s;
++        for (int64_t b = 0; b < B; ++b) {
++            const float * row = sc.data() + b * NKV;
++            const int32_t * id = ids.data() + b * K;
++            v.assign(row, row + NKV);
++            std::nth_element(v.begin(), v.begin() + (K - 1), v.end(), std::greater<float>());
++            const float kth = v[(size_t) K - 1];
++            s.assign(id, id + K);
++            std::sort(s.begin(), s.end());
++            bool ok = s.front() >= 0 && s.back() < NKV && std::adjacent_find(s.begin(), s.end()) == s.end();
++            int64_t gt_row = 0, gt_ids = 0, ge_ids = 0;
++            for (int64_t j = 0; j < NKV; ++j) gt_row += row[j] > kth;
++            for (int i = 0; ok && i < K; ++i) { gt_ids += row[s[(size_t) i]] > kth; ge_ids += row[s[(size_t) i]] >= kth; }
++            ok = ok && ge_ids == K && gt_ids == gt_row;
++            bad += !ok;
++        }
++        GGML_LOG_INFO("larry li_topk check %d: %lld queries x %lld keys (%lld on card 0, the rest on %zu other cards): %lld queries' ids wrong\n",
++                      nchk, (long long) B, (long long) NKV, (long long) n0, n0 < B ? g_lir.cards.size() : (size_t) 0, (long long) bad);
++    }
++}
++
  void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[0] == 2) { li_topk(ctx, dst); return; }   // larry (patch-litopk.py): the top-k mode
 +    if (li_xmx_ok(dst) && li_xmx(ctx, dst)) return;   // larry: decode / verify batches, one fused XMX kernel
 +    if (li_fused_ok(dst) && li_fused(ctx, dst)) return;   // larry: prompt batches, one fused XMX kernel (S in registers)
 +    if (li_gemm_ok(dst)) {   // larry: prompt batches as one XMX GEMM
@@ -7519,7 +7941,7 @@ diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/light
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
      const ggml_tensor * q = dst->src[0];
      const ggml_tensor * k = dst->src[1];
-@@ -154,7 +543,7 @@
+@@ -154,7 +904,7 @@
      GGML_ASSERT(dst->type == GGML_TYPE_F32);
      GGML_ASSERT(  q->type == GGML_TYPE_F32);
      GGML_ASSERT(  w->type == GGML_TYPE_F32);
@@ -7696,3 +8118,290 @@ diff --git a/ggml/src/ggml-sycl/rope.cpp b/ggml/src/ggml-sycl/rope.cpp
          } else {
              GGML_ABORT("Fatal error: Tensor type unsupported!");
          }
+diff --git a/ggml/src/ggml-sycl/topk-radix.cpp b/ggml/src/ggml-sycl/topk-radix.cpp
+--- a/ggml/src/ggml-sycl/topk-radix.cpp
++++ b/ggml/src/ggml-sycl/topk-radix.cpp
+@@ -3,6 +3,7 @@
+ #include "common.hpp"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ 
+ // Large-k top-k by radix select on an order-preserving unsigned key.
+ //
+@@ -513,6 +514,248 @@
+     });
+ }
+ 
++// larry (patch-topk2.py, GGML_SYCL_TOPK2): one row's top-k in two stages for long rows.  Stage 0 takes every block's
++// largest radix key (1 << bs_log2 columns a block, at most SYCL_TOP_K2_MAX_BLOCKS blocks, into SLM - the one full read of
++// the row); stage 1 the k-th largest of those, T (all four digits: its exact key); stage 2 the radix select and its emit
++// of top_k_radix_select_f32 over the columns of the blocks whose maximum reaches T only, in block order.  The same set:
++// k blocks hold a column >= T each, so the row's k-th largest key E >= T, and every column >= E lies in a block whose
++// maximum is >= T - the candidates hold every column at or above the pivot (ties too), and the selection over them is
++// the selection over the row (pivot-equal columns are taken in no fixed order by both).  The passes read ~k blocks.
++// Needs top_k_radix_key and the SYCL_TOP_K_RADIX_* constants above.
++static constexpr int SYCL_TOP_K2_MAX_BLOCKS = 8192;
++
++static inline int top_k2_bs_log2(const int64_t ncols) {
++    int b = 5;   // >= 32 columns a block
++    while (((ncols + ((int64_t) 1 << b) - 1) >> b) > SYCL_TOP_K2_MAX_BLOCKS) {
++        ++b;
++    }
++    return b;
++}
++
++// rows long enough that their block maxima cut the passes, and k small beside the blocks
++static inline bool top_k2_shape_ok(const int64_t ncols, const int k) {
++    if (ncols < 32768 || ncols > ((int64_t) 1 << 30)) {
++        return false;
++    }
++    const int b = top_k2_bs_log2(ncols);
++    return ((ncols + ((int64_t) 1 << b) - 1) >> b) >= 4 * (int64_t) k;
++}
++
++static void top_k_radix_select2_f32(
++    const float *   src,
++    int32_t *       dst_idx,
++    const int       ncols,
++    const int       k,
++    const int       bs_log2,
++    uint32_t *      slm,
++    const sycl::nd_item<1> & item_ct1
++) {
++    using local_atomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
++                                          sycl::memory_scope::work_group,
++                                          sycl::access::address_space::local_space>;
++
++    const auto grp        = item_ct1.get_group();
++    const auto sg         = item_ct1.get_sub_group();
++    const int  tid        = item_ct1.get_local_id(0);
++    const int  block_size = item_ct1.get_local_range(0);
++    const int  bs         = 1 << bs_log2;
++    const int  nblk       = (ncols + bs - 1) >> bs_log2;
++
++    uint32_t * hist     = slm;
++    uint32_t * s_digit  = slm + SYCL_TOP_K_RADIX_HIST_SIZE;
++    uint32_t * s_bucket = s_digit + 1;
++    uint32_t * s_need   = s_digit + 2;
++    uint32_t * s_cnt_gt = s_digit + 3;
++    uint32_t * s_cnt_eq = s_digit + 4;
++    uint32_t * s_ncand  = s_digit + 5;
++    uint32_t * bmax     = s_digit + 8;   // [nblk]
++    uint32_t * cand     = bmax + nblk;   // [nblk]: the candidate blocks, in order
++
++    const int copy = tid & (SYCL_TOP_K_RADIX_HIST_COPIES - 1);
++
++    // stage 0: every block's largest key, a sub-group a block
++    {
++        const int lane = sg.get_local_id()[0];
++        const int sgw  = sg.get_local_range()[0];
++        const int sgi  = sg.get_group_id()[0];
++        const int nsg  = sg.get_group_range()[0];
++        for (int b = sgi; b < nblk; b += nsg) {
++            const int c0 = b << bs_log2;
++            const int c1 = sycl::min(ncols, c0 + bs);
++            uint32_t  m  = 0;
++            for (int c = c0 + lane; c < c1; c += sgw) {
++                m = sycl::max(m, top_k_radix_key(src[c]));
++            }
++            m = sycl::reduce_over_group(sg, m, sycl::maximum<uint32_t>());
++            if (lane == 0) {
++                bmax[b] = m;
++            }
++        }
++    }
++    if (tid == 0) {
++        *s_cnt_gt = 0;
++        *s_cnt_eq = 0;
++    }
++    item_ct1.barrier(sycl::access::fence_space::local_space);
++
++    // the radix select of top_k_radix_select_f32 over n keys (key_at(i, key) false: no key there); every digit when
++    // `full` (then prefix is the pivot's whole key)
++    uint32_t prefix = 0;
++    uint32_t mask   = 0;
++    uint32_t need   = (uint32_t) k;
++    auto select = [&](const int n, auto key_at, const bool full) {
++        prefix = 0;
++        mask   = 0;
++        need   = (uint32_t) k;
++        for (int shift = 32 - SYCL_TOP_K_RADIX_BITS; shift >= 0; shift -= SYCL_TOP_K_RADIX_BITS) {
++            for (int i = tid; i < SYCL_TOP_K_RADIX_HIST_SIZE; i += block_size) {
++                hist[i] = 0;
++            }
++            item_ct1.barrier(sycl::access::fence_space::local_space);
++
++            for (int i = tid; i < n; i += block_size) {
++                uint32_t key;
++                if (key_at(i, key) && (key & mask) == prefix) {
++                    const uint32_t bucket = (key >> shift) & (SYCL_TOP_K_RADIX_BUCKETS - 1);
++                    local_atomic(hist[bucket * SYCL_TOP_K_RADIX_HIST_COPIES + copy]).fetch_add(1u);
++                }
++            }
++            item_ct1.barrier(sycl::access::fence_space::local_space);
++
++            uint32_t cnt = 0;
++            if (tid < SYCL_TOP_K_RADIX_BUCKETS) {
++                const uint32_t * h = hist + (SYCL_TOP_K_RADIX_BUCKETS - 1 - tid) * SYCL_TOP_K_RADIX_HIST_COPIES;
++                for (int c = 0; c < SYCL_TOP_K_RADIX_HIST_COPIES; c++) {
++                    cnt += h[c];
++                }
++            }
++            const uint32_t incl = sycl::inclusive_scan_over_group(grp, cnt, sycl::plus<uint32_t>());
++            if (tid < SYCL_TOP_K_RADIX_BUCKETS && incl >= need && incl - cnt < need) {
++                *s_digit  = (uint32_t) (SYCL_TOP_K_RADIX_BUCKETS - 1 - tid);
++                *s_bucket = cnt;
++                *s_need   = need - (incl - cnt);
++            }
++            item_ct1.barrier(sycl::access::fence_space::local_space);
++
++            const uint32_t digit      = *s_digit;
++            const uint32_t bucket_cnt = *s_bucket;
++            need   = *s_need;
++            prefix |= digit << shift;
++            mask   |= (uint32_t) (SYCL_TOP_K_RADIX_BUCKETS - 1) << shift;
++            const bool done = !full && bucket_cnt == need;
++            // the next pass rewrites hist and s_*; the reads above must land first
++            item_ct1.barrier(sycl::access::fence_space::local_space);
++            if (done) {
++                break;
++            }
++        }
++    };
++
++    // stage 1: T = the k-th largest block maximum (its exact key)
++    select(nblk, [&](const int i, uint32_t & key) { key = bmax[i]; return true; }, true);
++    const uint32_t T = prefix;
++
++    // the candidate blocks (maximum >= T) in order: each lane a run of blocks, an exclusive scan for their places
++    {
++        const int per = (nblk + block_size - 1) / block_size;
++        const int b0  = sycl::min(nblk, tid * per);
++        const int b1  = sycl::min(nblk, b0 + per);
++        uint32_t  cnt = 0;
++        for (int b = b0; b < b1; ++b) {
++            cnt += bmax[b] >= T ? 1u : 0u;
++        }
++        uint32_t off = sycl::exclusive_scan_over_group(grp, cnt, sycl::plus<uint32_t>());
++        for (int b = b0; b < b1; ++b) {
++            if (bmax[b] >= T) {
++                cand[off++] = (uint32_t) b;
++            }
++        }
++        const uint32_t tot = sycl::reduce_over_group(grp, cnt, sycl::plus<uint32_t>());
++        if (tid == 0) {
++            *s_ncand = tot;
++        }
++    }
++    item_ct1.barrier(sycl::access::fence_space::local_space);
++    const int nc = (int) (*s_ncand) << bs_log2;   // the candidates' columns (the last block may run past the row)
++
++    // stage 2: the select over the candidates' columns
++    select(nc, [&](const int i, uint32_t & key) {
++        const int c = (int) (cand[i >> bs_log2] << bs_log2) + (i & (bs - 1));
++        if (c >= ncols) {
++            return false;
++        }
++        key = top_k_radix_key(src[c]);
++        return true;
++    }, false);
++
++    // exactly k - need candidates have (key & mask) > prefix; the first need pivot-equal ones fill the tail
++    const uint32_t base_eq = (uint32_t) k - need;
++    for (int i = tid; i < nc; i += block_size) {
++        const int c = (int) (cand[i >> bs_log2] << bs_log2) + (i & (bs - 1));
++        if (c >= ncols) {
++            continue;
++        }
++        const uint32_t kp = top_k_radix_key(src[c]) & mask;
++        if (kp > prefix) {
++            const uint32_t pos = local_atomic(*s_cnt_gt).fetch_add(1u);
++            dst_idx[pos] = c;
++        } else if (kp == prefix) {
++            const uint32_t pos = local_atomic(*s_cnt_eq).fetch_add(1u);
++            if (pos < need) {
++                dst_idx[base_eq + pos] = c;
++            }
++        }
++    }
++}
++
++// a group a row, as top_k_radix_f32_sycl; block_size >= SYCL_TOP_K_RADIX_BUCKETS
++static void top_k_radix2_f32_sycl(
++    sycl::queue &   q,
++    const int       block_size,
++    const float *   src,
++    int32_t *       dst_indices,
++    const int64_t   ncols,
++    const int64_t   nrows,
++    const int       k
++) {
++    const int    bs_log2   = top_k2_bs_log2(ncols);
++    const int    nblk      = (int) ((ncols + ((int64_t) 1 << bs_log2) - 1) >> bs_log2);
++    const size_t slm_words = (size_t) SYCL_TOP_K_RADIX_HIST_SIZE + 8 + 2 * (size_t) nblk;
++    q.submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(slm_words), cgh);
++        cgh.parallel_for(
++            sycl::nd_range<1>(sycl::range<1>((size_t) nrows * block_size), sycl::range<1>(block_size)),
++            [=](sycl::nd_item<1> item_ct1) {
++                const int64_t row = item_ct1.get_group(0);
++                top_k_radix_select2_f32(
++                    src + row * ncols, dst_indices + row * k,
++                    (int) ncols, k, bs_log2,
++                    slm.get_multi_ptr<sycl::access::decorated::no>().get(),
++                    item_ct1);
++            });
++    });
++}
++
++// larry (patch-litopk.py)
++void ggml_sycl_top_k_rows(sycl::queue & q, int block_size, const float * src, int32_t * dst, int64_t ncols, int64_t nrows, int k) {
++    static const bool two = std::getenv("GGML_SYCL_TOPK2") && std::atoi(std::getenv("GGML_SYCL_TOPK2")) != 0;
++    if (two && top_k2_shape_ok(ncols, k)) {
++        top_k_radix2_f32_sycl(q, block_size, src, dst, ncols, nrows, k);
++        return;
++    }
++    GGML_ASSERT(ncols <= INT32_MAX && block_size >= SYCL_TOP_K_RADIX_BUCKETS);
++    q.submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(SYCL_TOP_K_RADIX_SLM_WORDS), cgh);
++        cgh.parallel_for(
++            sycl::nd_range<1>(sycl::range<1>((size_t) nrows * block_size), sycl::range<1>(block_size)),
++            [=](sycl::nd_item<1> item_ct1) {
++                const int64_t row = item_ct1.get_group(0);
++                top_k_radix_select_f32(src + row * ncols, dst + row * k, (int) ncols, k,
++                                       slm.get_multi_ptr<sycl::access::decorated::no>().get(), item_ct1);
++            });
++    });
++}
++
+ void ggml_sycl_top_k_radix(
+     ggml_backend_sycl_context & ctx,
+     const float *   src,
+@@ -523,8 +766,12 @@
+     dpct::queue_ptr main_stream
+ ) {
+     const int nparts = top_k_radix_split_groups(ctx.device, ncols, nrows);
++    // larry (patch-topk2.py): a long row's group in two stages (its blocks' maxima first) - GGML_SYCL_TOPK2=1
++    static const bool two = std::getenv("GGML_SYCL_TOPK2") && std::atoi(std::getenv("GGML_SYCL_TOPK2")) != 0;
+     if (nparts > 1) {
+         top_k_radix_split_f32_sycl(ctx, src, dst_indices, ncols, nrows, k, nparts, main_stream);
++    } else if (two && top_k2_shape_ok(ncols, k)) {
++        top_k_radix2_f32_sycl(*main_stream, ggml_sycl_info().max_work_group_sizes[ctx.device], src, dst_indices, ncols, nrows, k);
+     } else {
+         top_k_radix_f32_sycl(ctx, src, dst_indices, ncols, nrows, k, main_stream);
+     }
+diff --git a/ggml/src/ggml-sycl/topk-radix.hpp b/ggml/src/ggml-sycl/topk-radix.hpp
+--- a/ggml/src/ggml-sycl/topk-radix.hpp
++++ b/ggml/src/ggml-sycl/topk-radix.hpp
+@@ -14,6 +14,10 @@
+ 
+ // Top-k of every row of src, k indices per row into dst_indices, in no particular order.
+ // Picks between the one-group-per-row and the split-row kernel from the shape and the device.
++// larry (patch-litopk.py): the same on any queue of the context (rows of ncols >= 1; the two stages of patch-topk2.py
++// with GGML_SYCL_TOPK2 where they pay, else the one-group radix select); block_size = the device's largest work-group
++void ggml_sycl_top_k_rows(sycl::queue & q, int block_size, const float * src, int32_t * dst, int64_t ncols, int64_t nrows, int k);
++
+ void ggml_sycl_top_k_radix(
+     ggml_backend_sycl_context & ctx,
+     const float *   src,

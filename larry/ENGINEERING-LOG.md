@@ -51,6 +51,58 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-28 02:50 - 05:10: long contexts, part 2 - the 1M prompt's indexer: its top-k in two stages, its queries shared with the expert cards)
+
+**In the service since 05:06** (`bench/longctx/xinstall.sh lt` in a window, the engine before it in `build-xe/pre-lt`;
+`patches/svc-topk2.py`, `svc-lif1.py`, `svc-litopk.py`): a fresh 967K prompt **338.9 -> 308.3 s** - with part 1 the
+time to its first token **352.6 -> 308.9 s** (-12 %). Every answer the same as before: the top-k picks the same set, the
+indexer's ids are a top-k of card 0's own scores on every checked call.
+
+| a fresh 967K prompt after a 131K one (`bench/longctx/lt1m.sh`) | prompt | card 0's dense phase | waits on the expert cards |
+| --- | ---: | ---: | ---: |
+| before part 2 (the radix top-k; `r1m-ra.sh`, 10-28 01:50) | 342.7 s | 294.9 s | 31.9 s |
+| the top-k in two stages (the service since 03:12) | 338.9 s | 282.4 s | 38.9 s |
+| + the indexer's queries shared with cards 1-3, their copies bf16 | 313.2 s | 231.9 s | 65.7 s |
+| - the same, their queues at low priority | 322.3 s | 248.4 s | 58.4 s |
+| - their copies fp16, card 0 keeping 25 % | 309.5 s | 230.0 s | 62.6 s |
+| - their copies fp16, card 0 keeping 35 % (**the service**) | **308.3 s** | 235.2 s | 58.7 s |
+
+* **The top-k in two stages** (`patches/patch-topk2.py` + `topk2_kernel.inc`, `GGML_SYCL_TOPK2=1`): ggml-sycl's radix
+  select reads each query's whole score row up to five times (at 512K rows, 4.5 ms a call of 256 queries: the card's
+  read bandwidth). Now a work-group reads its row once for its blocks' largest keys (8192 blocks at most, in SLM), takes
+  the k-th largest of those - T, its exact key - and runs the radix select and its emit over the blocks whose maximum
+  reaches T only: k blocks hold a key >= T each, so the row's k-th largest key is >= T and every key at or above it lies
+  in such a block - the same set (ties at the pivot are taken in no fixed order, as before). `bench/li/topk2_test.cpp`
+  (`topk2.sh`): 1280 rows of four kinds (normals; relu-weighted sums with many exact zeros; -inf past each query's
+  visible rows, fewer visible than k too; few-level ties) at 64K-1M columns all the same; 256 rows of 512K columns
+  4.32 -> 1.67 ms (2.6x), of 1M 8.83 -> 2.94 ms (3.0x). A 512K needle's dense phase 136.3 -> 130.5 s.
+* **The fused indexer reading its BF16 keys in place** (`patches/patch-lifbf16.py`, `GGML_SYCL_LI_FUSED=2`): mode 1
+  converts the whole key table to fp16 on every call; mode 2 runs the same kernel in bf16 on the keys as stored. The
+  same bits (the values are FP4-rounded: exact in both; `GGML_SYCL_LI_FUSED_CHECK16` and `bench/li/lifbf_probe.cpp`: 0
+  scores differ) - but bf16's kernel is slower at depth: 2-4 % faster up to 64K keys, even at 128K, 3 % / 6 % slower at
+  256K / 512K (19.0 against 20.3 ms for 512 queries). In the service 03:12-04:05, then back to mode 1
+  (`svc-lif1.py`). (tsvc2's 16K needle at 1912 tok/s that hour was noise: at 8K keys mode 2 is the faster one.)
+* **The indexer and its top-k as one op, its queries shared with the expert cards** (`patches/patch-litopk.py`,
+  `patch-litopk-eng.py`; `STRATA_LI_TOPK=1`, `STRATA_LI_REMOTE=131072`, `GGML_SYCL_LI_REMOTE_SHARE=35`):
+  `ggml_lightning_indexer_topk` (LIGHTNING_INDEXER, op_params[0] = 2) gives I32 [k, n] straight from the scores - the
+  [cap, n] score tensor and its column slices are gone from the graph - for the layers that rank every visible row (2 /
+  8 / 14). For a served prompt of >= 131072 tokens the engine prepares cards 1-3 before its first batch (each a fp16 copy
+  of the three layers' keys sized for the prompt's last cap bucket, score scratch for its share of a span: 657 MiB a
+  card at 1M) and frees them after it. A call of >= 64K keys keeps 35 % of its queries on card 0; card 0 stages the
+  keys' rows the others lack and their queries in a plain buffer of its own (card 0's KV pages and ggml's pool are never
+  read by a peer), each card pulls its part, converts it to fp16, scores and ranks it on a queue of its own, and card 0
+  pulls their ids back after its own share - in queue order, no host wait.
+* **Its first build was wrong** (a test server only): every query on cards 1-3 got wrong ids from its second call on
+  (`GGML_SYCL_LI_TOPK_CHECK`: each query's ids against card 0's scores of every query - distinct, in range, a top-k of the
+  row). The cards' copy was counted as complete up to the call's cap bucket, but the bucket's later rows were not
+  written yet: the next span wrote them and nobody copied them. Now the op carries the rows already final (its last
+  query's (position + 1) / ratio) and the cards copy up to that; 14 checked calls since, 0 queries wrong.
+* **Why only -30 s of card 0's -47**: cards 1-3 also run every layer's experts for the prompt, and the indexer's share
+  now competes with those calls - the dense half waits for them 20 s longer. Their queues at low priority only moved the
+  wait (card 0 then waited for the shares instead: 322.3 s); fp16 copies (6 % less work there) and a larger share for
+  card 0 helped a little. The needles (131K, 967K) found on every run, no faults; decode at depth unchanged (68.9-70.5
+  tok/s against 69.7).
+
 ## Measured (2026-10-28 01:20 - 02:50: long contexts, part 1 - the wait before the first reply after a long prompt; where a 1M prompt's time goes)
 
 **In the service since 02:33** (`bench/longctx/xinstall.sh ra` in a window, the engine before it in `build-xe/pre-ra`;
@@ -2523,7 +2575,8 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `run.sh NAME [args]`, `tok.py enc/dec`, `xe-env.sh`, `vt.sh` | one-shot runs (logs/NAME.*), prompt <-> ids, the environment, VTune |
 | `dev-hold.sh on` | free all four cards for development without a layout (`larry-mode small` undoes it) |
 | `bench/speed/` | the standard speed table: `run_all.sh` (the service held, a DSpark and a plain private copy, the service back), `tspeed.sh NAME [VAR=..]` (one copy: warm-up, `vbench.sh` = `vllm bench serve` on MT-Bench, `speedtab.py` = llama-bench's pp512 / tg128 at depths), `patch_vllm_chat.py`, `hf/` (tokenizer + MT-Bench cache), results in `out/`; the prompt A/B: `tab_all.sh NAME:VAR=v,.. ...` (the service held, `tab.sh` a config: speedtab's `TAB_SPECS`, then the service back; `TAB_PPL=1` adds `tlppl.sh` = one-shot prompt-path logits KL via `lkl.py`), `tabsum.py` (the table), `tpg_light.sh`, `ab*.sh` (the night's A/B windows, each after the AIME client's current problem), `run_all2.sh` + `sttab.py` (the speed table again; old vs new as markdown); the afternoon A/B window `abw.sh NAME:TESTS[:VAR=v,..] ..` (waits until the service has been idle `AB_IDLE_MIN` minutes, `yieldsrv.py` answers 503 on :18080 and ends the window if a request comes; `tabx.sh` one configuration, `abx.py` prompts from empty / the edit / decode tasks, `abxsum.py` the table), `turns.py ENGINE_LOG [LINE]` (per request: prompt, decode, ms and CPU-pool experts a pass); the evening's `agentx.py` (an agent session replayed: the test "agent", `AGENT_ARGS`), `abx.py --needles N,..` (the test "needles", `AB_NEEDLES`), `AB_CTX` (the config's `--ctx`), a window step `@COMMAND` (a probe or tpg.sh run as it is); `bench/dqb/stage_ring.cpp` (pageable -> cards: the tier's stage vs rings in the L3) |
-| `bench/longctx/` | long contexts: `xbuild.sh NAME PATCH..` (an engine change built at low priority and staged in `NAMEbin`, the service's build put back), `xinstall.sh NAME` (staged -> `build-xe`, an abw step), `r1m-ra.sh` (131K + 984K needles on a staged engine with the replica check), `ra-ab.sh` (the read-ahead off / on, with vmwatch), `prof1m.sh` + `profdiff.py` (card 0's op profile over a long prompt, by depth), `tsvc2-ra.sh` (tsvc2 + concurtest after an install) |
+| `bench/li/` | the prompt indexer: `li_probe.cpp` (its kernels one by one), `topk2_test.cpp` + `topk2.sh` (the two-stage top-k against the radix select: sets and times), `lifbf_probe.cpp` + `lif_kernel.inc` + `lifbf.sh` (the fused kernel's fp16 copies against bf16 in place) |
+| `bench/longctx/` | long contexts: `xbuild.sh NAME PATCH..` (an engine change built at low priority and staged in `NAMEbin`, the service's build put back), `xinstall.sh NAME` (staged -> `build-xe`, an abw step), `r1m-ra.sh` (131K + 984K needles on a staged engine with the replica check), `ra-ab.sh` (the read-ahead off / on, with vmwatch), `prof1m.sh` + `profdiff.py` (card 0's op profile over a long prompt, by depth), `tsvc2-ra.sh` (tsvc2 + concurtest after an install), `pp-ab.sh` (one long needle a configuration), `lt1m.sh` (`r1m-ra.sh` a configuration) |
 | `bench/quality/` | AIME 2026 through the service at DeepSeek's settings (DeepInfer `eval/aime`: its prompt and rule judge, effort 100, top-p 1.0, 144K, one sample a problem): `aime.py [--deadline HH:MM] [--score]` (resumable; a `STOP` file in `out/` ends it after the current problem), `data/aime_2026.jsonl` (MathArena/aime_2026), `out/aime-1.jsonl` + `.log`, `encchk.py` / `effchk.py` (the prompt matches DeepSeek's encoder; the effort reaches the engine); `gpqa.py` + `mkgpqa.py` + `data/gpqa_diamond.jsonl` (GPQA Diamond the same way: DeepInfer's prompt and rule judge, the public mirror hendrydong/gpqa_diamond_mc; not run yet). Both clients YIELD: when the server's /metrics shows another request queued they cancel their own and stop (`fakesrv.py` tests that) |
 
 ## Knobs (environment of `ds41-xe-engine.sh`; `larry-mode restart` after a change)
@@ -2584,7 +2637,10 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_XMX` | 0 | 1: decode / verify experts on XMX (flat in tokens, slower below ~4 tokens); `STRATA_XMX_KSG` / `_KSD` / `_GRF` its K splits / register mode |
 | `GGML_SYCL_LARRY_XMXMV` | 0 | 1: XMX multi-column Q6_K mat-vecs for verify passes (no end-to-end gain measured) |
 | `GGML_SYCL_LI_GEMM_MIN` / `GGML_SYCL_LI_XMX` | 1 / 1 (service; engine 32 / 0) | the lightning indexer of decode / verify passes on XMX: li_gemm for every batch / one fused bf16 kernel for <= 8 queries (`GGML_SYCL_LI_XMX_CHECK=1` compares with li_gemm) |
-| `GGML_SYCL_LI_FUSED` (`_MIN`, `_QW`, `_KR`, `_CHECK`) | 1 (service, since 2026-10-26 07:48; engine 0) (16, -, -, 0) | the prompt indexer (batches of >= `_MIN` queries) as one fused XMX kernel - the score matrix stays in registers (16K keys 4.36 -> 0.63 ms); `_QW` / `_KR` override the work-group's queries / keys, `_CHECK=N` compares the first N calls with li_gemm |
+| `GGML_SYCL_LI_FUSED` (`_MIN`, `_QW`, `_KR`, `_CHECK`, `_CHECK16`) | 1 (service, since 2026-10-26 07:48; engine 0) (16, -, -, 0) | the prompt indexer (batches of >= `_MIN` queries) as one fused XMX kernel - the score matrix stays in registers (16K keys 4.36 -> 0.63 ms); `_QW` / `_KR` override the work-group's queries / keys, `_CHECK=N` compares the first N calls with li_gemm; 2 = the BF16 keys read in place (the same bits; 6 % slower at 512K keys: not used) |
+| `GGML_SYCL_TOPK2` | 1 (service since 2026-10-28 03:12; engine 0) | ggml-sycl's top-k of long rows (>= 32K columns, >= 4k blocks) in two stages: the blocks' maxima, then the radix select over the blocks that reach the k-th of them - the same set, 2.6x at 512K columns |
+| `STRATA_LI_TOPK` (`GGML_SYCL_LI_TOPK_MIB` 512, `_CHECK` 0, `_CHECK_KEYS` 131072) | 1 (service since 2026-10-28 05:06; engine 0) | the indexer of every layer that ranks all visible rows (2 / 8 / 14) as one op with its top-k (`ggml_lightning_indexer_topk`: no [cap, n] scores in the graph); `_CHECK=N` checks N calls' ids against card 0's scores |
+| `STRATA_LI_REMOTE` (`GGML_SYCL_LI_REMOTE_SHARE` 25 engine / 35 service, `_MIN_KEYS` 65536, `_PRIO` 0) | 131072 (service; engine 0 = off) | a prompt of >= this many tokens hands that op's queries to cards 1-3 (card 0 keeps `_SHARE` % of each call of >= `_MIN_KEYS` keys; their fp16 key copies, 657 MiB a card at 1M, freed after the prompt); `_PRIO=1`: their queues at low priority (measured worse) |
 | `STRATA_LI_NVIS` | 1 (service, since 2026-10-26 07:48; engine 0) | the prompt path's indexer takes each query's visible row count (`ggml_lightning_indexer_nvis`) instead of a [cap, n] 0 / -inf mask built per call; ggml-sycl only |
 | `STRATA_OPROJ_A` | 1 (service, since 2026-10-26 10:23; engine 0) | the prompt path's wo_a as one op (`ggml_dsv41_oproj_a`): its 8 slices in one oneMKL gemm_batch written in wo_b's input layout (768 us + a 162 us copy -> 520 us a 512-column span) |
 | `STRATA_HC_NORM_MV_WIDE` / `GGML_SYCL_NORM_MV_WIDE` | 1 (service, since 2026-10-26 10:23; engine 0) / 1 | the prompt path's hc mixes through `ggml_dsv41_norm_mv` / ggml-sycl's wide kernel for it (> 8 tokens; 0 = the per-row one) |
@@ -2635,7 +2691,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_TP_EVICT` (`_KEEP_GIB` 0.25, `_MEM_GIB` 4, `_PAR` 1, `_ROUND` 1), `STRATA_XE_TP_DEFER_FLEX_GIB` 0.8 | 1 (service; engine 0) | the TP cards' future KV room beyond 0.8 GiB holds experts (each card's last slabs) until a long context needs it; then the slabs it takes go back (their experts read from the model file into host memory - ahead, below), the cards side by side (`_PAR`), the driver waited for once a round of slabs (`_ROUND`) |
 | `STRATA_TP_AHEAD_S` | 30 | serve: once a long prompt's batches left look shorter than this, the evictions its KV replicas will need are read ahead (0 = off) |
 | `STRATA_XE_TP_AHEAD` (`_READERS` 2, `_CPUS`, `_MEM_GIB` 8, `_WAIT_S` 60) | 1 | the tier's side of it: the slabs' experts read on a helper thread by `_READERS` threads (on `_CPUS`, else the process's CPUs) while `_MEM_GIB` of MemAvailable stays over; an eviction waits for a read at most `_WAIT_S` |
-| `STRATA_LI_CHUNK_MIB` | 512 | the prompt indexer's [cap, n] tensors in column slices of at most this many MiB (1M context: ~9 GiB a span otherwise) |
+| `STRATA_LI_CHUNK_MIB` | 512 | the prompt indexer's [cap, n] tensors in column slices of at most this many MiB (1M context: ~9 GiB a span otherwise) (not with `STRATA_LI_TOPK`: the op slices its own scratch) |
 | `STRATA_SERVE_PARK_MAX` | 262144 (service; engine 65536) | positions a parked conversation may save |
 | `STRATA_SERVE_PARK_SLOTS` | 2 | conversations kept beside the live one (1 = the old single park) |
 | `STRATA_XE_PIN_SKIP_GIB` | 0 | the first GiB of the ranked arena stay pageable (18 measured worse) |
@@ -2726,6 +2782,13 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-28 05:10: done - long contexts, part 2: a fresh 967K prompt 338.9 -> 308.3 s (its top-k in two stages; the
+  indexer of layers 2 / 8 / 14 as one op whose queries the expert cards share), the first token after it 352.6 -> 308.9 s
+  with part 1. Next on long prompts: the expert cards now bound part of it (their expert calls and the indexer's share
+  compete: the dense half waits 20 s longer) - the indexer's work made cheaper there (int8 dot products of the FP4
+  values: a ~2x ceiling, less a rescale every 32 values), or card 0's own constant part (weight GEMMs ~51 s, attention ~42 s,
+  key gather ~31 s of the 967K prompt - optimization #3's).
 
 - 2026-10-28 02:50: done - long contexts, part 1: the first reply after a long prompt (131K 2.2 -> 0.35 s, 967K 8.1 ->
   0.7 s: the expert cards' evictions read ahead and side by side, the replica rows copied once). Next, part 2: the 1M

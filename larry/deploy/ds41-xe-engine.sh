@@ -62,7 +62,16 @@ export GGML_SYCL_LI_XMX="${GGML_SYCL_LI_XMX:-1}"
 # 64K 17.4 -> 2.33 ms (bench/li/li_probe); and told each query's visible rows instead of a [cap, n] 0 / -inf mask
 # (its repeat / add / step / log / F16 copy, ~0.9 ms a call) - abwT112: fresh 16K 7.00 -> 6.76 s, 31K 12.34 -> 11.31 s,
 # the agent replay's follow-ups 42.6 -> 39.9 s
-export GGML_SYCL_LI_FUSED="${GGML_SYCL_LI_FUSED:-1}"
+export GGML_SYCL_LI_FUSED="${GGML_SYCL_LI_FUSED:-1}"   # (2, the BF16 keys in place: 6 % slower at 512K keys - svc-lif1.py)
+# the prompt indexer keeps each query's 512 best rows in two stages: its blocks' maxima, then the radix select over the
+# blocks that reach the 512th of those (patch-topk2.py: the same set, 2.6x at 512K rows)
+export GGML_SYCL_TOPK2="${GGML_SYCL_TOPK2-1}"
+# the indexer of every layer that ranks all visible rows (2 / 8 / 14) as one op with its top-k (patch-litopk.py); a
+# prompt of >= 131072 tokens hands 65 % of each call's queries to the expert cards (their fp16 key copies, 657 MiB a
+# card at 1M, freed after the prompt): the 967K prompt 338.9 -> 308.3 s
+export STRATA_LI_TOPK="${STRATA_LI_TOPK-1}"
+export STRATA_LI_REMOTE="${STRATA_LI_REMOTE-131072}"
+export GGML_SYCL_LI_REMOTE_SHARE="${GGML_SYCL_LI_REMOTE_SHARE-35}"
 export STRATA_LI_NVIS="${STRATA_LI_NVIS:-1}"
 # card 0's 512-column prompt span: wo_a's 8 slices as one product written in wo_b's layout (768 us + a 162 us copy ->
 # 520 us) and the hc mixes' rms_norm copy + [24 x 20480] GEMM as one pass over the state (2 x 323 -> 2 x 153 us)

@@ -1116,6 +1116,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 static const int64_t li_chunk = (std::getenv("STRATA_LI_CHUNK_MIB") ? std::atoll(std::getenv("STRATA_LI_CHUNK_MIB")) : 512) << 20;
                 int64_t ncol = n;
                 if (li_chunk > 0 && cap * n * 4 > li_chunk) ncol = std::min<int64_t>(n, std::max<int64_t>(16, (li_chunk / (cap * 4)) & ~(int64_t) 15));
+                // larry, STRATA_LI_TOPK (patch-litopk.py, default 0; with STRATA_LI_NVIS): a source that ranks every visible row
+                // (not the candidate layer, not the candidates' users) takes its ids from ggml_lightning_indexer_topk - the
+                // scores and their top-k in one op that never holds [cap, n] scores in the graph (and can hand a share of its
+                // queries to the expert cards: ggml_backend_sycl_li_remote) - one call a span
+                static const bool li_topk_on = env_on("STRATA_LI_TOPK", false) && env_on("STRATA_LI_NVIS", false);
+                const bool topk_op = li_topk_on && im.sycl && !L.uses_cand && !L.cand_src && idxk->type == GGML_TYPE_BF16 &&
+                                     idxk->nb[1] == 256 && cap % 32 == 0 && im.ID == 128 && im.IH == 32;
+                if (topk_op) ncol = n;
                 std::vector<ggml_tensor *> sel_parts, selm_parts;
                 for (int64_t q0 = 0; q0 < n; q0 += ncol) {
                     const int64_t nq = std::min<int64_t>(ncol, n - q0);
@@ -1128,6 +1136,10 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     // mask (repeat + add + step + log + F16 copy a call), the selected rows' mask from their ids below
                     static const bool li_nvis = env_on("STRATA_LI_NVIS", false);
                     ggml_tensor * vis = nullptr, * sc = nullptr;
+                    if (topk_op) {   // (patch-litopk.py) the ids straight from the scores
+                        // (the rows its last query sees are written by now: (position + 1) / ratio of it)
+                        sel = ggml_lightning_indexer_topk(gc, iqs, ksrc, iws, nvs, (int) K, (int) (((int64_t) im.pos0 + qc0 + nq) / r));
+                    } else {
                     if (li_nvis && im.sycl) {
                         sc = ggml_lightning_indexer_nvis(gc, iqs, ksrc, iws, nvs);   // [cap, nq], -inf past nvis
                     } else {
@@ -1156,6 +1168,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                         outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, nq, im.cand->nb[1], (size_t) qc0 * im.cand->nb[1])));
                     }
                     sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, nq]
+                    }   // (patch-litopk.py)
                 // Canonicalise the top-k order.  ggml_cuda_op_top_k asks CUB's DeviceTopK for
                 // output_ordering::unsorted, and CUB hands the k ids back in an order its atomically assigned
                 // output slots produce - run-to-run unstable, while the SET is stable (measured: order-only on
