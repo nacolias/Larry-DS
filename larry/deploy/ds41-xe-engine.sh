@@ -70,7 +70,9 @@ export GGML_SYCL_TOPK2="${GGML_SYCL_TOPK2-1}"
 # prompt of >= 131072 tokens hands 65 % of each call's queries to the expert cards (their fp16 key copies, 657 MiB a
 # card at 1M, freed after the prompt): the 967K prompt 338.9 -> 308.3 s
 export STRATA_LI_TOPK="${STRATA_LI_TOPK-1}"
-export STRATA_LI_REMOTE="${STRATA_LI_REMOTE-131072}"
+# (svc-fsa.py: 131072 -> 0 - with the fused attention card 0 is faster and the expert cards' share slowed their calls;
+# 984K 307.7 s alone against 339 s sharing)
+export STRATA_LI_REMOTE="${STRATA_LI_REMOTE-0}"
 export GGML_SYCL_LI_REMOTE_SHARE="${GGML_SYCL_LI_REMOTE_SHARE-35}"
 export STRATA_LI_NVIS="${STRATA_LI_NVIS:-1}"
 # card 0's 512-column prompt span: wo_a's 8 slices as one product written in wo_b's layout (768 us + a 162 us copy ->
@@ -257,4 +259,8 @@ export STRATA_XE_ZCOPY="${STRATA_XE_ZCOPY-1}"
 # the prompt attention of layers 0-19 (128 or 640 keys a query) as one oneDNN graph SDPA a 512-query span: keys 576 wide
 # with an extra sink key (2026-10-25 abwT54; partial spans and layers 20-39 keep the oneMKL path)
 export STRATA_ATTN_SDPA="${STRATA_ATTN_SDPA-1}"
+# the prompt attention as one kernel reading each query's keys where they lie (patch-fsa.py; with STRATA_SDPA_O16):
+# 2.37 -> 1.44 ms a 512-column span at 30K; and the expert cards' X in fp16 by peer loads (card 0 waits on them now)
+export STRATA_ATTN_FSA="${STRATA_ATTN_FSA-1}"
+export STRATA_XE_FN16="${STRATA_XE_FN16-2}"
 exec "$XE_BIN/ds41_generate_xe" "${ARGS[@]}"

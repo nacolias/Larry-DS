@@ -1235,12 +1235,20 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     static const bool attn_sdpa = env_on("STRATA_ATTN_SDPA", false);
     static const int sdpa_dp = std::getenv("STRATA_ATTN_SDPA_DP") ? std::atoi(std::getenv("STRATA_ATTN_SDPA_DP")) : 576;
     if (attn_sdpa && sycl_mqa && DH == 512 && (M == SWA || (Kc && M == SWA + 512))) {
-        ggml_tensor * kp = ggml_dsv41_kgather_pad(gc, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, (int) SWA, sdpa_dp);
         // larry, STRATA_SDPA_O16 (patch-sdpao16.py, default 0): the output in fp16 when wo_a takes it as one op (STRATA_OPROJ_A)
         static const bool sdpa_o16 = env_on("STRATA_SDPA_O16", false) && env_on("STRATA_OPROJ_A", false);
         const bool o16 = sdpa_o16 && im.sycl && n > 8 && im.BL(il, "attn_output_a.weight")->type == GGML_TYPE_Q6_K;
+        // larry, STRATA_ATTN_FSA (patch-fsa.py, default 0; with the fp16 output): one kernel that reads each query's window
+        // rows and selected compressed rows where they lie - no [n, 656, 576] gathered copy, no Q' / mask / output kernels
+        static const bool attn_fsa = env_on("STRATA_ATTN_FSA", false);
+        if (attn_fsa && o16 && SWA == 128 && NH == 64 && (!Kc || kg_comp->type == GGML_TYPE_BF16) && ggml_is_contiguous(Mall)) {
+            o = ggml_dsv41_attn_fsa(gc, q, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, Mall,
+                                    im.BL(il, "attn_sinks.weight"), 1.0f / std::sqrt((float) DH), (int) SWA);   // F16 [DH, NH, n]
+        } else {
+        ggml_tensor * kp = ggml_dsv41_kgather_pad(gc, wsrc, widx_v, Kc ? kg_comp : nullptr, Kc ? kg_sel : nullptr, (int) SWA, sdpa_dp);
         o = (o16 ? ggml_dsv41_attn_sdpa_o16 : ggml_dsv41_attn_sdpa)(gc, q, kp, Mall, im.BL(il, "attn_sinks.weight"),
                                                                    1.0f / std::sqrt((float) DH));   // [DH, NH, n]
+        }   // (patch-fsa.py)
         o = b.rope(o, pos, r, true, rope_ip && im.sycl);                                       // de-RoPE the output
     } else {
     if (!im.cpu && !sycl_mqa && !sycl_dec && M % 256) {

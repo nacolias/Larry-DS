@@ -51,6 +51,82 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-28 15:00 - 18:20: big prompts, part 1 - the prompt attention as one kernel that reads each query's keys where they lie; the expert cards' X in fp16 again)
+
+**In the service since 17:59** (`bench/longctx/xinstall.sh fsa` in a window, the engine before it in `build-xe/pre-fsa`;
+`patches/svc-fsa.py`, backup `ds41-xe-engine.sh.pre-fsa-20261028`): `STRATA_ATTN_FSA=1` (`patches/patch-fsa.py` +
+`fsa_kernel.inc`), `STRATA_XE_FN16=2` again, `STRATA_LI_REMOTE` 131072 -> 0. Fresh prompts through a server (second
+runs; the 984K needle after a 131K one, `bench/longctx/lt1m.sh`):
+
+| fresh prompt | before (abwT157 fsa0) | + the fused attention (fsa1) | + the expert cards' X in fp16 (abwT158 fn2) |
+| --- | ---: | ---: | ---: |
+| 16K | 6.48 s | 6.28 s | **6.15 s** |
+| 31K | 10.72 / 11.23 s | 10.15 / 10.77 s | **9.96 / 10.35 s** |
+| 64K | 21.35 / 21.25 s | 20.09 / 20.27 s | **19.61 / 19.74 s** |
+| 131K needle (abwT159 r0: 39.3 s) | 45.44 s | 43.96 s | - |
+| 984K needle (the indexer on card 0 alone, abwT160) | 308.3 s (10-28 05:06) | 339.4 s (sharing as before) | **300.9 s** |
+
+* **Where a big prompt's time went** (abwT146: `STRATA_GPU_PTL` + `STRATA_XE_CALL_TL` over fresh 16K / 31K / 64K
+  prompts and a 131K needle, then `opprof-shapes.sh` on p30k): in layers 0-19 card 0's 512-column span took 5.6-5.9 ms
+  (~180 ms a layer of a 16K batch) and the expert cards' two calls ~174 ms - still balanced. Of card 0's span the
+  attention took 2.44 ms: DSV41_KGATHER 0.78 ms (each query's 656 key rows written, 387 MB), oneDNN's SDPA 1.10, its
+  Q' / mask kernels 0.23, the op's output copy 0.33. An expert card's 8K-token call: X read 17.7 ms (168 MB f32 over
+  card 0's link), GEMMs + gather 43-69 ms (~1.15 TFLOP: ~23 TFLOPS, xe_dqgemm alone ~47), the push 8-11 ms (fp16
+  already, `STRATA_XE_COMBINE=2`).
+* **No shared key set per block of queries** (abwT147: `patches/patch-dumpsel.py`, `STRATA_DUMP_SEL=1`, dumps every
+  batch's selected rows; `bench/fa/selunion.py`): consecutive queries share about half of their 512 compressed rows -
+  the union of Bq consecutive queries' selections is 1.2-1.5x of 512 at Bq 2, 1.5-2.2x at 4, 2.0-3.2x at 8, 2.6-4.7x at
+  16 (code, 16-31K; prose - this log, 94K tokens - more: 3.9-4.7x at 16). An attention over each block's union (oneDNN's
+  SDPA with q length Bq, `bench/fa/test_sdpa_blk.cpp`) would multiply the work; a kernel has to read each query's own
+  rows.
+* **The B70's operand paths for such a kernel** (`bench/fa/mqa_mb.cpp`, abwT148 / T149: a sub-group's 2 x 2
+  accumulators, fp16): from local memory B col_major / row_major `joint_matrix_load` 13 / 27 TFLOPS (IGC gathers), a
+  VNNI-packed copy 85, B by hand (a lane's 32 B of its row + get_wi_data) 78, A row_major 66; from global memory (2D
+  block loads) B col_major 62, B row_major with the VNNI transform 73, A 73, both 51. Local reads ~3.7 TB/s; L2 24 MB.
+* **The fused attention** (`patches/fsa_kernel.inc`; `bench/fa/test_fsa.cpp` against the service path - KGATHER + Q' +
+  mask + oneDNN SDPA + the output copy - on the same inputs, and a double reference): a small kernel first writes the
+  span's window rows in fp16 by position, so query t's 128 window keys are rows t .. t + 127 of it, read in place; then
+  64 persistent work-groups (16 sub-groups, GRF 256), a query at a time: its Q to fp16 into the group's 192 KB slot of a
+  scratch (reused query after query: it stays in L2), its keys in chunks of 128 - the window in place, its 512
+  compressed rows converted into the slot - each chunk QK^T (2 x 2 accumulators a sub-group over the 512 dims; Q and
+  K^T by 2D block loads), the chunk's max a head through local memory, P = exp(s - m) in fp16, PV into the query's O
+  held in registers (4 x 4 accumulators a sub-group; V by VNNI-transforming block loads), and O / (l + exp(sink - m)).
+  Five versions: v1 6.4 ms - IGC compiles a per-lane `vec<half, 8>` store as eight 2-byte scattered stores (the shader
+  dump, `IGC_ShaderDumpEnable=1`), 256 such messages a chunk; v2 2.93 (sub-group block stores; both loops double-
+  buffered by hand - IGC does not software-pipeline a load -> dpas loop); v3 2.58 (the window in place); v4 2.38 (block
+  reads, the next chunk's rows prefetched to L1 - but 177 registers spilled); **v5 1.44** (Q's conversion by block IO too
+  - its half stores were ~4000 messages a query - two rows in flight, P single-buffered: no spills). Against the service
+  path: 30K **2.37 -> 1.44 ms** a 512-column span, early positions 2.03 -> 1.14-1.19, 130K with random rows (no L2
+  reuse) 2.64 -> 1.84; rms error against the reference 5.07e-5 (the service path 5.19e-5). (v6, the softmax's reductions
+  by transpose-reduce: 3.7 ms - not kept.)
+* **In the engine** (`ggml_dsv41_attn_fsa`: a GGML_OP_DSV41_ATTN_SDPA node of form 2; with `STRATA_SDPA_O16`): card 0's
+  dense phase of a 31K prompt 7.35 -> 5.79 s, 64K 14.6 -> 12.5 s, but the prompts only -3..-6 %: card 0 now waits on the
+  expert cards (+0.5-0.9 s). The graph also drops the 387 MB gathered tensor. Numerics (`tlppl-ab.sh`, abwT157): p8k KL
+  mean 2.92e-3 against a run-to-run floor of 2.35e-3 (p99 4.26e-2 / 3.49e-2, max 0.33 / 0.50, top-1 98.77 / 98.84 %) -
+  oneDNN's SDPA in its day was 2.8e-3 against 1.9e-3; p30k PPL 1.7822 / 1.7777.
+* **The expert cards' X in fp16 again** (`STRATA_XE_FN16=2`: card 0 converts the call's X once, the expert cards read
+  it by peer loads; abwT158, all with the fused attention): 16K 6.37 -> 6.15 s, 31K 10.38 / 10.76 -> 9.96 / 10.35, 64K
+  20.12 / 20.27 -> 19.61 / 19.74 (`=1`, the copy engine: between). It lost before (10-25, 10-26) while card 0 bounded.
+  Numerics of both (abwT160): p8k KL 2.76e-3 against 2.62e-3 (top-1 98.86 / 98.91 %), p30k PPL 1.7809 / 1.7811.
+* **The long prompts' indexer back on card 0** (`STRATA_LI_REMOTE=0`): with the fused attention the 984K needle got
+  slower while sharing - 339.4 s at card 0's 35 % (card 0's dense phase 235.2 -> 206.7 s, its waits on the expert cards
+  58.7 -> 110.9 s: the share's kernels slow the cards' expert calls), 357.0 s at 50 %, 306.5 / 308.4 s at 65 %, 307.7 s
+  without it, 300.9 s without it and with FN16=2. 131K: 39.3-40.7 s (a fresh engine's first big prompt once 46.7).
+* **Open: one engine went silent after its 984K batch** (abwT159 s65: the fused attention, the indexer shared with card
+  0 keeping 65 %): the batch finished (306.5 s), the engine log ends after "prompt phases" (DSpark tail 0), the client's
+  request failed with the server closing the connection; no GPU fault, no OOM; that server's log was overwritten
+  (`lt1m.sh` keeps them now). The same config again (abwT160 s65b) passed (308.4 s, its turn 8.7 s). The service runs
+  without the share.
+* **Taller expert GEMM tiles** (`bench/dqb/dqmt.sh`: xe_dqgemm with 160 / 192 token rows a tile, abwT158): +10-25 % for
+  experts of 144-160 tokens (PTQ1_0 38.4 -> 49.0 TFLOPS at 160), slower at <= 128 and >= 192 - a per-expert choice would
+  buy ~2 ms a call; `patches/patch-dqmt.py` written, not applied.
+* tsvc2 on the service (`logs/tsvc2-fsa.log`): every needle found (8K 1390 / 1835, 16K 2541, **31K 3323** tok/s - part
+  2's 3108), decode 84.3 / 104.9 tok/s, essay 79.6 / 76.2, the tool call, the picture and its follow-up right, hidden
+  RAM 34 GiB at most; concurtest PASS.
+
+Next for big prompts: the expert cards bound 16K-131K now - inside a call their GEMMs run at about half of xe_dqgemm's
+own speed (to trace: `bench/speed/utdrive.py` + `utcall.py` on an expert card); at 1M card 0 bounds (the indexer).
+
 ## Measured (2026-10-28 02:50 - 05:10: long contexts, part 2 - the 1M prompt's indexer: its top-k in two stages, its queries shared with the expert cards)
 
 **In the service since 05:06** (`bench/longctx/xinstall.sh lt` in a window, the engine before it in `build-xe/pre-lt`;
@@ -2640,7 +2716,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `GGML_SYCL_LI_FUSED` (`_MIN`, `_QW`, `_KR`, `_CHECK`, `_CHECK16`) | 1 (service, since 2026-10-26 07:48; engine 0) (16, -, -, 0) | the prompt indexer (batches of >= `_MIN` queries) as one fused XMX kernel - the score matrix stays in registers (16K keys 4.36 -> 0.63 ms); `_QW` / `_KR` override the work-group's queries / keys, `_CHECK=N` compares the first N calls with li_gemm; 2 = the BF16 keys read in place (the same bits; 6 % slower at 512K keys: not used) |
 | `GGML_SYCL_TOPK2` | 1 (service since 2026-10-28 03:12; engine 0) | ggml-sycl's top-k of long rows (>= 32K columns, >= 4k blocks) in two stages: the blocks' maxima, then the radix select over the blocks that reach the k-th of them - the same set, 2.6x at 512K columns |
 | `STRATA_LI_TOPK` (`GGML_SYCL_LI_TOPK_MIB` 512, `_CHECK` 0, `_CHECK_KEYS` 131072) | 1 (service since 2026-10-28 05:06; engine 0) | the indexer of every layer that ranks all visible rows (2 / 8 / 14) as one op with its top-k (`ggml_lightning_indexer_topk`: no [cap, n] scores in the graph); `_CHECK=N` checks N calls' ids against card 0's scores |
-| `STRATA_LI_REMOTE` (`GGML_SYCL_LI_REMOTE_SHARE` 25 engine / 35 service, `_MIN_KEYS` 65536, `_PRIO` 0) | 131072 (service; engine 0 = off) | a prompt of >= this many tokens hands that op's queries to cards 1-3 (card 0 keeps `_SHARE` % of each call of >= `_MIN_KEYS` keys; their fp16 key copies, 657 MiB a card at 1M, freed after the prompt); `_PRIO=1`: their queues at low priority (measured worse) |
+| `STRATA_LI_REMOTE` (`GGML_SYCL_LI_REMOTE_SHARE` 25 engine / 35 service, `_MIN_KEYS` 65536, `_PRIO` 0) | 0 (service since 10-28 17:59, was 131072; engine 0 = off) | a prompt of >= this many tokens hands that op's queries to cards 1-3 (card 0 keeps `_SHARE` % of each call of >= `_MIN_KEYS` keys; their fp16 key copies, 657 MiB a card at 1M, freed after the prompt); `_PRIO=1`: their queues at low priority (measured worse) |
 | `STRATA_LI_NVIS` | 1 (service, since 2026-10-26 07:48; engine 0) | the prompt path's indexer takes each query's visible row count (`ggml_lightning_indexer_nvis`) instead of a [cap, n] 0 / -inf mask built per call; ggml-sycl only |
 | `STRATA_OPROJ_A` | 1 (service, since 2026-10-26 10:23; engine 0) | the prompt path's wo_a as one op (`ggml_dsv41_oproj_a`): its 8 slices in one oneMKL gemm_batch written in wo_b's input layout (768 us + a 162 us copy -> 520 us a 512-column span) |
 | `STRATA_HC_NORM_MV_WIDE` / `GGML_SYCL_NORM_MV_WIDE` | 1 (service, since 2026-10-26 10:23; engine 0) / 1 | the prompt path's hc mixes through `ggml_dsv41_norm_mv` / ggml-sycl's wide kernel for it (> 8 tokens; 0 = the per-row one) |
@@ -2652,6 +2728,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_DSPARK_CUM` | 0.5 (service, since 2026-10-26 17:30; engine 0 = off) | DSpark: the verify window also stops where the product of the drafts' confidences so far drops below this (besides `STRATA_DSPARK_CONF`'s floor on each; Project Maya's rule): 102.7 -> 106.2 tok/s on the decode tasks (abwT137) |
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
+| `STRATA_XE_FN16` (`_MIN` 0) | 2 (service since 10-28 17:59; engine 0) | prompt calls: the call's X converted to fp16 once on the dense card; 1: the expert cards copy it (copy engine), 2: they read it by peer loads - half the bytes over the dense card's link |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |
 | `STRATA_XE_PREFETCH_DEPTH` | 5000 (service; engine 0) | prompt: a batch that ends before this context position takes no prefetch (its arena experts stream on demand, light ones on the CPU pool; the promotion cache stays) |
 | `STRATA_XE_DENSE_LITE` (`_MIN` 0) | 1 (service; engine 0) | pipelined prompt calls: the dense card reads X in place, queues its part without host waits, and (in calls of >= _MIN tokens) takes no streamed experts |
@@ -2682,6 +2759,8 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_LT_QUANT_THREADS` | 0 | the CPU-light activations quantised on N helper threads (no gain measured) |
 | `STRATA_STALL_PERF` | 0 | diagnostic: a stalled batch head's thread perf-sampled into logs/stall.PID.N.perf |
 | `STRATA_ATTN_SDPA` | 1 (service; engine 0) | the prompt attention of a full 512-query span (layers 0-19: 128 / 640 keys) as one oneDNN graph SDPA, the sink as an extra key; `STRATA_ATTN_SDPA_DP` the key width (576) |
+| `STRATA_ATTN_FSA` (`GGML_SYCL_FSA_SLOTS` 64) | 1 (service; engine 0) | with `STRATA_ATTN_SDPA` and `STRATA_SDPA_O16`: those spans' attention as one kernel that reads each query's window rows (an fp16 copy of the span's window by position) and selected compressed rows where they lie - no gathered [n, 656, 576] copy (patch-fsa.py); `_SLOTS` the persistent work-groups |
+| `STRATA_DUMP_SEL` | unset | debug (patch-dumpsel.py, not in the engine): every prompt batch's index-source selections appended to logs/dump_sel.PID.bin |
 | `STRATA_XE_HOT_PROF` | 0 | diagnostic: where the staging rings' time goes (slot waits, copies, lock, submits), printed at a prefetch's end |
 | `GGML_SYCL_HC_POST_V2` | 1 (service; engine 0) | hc_post one work-item per (dim, token) for all hc outputs (same sums) |
 | `STRATA_ROPE_INPLACE` | 1 (service; engine 0) | prompt path: q's RoPE and the attention output's de-RoPE in place (ggml-sycl then rotates only the 64 rope dims) |
