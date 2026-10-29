@@ -31,6 +31,8 @@ Pictures (since 2026-10-26): OpenAI `image_url` parts and Anthropic image blocks
 Two requests at once (since 2026-10-27 19:04, `"parallel": 2`): since 20:47 their decode shares the passes - two long
 answers at ~48 tok/s each, 92 in total since 23:08 (one alone ~71-85); a third waits for a free slot.
 Sampling defaults: temperature 1.0, top-p 0.95. Context: 1,048,576 tokens (since 2026-10-24 20:35; see below).
+Thinking that starts repeating itself is closed early and answered (since 2026-10-29 17:52: the server's loop detector,
+`"reasoning_loop_recovery": "wrap"` in `larry-ds41.json`), not run into the thinking budget.
 
 ## Model provenance (verified 2026-10-26)
 
@@ -50,6 +52,60 @@ deepseek-ai/DeepSeek-V4.1-Flash-1017 with no fine-tune and no abliteration. The 
 So the weights are DeepSeek's official 1017 release; the metadata strings are mislabeled. dealignai's repo is an
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
+
+## Measured (2026-10-29 05:39 - 18:00: the morning's thinking loops - the build cleared at depth, a loop guard; where decode at depth goes)
+
+**In the service since 17:52** (`bench/loop/launch-lw2.sh`'s window; `patches/patch-loopwrap.py` + `patches/svc-loopwrap.py`,
+backup `larry-ds41.json.pre-loopwrap-20261029`): `"reasoning_loop_recovery": "wrap"` - thinking that repeats whole
+passages is closed the way the thinking budget closes it, and the model answers.
+
+* **What happened** (the engine log's `serve:` lines; no text was read): an agent session 04:12-06:09, 165 requests, the
+  engine busy 51 min. Between 05:39 and 05:59 nine replies looped: each wrote ~24,600 tokens of near-verbatim repetition
+  (21,000 of 21,050 lookup drafts accepted, 6.95 tokens a pass, ~205 tok/s) for ~2 min, until the 24,576-token thinking
+  budget (max_tokens 32,768) closed the thinking; the next pass then read those 24,600 tokens again (8-9 s). The loop's
+  text stayed in the conversation and the next turns looped too: 56K -> 155K in four loops, and again after the context
+  had shrunk to ~100K and ~75K. 19.5 of the 51 minutes (38 %); the journal has no earlier budget wrap-up since Oct 19.
+  The rest: replies 25.3 min (49 %; 84.7 tok/s at 40-155K), follow-up prompts of <= 3K new tokens 2.9 min (6 %), larger
+  prompts 3.5 min.
+* **Not the build** (`bench/loop/ltkl.sh`: the service's engine over its line protocol, fresh 96K and 150K prompts of
+  code, the last 2,048 rows' logits dumped with `STRATA_SERVE_DUMP_TAIL`, 192 tokens greedy with `STRATA_TP_SYNC_CHECK=1`;
+  `tailkl.py`): the engine as it runs, the same with the 10-28 changes off (`STRATA_ATTN_FSA`, `STRATA_XE_FN16`,
+  `STRATA_XE_DQ2`, `STRATA_LI_TOPK`, `GGML_SYCL_TOPK2`, `STRATA_TP_AHEAD_S`), and as it runs again:
+
+| fresh prompt | PPL now / again / changes off | KL now vs again (the floor) | KL now vs changes off | top-1 agreement |
+| --- | --- | --- | --- | --- |
+| 96K | 1.2318 / 1.2334 / 1.2317 | 2.51e-3 | 2.60e-3 | 99.07 / 99.51 % |
+| 150K | 1.8950 / 1.8919 / 1.8996 | 6.41e-3 | 6.78e-3 | 98.19 / 98.14 % |
+
+  Every TP replica check (216 regions after each prompt) found 0 rows that differ. The speculative accept is exact
+  (`spec_accept`: a draft is kept with its probability, else the token is resampled without it), so the lookup drafts do
+  not favor loops either: the loops are the model's own, fed by their text staying in the conversation.
+* **The guard.** Strata's server had a loop detector (#728 / #1753; every 512 tokens: the share of the last 2,000 words
+  inside 12-word passages seen three times >= 0.25, or a 2,048-character tail with a period of <= 64), off by default,
+  and its two modes do not suit an agent at depth: "recover" reads the whole prompt again with the low-effort system
+  sentence (~30 s at 100K, and the next turn reads the original again), "stop" ends the reply with no answer. "wrap"
+  closes the thinking there with the budget's wrap-up, the same prompt and sampler (the engine keeps its prefix): a loop
+  costs a few thousand tokens instead of ~24,600, and far less of it stays in the conversation. Tests:
+  `serve/test_reasoning_loop_recovery.py` 22 (4 new: a passage loop, a one-word loop, novel reasoning left alone, batch
+  slots), `serve/test_server.py`. Through the service (`bench/loop/loopprobe.py`: a request whose thinking is asked to
+  write one line 300 times before it answers 17 x 23): the line 51 times, the guard at 4,608 tokens (coverage 0.296),
+  then the wrap-up and "391".
+* tsvc2 on the service (`logs/tsvc2-lw2.log`): every needle found (8K 1529 / 1912, 16K 2616, 31K 3380 tok/s), decode
+  101.6 / 101.3 tok/s, essay 81.3 / 79.4, the tool call, the picture and its follow-up right, hidden RAM 34 GiB at most;
+  concurtest PASS.
+* **Where decode at depth goes** - the next item. The session's 97 replies of >= 200 tokens: 84.7 tok/s, 2.60 tokens and
+  30.7 ms a pass, **15.4 CPU-pool experts a pass** (the essay bench: 5.8). A least-squares fit over them: ms a pass =
+  17.4 + 0.50 x CPU experts a pass + 2.1 x tokens a pass - a CPU-pool expert is ~0.5 ms on the critical path, 7.7 of the
+  30.7 ms. `bench/loop/agentd.py` (a deep agent session replayed: thinking on, temperature 1, a 64K first prompt, 24
+  turns of the session's sizes) on a private server with `STRATA_XE_CPU_LOG` (`deeprun.sh dd1`): 107 tok/s, 3.32
+  tokens and 31.0 ms a pass, 11.9 CPU-pool experts a pass (the short turns read as 7-row passes: 40 a pass, 45 ms);
+  2,625 distinct experts outside the fixed placement, 4.9 uses each, 58 % of the CPU uses last used 17+ passes before;
+  the promotion cache (380 slots) promoted and evicted ~6.5 a pass. Replayed (`bench/loop/pcsim2.py`) the cache's size
+  is the lever: 380 slots 10.9 CPU experts a pass (the run 11.9), 600 6.9, 800 5.8, 1,000 5.2; a perfect-hindsight
+  policy at 380 5.7. (A bigger cache that takes its room from the static experts did not pay on Oct 24.) The session's
+  cards also gave ~665 static experts to the TP core's KV rows (seven 1 GiB slabs as the two slots grew to 262K-row
+  buckets, 0.3-1.0 s each), and they do not come back when the conversations get shorter. A prompt that takes the
+  prefetch (>= 2,048-3,072 new tokens) drops the whole promotion cache; smaller turns keep it.
 
 ## Measured (2026-10-28 18:20 - 19:10: big prompts, part 2 - the expert GEMMs, v2)
 
@@ -2895,6 +2951,12 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-29 18:00: done - the morning's thinking loops (nine of ~24,600 tokens, 38 % of an agent session's engine
+  time) checked against the build (the 10-28 changes give the same logits at 96K / 150K within the run-to-run floor) and
+  guarded (`"reasoning_loop_recovery": "wrap"`). Next, decode at depth (49 % of that session, 84.7 tok/s at 40-155K): the
+  promotion cache's room (the expert cards keep ~1.3-1.5 GiB free between prompts; slots sized to the largest expert,
+  14.5 MiB, against an average CPU-pool expert of 11.7), and the static experts the KV rows took back.
 
 - 2026-10-28 05:10: done - long contexts, part 2: a fresh 967K prompt 338.9 -> 308.3 s (its top-k in two stages; the
   indexer of layers 2 / 8 / 14 as one op whose queries the expert cards share), the first token after it 352.6 -> 308.9 s

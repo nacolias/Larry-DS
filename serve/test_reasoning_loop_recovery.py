@@ -208,6 +208,51 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(engine.calls[1][1], 40000 - len(retained))
         self.assertNotIn('</think>', self.tok.decode(engine.calls[1][0]))
 
+    # larry (patch-loopwrap.py): "wrap" closes a looping thinking the way the thinking budget does
+    def run_wrap(self, scripts, sampling=None, batch=0):
+        engine = RecordingEngine(self.tok, scripts)
+        engine.batch = batch
+        service = Service(engine, self.tok, None)
+        service.reasoning_loop_recovery = "wrap"
+        events = list(service.run(self.ids, True, [], 40000, sampling or {}, threading.Event()))
+        return engine, service, events
+
+    def test_wrap_mode_closes_the_thinking_and_the_model_answers(self):
+        engine, service, events = self.run_wrap([self.loop, 'Complete solution.'], {'temperature': .6, 'top_p': .95})
+        self.assertEqual(len(engine.calls), 2)
+        first, second = engine.calls[0][0], engine.calls[1][0]
+        self.assertEqual(second[:len(first)], first)             # the same prompt: the engine keeps its prefix
+        added = self.tok.decode(second[len(first):])
+        self.assertTrue(added.startswith(self.loop[:200]))       # what was generated, then the wrap-up
+        self.assertTrue(added.endswith('</think>\n\n'))
+        self.assertLess(len(second) - len(first), 20000)         # long before the budget
+        self.assertEqual(engine.sampling_calls[1], engine.sampling_calls[0])   # the sampler unchanged
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(content, 'Complete solution.')
+        self.assertEqual(events[-1][1]['finish'], 'stop')
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+        self.assertEqual(service.history[-1]['reasoning_recoveries'], 1)
+        self.assertGreaterEqual(service.history[-1]['reasoning_repeat_coverage'], .25)
+
+    def test_wrap_mode_closes_a_loop_written_as_one_long_word(self):
+        engine, _, events = self.run_wrap(['9^104 = ' + '58747693387' * 3000, 'Answer.'])
+        self.assertEqual(len(engine.calls), 2)
+        self.assertLess(len(engine.calls[1][0]) - len(engine.calls[0][0]), 5000)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+
+    def test_wrap_mode_leaves_novel_reasoning_alone(self):
+        work = ' '.join(str(i) for i in range(6000))
+        engine, _, events = self.run_wrap([work + '\n</think>\nAnswer.'])
+        self.assertEqual(len(engine.calls), 1)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
+
+    def test_wrap_mode_with_batch_slots(self):
+        engine, service, events = self.run_wrap([self.loop, 'Answer.'], batch=2)
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+        self.assertFalse(service.status['busy'])
+        self.assertEqual(service.live_reqs, {})
+
 
 if __name__ == '__main__':
     unittest.main()
