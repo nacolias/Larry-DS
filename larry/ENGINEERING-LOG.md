@@ -54,6 +54,47 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-29 21:55 - 23:15: optimization #4 - fewer bytes per cold expert: measured, not enabled)
+
+The owner left the call to me. **Not enabled**: the coldest experts requantized cost a measurable share of the model's
+fidelity outside agent and code text for a few percent of speed.
+
+* **The experts' formats** (the class table from the blob sizes; 11.8M weights a part, gate / up / down): Q3_K 3.4375 bits
+  a weight, Q2_0 2.25 (64-value blocks, levels {-1, 0, 1, 2} d), PTQ1_0 1.75 (128-value blocks, ternary); the nine (gate /
+  up, down) pairs. Half of the CPU pool's experts in the deep replay are the all-Q3_K class (14.50 MiB), the
+  use-weighted mean 12.17 MiB.
+* **The tools** (in the kit, not applied to the service): `ds41_requant` (`patches/patch-requant-tool.py` +
+  `patches/ds41_requant.cpp`: a target in xe.cmake) writes the experts at rank position >= R (rank.bin, the placement's
+  order) with their Q3_K parts in Q2_0 (`--to ptq1`: every part ternary) into a sidecar file; its quantizers search each
+  block for the least squared error (ggml's Q2_0 reference takes the block's max |w| as its scale and never uses the +2 d
+  level). `patches/patch-blobrq.py` (`STRATA_BLOB_RQ=<file>`): `Ds41FileBlobs` gives those experts their new class and
+  reads their blobs from the file on every path. R = 9,600 (the experts no card keeps: past cards 1-3's static set and
+  card 0's cache): 2,233 experts with a Q3_K part, 28.8 -> 20.3 GiB, the requantized parts' relative RMS error 0.355
+  (gate / up) and 0.352 (down) against the GGUF's values (24 min on 8 threads).
+* **Fidelity** (`bench/loop/qv4.py` + `qv4score.py`: the 18 qv/ corpus sequences read by the engine with every row's
+  logits dumped, against the original release's teacher-forced logits of 2026-10-22; `bench/loop/out/qv4-rq.txt`):
+
+| domain | KL: service / rebuilt / requantized | top-1 agreement: rebuilt -> requantized | ppl over the teacher's: rebuilt -> requantized |
+| --- | --- | --- | --- |
+| all | 0.2908 / 0.2916 / **0.3123** (+7 %) | 84.9 -> 84.3 % | 1.152 -> 1.167 |
+| English | 0.316 / 0.316 / 0.346 (+10 %) | 78.0 -> 76.7 % | 1.146 -> 1.177 |
+| Chinese | 0.602 / 0.601 / 0.654 (+9 %) | 75.4 -> 74.5 % | 1.444 -> 1.522 |
+| math | 0.164 / 0.166 / 0.190 (+15 %) | 91.9 -> 91.2 % | 1.079 -> 1.101 |
+| agent | 0.315 / 0.318 / 0.321 (+1 %) | 86.4 -> 86.5 % | 1.117 -> 1.087 |
+| code | 0.103 / 0.103 / 0.106 (+2 %) | 92.1 -> 92.0 % | 1.060 -> 1.062 |
+
+  The staged engine (a full rebuild: `build-xe`'s objects were lost to a failed CMake regenerate, below) scores as the
+  service's to 0.001 KL; the requantized file's difference is ~25x that.
+* **Speed** (`bench/loop/rqab.sh`: the deep replay without / with, twice, lending on): replies 121.1 / 120.3 -> 124.7 /
+  122.1 tok/s, ms a pass 28.1 / 28.2 -> 28.0 / 27.6, the turns' prompts 37.9 / 37.9 -> 34.7 / 34.4 s (-9 %: the
+  follow-ups' CPU-light part reads fewer bytes). The CPU pool runs as many experts a pass (5.3-5.9); in the agent session
+  of the morning (15.4 a pass) the replies would gain ~3-4 %.
+* To enable: apply patch-blobrq.py, build, `ds41_requant ... --from-rank 9600` and `STRATA_BLOB_RQ=<file>` in
+  ds41-xe-engine.sh (the arena also shrinks by 8.5 GiB). The file stays in `/srv/dsv41/rq/rq-q20-r9600.rq`.
+* GOTCHA: `ninja -C build-xe` without `xe-env.sh` (icpx not in PATH) re-ran CMake's regenerate, which failed and left
+  build-xe without its object files and with a reset cache (no Release): `build-xe.sh`'s cmake line restored it
+  (`logs/reconfigure-20261029.log`), the next engine build was a full rebuild. Build only through xe-env.sh.
+
 ## Measured (2026-10-29 21:30 - 21:50: an answer that loops ends there)
 
 **In the service since 21:46** (`bench/loop/launch-alinst.sh`'s window: `patches/patch-answerloop.py` +
@@ -3076,6 +3117,11 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-29 23:15: measured and not enabled - optimization #4 (the coldest experts' Q3_K parts in Q2_0): replies +2-4 %,
+  follow-up prompts -9 %, but KL against the original +7 % (English +10 %, Chinese +9 %, math +15 %; agent and code
+  +1-2 %). The tools stay in the kit (ds41_requant, patch-blobrq.py). What bounds the service now: the host's memory for
+  the arena experts (replies at depth, short follow-ups' expert calls), card 0 for long fresh prompts.
 
 - 2026-10-29 18:40: done - decode at depth, part 1: the expert cards' free VRAM lent to the promotion cache between
   prompts (verify passes -5.8 % at 64-79K, CPU-pool experts a pass -30 %; a fresh service's replies ~+8 %). Part 2 (the
