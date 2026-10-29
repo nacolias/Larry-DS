@@ -53,6 +53,23 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-29 20:20 - 20:55: the follow-ups' expert calls with lending; the lent slots kept over prompt calls - not adopted)
+
+* **What a follow-up's expert calls wait on now** (`deeprun.sh nm1`: the deep replay with `STRATA_XE_CALL_TL` and
+  `STRATA_XE_LOCK_PROF`, the service's engine; `calltl_stats.py`): calls of 129-512 tokens (800, mean 344) 20.0 ms - the
+  CPU-light part (24.6 arena experts with 1-4 tokens) 18.2 ms and last to end in 57 % of them, the cards done at ~15 ms
+  (GEMMs ~8 ms, small-expert jobs ~8 ms); 513-1024 tokens 31.0 ms (CPU-light 26.9 ms); 1025-2048 43.0 ms (the cards ~25
+  ms). No expert streamed any more (0-0.2 a card a call). The CPU-light experts are arena bytes either way - on the cards
+  they would cross PCIe from the same DRAM - so short follow-ups are bound by the host's memory, as decode is.
+* **The lent slots kept over prompt calls** (`patches/patch-pclend3.py`, staged in `pl3bin`, never installed: a prompt call
+  keeps them when it cannot grow a device buffer on an expert card - X / OUT, the token map, the job buffers, the int8 X /
+  H, the GEMM scratch against a bound with every row on one card): `lendab.sh pl3` (`STRATA_XE_PC_LEND_KEEP_CALLS=0` / 1,
+  twice): 129-512-token calls 20.1 / 20.2 -> 19.4 / 19.3 ms, CPU-light experts 24.7 / 24.4 -> 23.6 / 23.6 (the lent slots
+  hold what decode used; a prompt's 1-4-token experts are mostly others), 1025-2048-token calls 33.6 / 33.7 -> 35.7 / 35.6
+  ms, replies 120.0 / 119.0 -> 120.7 / 123.0 tok/s, prompts 38.0 / 38.3 -> 37.6 / 37.2 s; needles and concurtest passed.
+  Its check logged buffers growing by up to 77 MiB in calls that kept the slots (possibly the dense card's, which lends
+  nothing - the log does not say which card). ~2 % for a bound not shown safe: not adopted.
+
 ## Measured (2026-10-29 19:20 - 20:25: decode at depth, part 3 - the KV rows' evictions read ahead; the lent slots kept over request starts)
 
 **In the service since 19:46** (`bench/loop/launch-kva2inst.sh`'s window: `bench/longctx/xinstall.sh kva2`, the engine
@@ -3044,8 +3061,9 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
   prompts (verify passes -5.8 % at 64-79K, CPU-pool experts a pass -30 %; a fresh service's replies ~+8 %). Part 2 (the
   prompt path's buffers lent too, 19:20) measured and not adopted: -18 % more CPU-pool experts, but ~130 ms a turn to
   allocate them again. Part 3 (20:25): the KV rows' growth stall read ahead (679 -> 2 ms at the 65,536 crossing) and the
-  lent slots no longer given back at every request's start. Left for decode at depth: the lent slots kept over small
-  prompt calls, and fewer bytes a cold expert (#4, with the owner's OK). The loop detector reads the thinking only (an
+  lent slots no longer given back at every request's start. The lent slots kept over prompt calls (20:55): ~2 %, not
+  adopted. Left: fewer bytes a cold expert (#4, with the owner's OK) - the CPU pool's DRAM is now the bound of both the
+  replies at depth and the short follow-ups' expert calls (their CPU-light part, 18 of a 20 ms call). The loop detector reads the thinking only (an
   answer that repeats runs to max_tokens): a guard for answers would need care with code and tables that repeat.
 
 - 2026-10-29 18:00: done - the morning's thinking loops (nine of ~24,600 tokens, 38 % of an agent session's engine
