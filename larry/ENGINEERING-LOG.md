@@ -53,6 +53,22 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-29 18:45 - 19:20: decode at depth, part 2 - the prompt buffers lent too: not adopted)
+
+`patches/patch-pcbuf.py` (`STRATA_XE_PC_LEND_BUFS`, on top of part 1; staged in `pcbbin`, never installed): run_big's
+buffers on the expert cards (`cX`, `cXh`, `cOUT`, `cS` / `cW`, the job buffers, `gscratch` - grown to the largest call and
+kept, ~1.6 GiB a card after a 16K batch) freed when the lend is made, their sizes remembered, and allocated again at those
+sizes when the lend is given back (before a prompt call over 8 tokens, the prefetch, the KV rows' room) - so a prompt sees
+the card as before. The lend became +337 slots (4.77 GiB: 112-113 a card) instead of 0-140.
+
+`bench/loop/lendab.sh pcb` (`launch-pcb.sh`; the deep replay, part 1 alone / with the buffers, twice each): CPU-pool
+experts a pass 5.3 / 5.7 -> 4.7 / 4.3 (-18 %), replies 115.8 / 114.3 -> 115.6 / 117.9 tok/s (within the texts' spread),
+but the turns' prompts 38.0 / 37.9 -> 42.0 / 40.1 s: the buffers' allocations at every give-back cost ~50-150 ms a batch
+turn (and the first turn after the 64K prompt 1.34 -> 3.32 s once). The extra slots live only until the next prompt call,
+so a short turn never fills them: ~1 % of the decode for ~130 ms a turn - not worth it. Needles of 32K / 131K and
+concurtest passed on it. (A version that keeps the lent slots over small prompt calls - giving them back only when a call
+must grow a buffer - would keep the slots warm; not built.)
+
 ## Measured (2026-10-29 18:00 - 18:40: decode at depth, part 1 - the expert cards' free VRAM lent to the promotion cache)
 
 **In the service since 18:37** (`bench/loop/launch-pclinst.sh`'s window: `bench/longctx/xinstall.sh pcl`, the engine
@@ -2993,9 +3009,11 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 ## Not done yet / next
 
 - 2026-10-29 18:40: done - decode at depth, part 1: the expert cards' free VRAM lent to the promotion cache between
-  prompts (verify passes -5.8 % at 64-79K, CPU-pool experts a pass -30 %; a fresh service's replies ~+8 %). Next, part 2:
-  the prompt path's buffers (`cX`, `cOUT`, `gscratch`, the job buffers: ~1.2-1.7 GiB a card once a 16K batch ran) given
-  back after a prompt so the cache can borrow them too - after long prompts the lent slots are few.
+  prompts (verify passes -5.8 % at 64-79K, CPU-pool experts a pass -30 %; a fresh service's replies ~+8 %). Part 2 (the
+  prompt path's buffers lent too, 19:20) measured and not adopted: -18 % more CPU-pool experts, but ~130 ms a turn to
+  allocate them again. Left for decode at depth: the KV rows' growth stall (a 1 GiB slab's experts read from the model
+  file mid-turn, 0.6-3 s, at 64K / 128K / ... - read ahead before the bucket crossing), the lent slots kept over small
+  prompt calls, and fewer bytes a cold expert (#4, with the owner's OK).
 
 - 2026-10-29 18:00: done - the morning's thinking loops (nine of ~24,600 tokens, 38 % of an agent session's engine
   time) checked against the build (the 10-28 changes give the same logits at 96K / 150K within the run-to-run floor) and
