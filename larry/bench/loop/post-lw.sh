@@ -22,6 +22,7 @@ grep -q "service health 200" $W || { echo "the service is not healthy after the 
   echo "--- loop probe"
   T0=$(date '+%F %T')
   DS41_URL=http://172.23.0.1:18080 DS41_KEY_FILE=/opt/docker/vllm/.env python3 bench/loop/loopprobe.py 2>&1 | tail -3
-  journalctl -u larry-ds41 --since "$T0" --no-pager -o cat | grep -E "reasoning_loop_recovery|thinking budget reached" | cut -c1-200
+  DS41_URL=http://172.23.0.1:18080 DS41_KEY_FILE=/opt/docker/vllm/.env python3 bench/loop/loopprobe.py --answer 2>&1 | tail -3
+  journalctl -u larry-ds41 --since "$T0" --no-pager -o cat | grep -E "reasoning_loop_recovery|thinking budget reached|answer repeated" | cut -c1-200
   echo "--- done $(date '+%F %T')"
 } > $O 2>&1

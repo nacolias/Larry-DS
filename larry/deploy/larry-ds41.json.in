@@ -36,6 +36,7 @@
   "api_monitor": false,
   "reasoning_budget_tokens": 32768,
   "reasoning_loop_recovery": "wrap",
+  "answer_loop_stop": 0.9,
   "vision": {
     "exe": "@DS41_HOME@/ds41-vision.sh",
     "mmproj": "@DS41_HOME@/models/gsq1017/V41-MTP-Vision-1017.Q2_K.gguf",

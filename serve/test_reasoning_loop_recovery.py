@@ -253,6 +253,45 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertFalse(service.status['busy'])
         self.assertEqual(service.live_reqs, {})
 
+    # larry (patch-answerloop.py): "answer_loop_stop" ends an answer that repeats whole passages
+    def run_answer(self, script, threshold=0.9, max_new=40000):
+        engine = RecordingEngine(self.tok, [script])
+        service = Service(engine, self.tok, None)
+        service.answer_loop_stop = threshold
+        ids = self.tok.encode('<|im_start|>user\nTask<|im_end|>\n<|im_start|>assistant\n', parse_special=True)
+        events = list(service.run(ids, False, [], max_new, {}, threading.Event()))
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        return engine, events, content
+
+    def test_answer_loop_is_ended(self):
+        engine, events, content = self.run_answer(self.loop)
+        self.assertEqual(len(engine.calls), 1)
+        self.assertEqual(events[-1][1]['finish'], 'length')
+        self.assertLess(events[-1][1]['completion_tokens'], 20000)
+        self.assertTrue(content.startswith(self.loop[:200]))
+
+    def test_answer_loop_as_one_long_word_is_ended(self):
+        _, events, _ = self.run_answer('9^104 = ' + '58747693387' * 3000)
+        self.assertEqual(events[-1][1]['finish'], 'length')
+        self.assertLess(events[-1][1]['completion_tokens'], 5000)
+
+    def test_repetitive_code_is_not_ended(self):
+        code = ''.join('    assert square(%d) == %d, "square of %d"\n' % (i, i * i, i) for i in range(600))
+        _, events, content = self.run_answer(code)
+        self.assertEqual(events[-1][1]['finish'], 'stop')
+        self.assertEqual(content, code)
+
+    def test_novel_answer_is_not_ended(self):
+        work = ' '.join(str(i) for i in range(6000))
+        _, events, content = self.run_answer(work)
+        self.assertEqual(events[-1][1]['finish'], 'stop')
+        self.assertEqual(content, work)
+
+    def test_answer_guard_off_by_default(self):
+        _, events, _ = self.run_answer(self.loop, threshold=0.0, max_new=16384)
+        self.assertEqual(events[-1][1]['finish'], 'length')
+        self.assertEqual(events[-1][1]['completion_tokens'], 16384)
+
 
 if __name__ == '__main__':
     unittest.main()

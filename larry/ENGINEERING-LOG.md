@@ -32,7 +32,8 @@ Two requests at once (since 2026-10-27 19:04, `"parallel": 2`): since 20:47 thei
 answers at ~48 tok/s each, 92 in total since 23:08 (one alone ~71-85); a third waits for a free slot.
 Sampling defaults: temperature 1.0, top-p 0.95. Context: 1,048,576 tokens (since 2026-10-24 20:35; see below).
 Thinking that starts repeating itself is closed early and answered (since 2026-10-29 17:52: the server's loop detector,
-`"reasoning_loop_recovery": "wrap"` in `larry-ds41.json`), not run into the thinking budget.
+`"reasoning_loop_recovery": "wrap"` in `larry-ds41.json`), not run into the thinking budget; an answer that repeats whole
+passages is ended there (since 21:46: `"answer_loop_stop": 0.9`), not run to max_tokens.
 
 ## Model provenance (verified 2026-10-26)
 
@@ -52,6 +53,25 @@ deepseek-ai/DeepSeek-V4.1-Flash-1017 with no fine-tune and no abliteration. The 
 So the weights are DeepSeek's official 1017 release; the metadata strings are mislabeled. dealignai's repo is an
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
+
+## Measured (2026-10-29 21:30 - 21:50: an answer that loops ends there)
+
+**In the service since 21:46** (`bench/loop/launch-alinst.sh`'s window: `patches/patch-answerloop.py` +
+`patches/svc-answerloop.py`, backup `larry-ds41.json.pre-answerloop-20261029`): `"answer_loop_stop": 0.9`. The loop detector
+read the thinking only, and a probe once wrote its 300 repeated lines in the answer and ran to max_tokens (16,000 tokens).
+The same measure now runs over an answer every 512 tokens - the share of its last 2,000 words inside 12-word passages seen
+three times, or a 2,048-character tail with a period of <= 64 - against a much higher bar than the thinking's 0.25: code
+and tables that repeat lines change their names and numbers, a loop does not. Answers under 2,000 words are never
+measured; an answer over the bar ends as "length", as the one-token run guard (#606) ends one.
+
+* Tests (`serve/test_reasoning_loop_recovery.py`, 27, 5 new): a passage loop and a one-word loop in an answer end (~2,000
+  tokens in); 600 lines of `assert square(i) == i*i, "square of i"` and 6,000 distinct numbers run to their end; the guard
+  off by default. `serve/test_server.py` as before.
+* Through the service (`bench/loop/loopprobe.py --answer`, thinking off, the answer asked to be one line 300 times):
+  ended at 2,561 tokens, coverage 1.000 (12 s; 16,000 tokens before). The thinking probe: its thinking wrapped up at
+  5,632 tokens (coverage 0.355), then the model went on repeating in its answer - ended at 8,210 tokens.
+* tsvc2 on the service (`logs/tsvc2-alinst.log`): every needle found (8K 1537 / 1911, 16K 2641, 31K 3422 tok/s), decode
+  103.0 / 102.0 tok/s, essay 87.4 / 82.1, the tool call, the picture and its follow-up right; concurtest PASS.
 
 ## Measured (2026-10-29 20:20 - 20:55: the follow-ups' expert calls with lending; the lent slots kept over prompt calls - not adopted)
 
@@ -3063,8 +3083,8 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
   allocate them again. Part 3 (20:25): the KV rows' growth stall read ahead (679 -> 2 ms at the 65,536 crossing) and the
   lent slots no longer given back at every request's start. The lent slots kept over prompt calls (20:55): ~2 %, not
   adopted. Left: fewer bytes a cold expert (#4, with the owner's OK) - the CPU pool's DRAM is now the bound of both the
-  replies at depth and the short follow-ups' expert calls (their CPU-light part, 18 of a 20 ms call). The loop detector reads the thinking only (an
-  answer that repeats runs to max_tokens): a guard for answers would need care with code and tables that repeat.
+  replies at depth and the short follow-ups' expert calls (their CPU-light part, 18 of a 20 ms call). The loop detector
+  reads the thinking only (an answer that repeats ran to max_tokens): 21:46, an answer guard (`"answer_loop_stop": 0.9`).
 
 - 2026-10-29 18:00: done - the morning's thinking loops (nine of ~24,600 tokens, 38 % of an agent session's engine
   time) checked against the build (the 10-28 changes give the same logits at 96K / 150K within the run-to-run floor) and

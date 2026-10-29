@@ -3188,6 +3188,7 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.answer_loop_stop = 0.0                      # larry (patch-answerloop.py): an answer's loop coverage that ends it
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -4265,6 +4266,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        answer_text, answer_looped, answer_cov, next_answer_check = "", False, 0.0, 0   # larry (patch-answerloop.py)
         loop_wrap = False                               # larry (patch-loopwrap.py): a loop closed the thinking
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
@@ -4400,6 +4402,8 @@ class Service:
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
+                                    if self.answer_loop_stop and ev.kind == "content":   # (patch-answerloop.py)
+                                        answer_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
@@ -4428,6 +4432,14 @@ class Service:
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
+                                # larry (patch-answerloop.py): an answer that repeats whole passages ends here ("length")
+                                if (self.answer_loop_stop and parser.state == "content" and n >= next_answer_check
+                                        and not parser.buf and not parser.pending and not detok.pending()):
+                                    next_answer_check = n + LOOP_CHECK_EVERY
+                                    answer_cov = reasoning_repeat_coverage(answer_text)
+                                    if answer_cov >= self.answer_loop_stop:
+                                        answer_looped = True
+                                        break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -4577,6 +4589,10 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif answer_looped:   # larry (patch-answerloop.py)
+                        print(f"[strata] the answer repeated the same passages (coverage={answer_cov:.3f}) at {n} "
+                              f"tokens: ended as \"length\" (answer_loop_stop {self.answer_loop_stop} in the config; 0 "
+                              "turns this off)", flush=True)
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
@@ -7117,6 +7133,10 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    als = cfg.get("answer_loop_stop", 0)   # larry (patch-answerloop.py): 0 (off) or a coverage in (0, 1]
+    if isinstance(als, bool) or not isinstance(als, (int, float)) or not 0 <= als <= 1:
+        raise SystemExit(f"[strata] config \"answer_loop_stop\" must be a number from 0 (off) to 1, not {als!r}")
+    svc.answer_loop_stop = float(als)
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:

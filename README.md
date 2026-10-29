@@ -214,9 +214,10 @@ and GPUs are untested.
 - **[`larry-ds41.json.in`](larry/deploy/larry-ds41.json.in)** holds the engine flags (`--ctx 1048576
   --prompt-batch 16384 --route-bias 0.5 --route-bias-file 0.3 --vision`), the sampling defaults (temperature 1.0,
   top-p 0.95), the model paths, the `"vision"` section (the encoder script, the sidecar it reads, 6 CPU threads) and
-  `"parallel": 2` (two requests at once; 1 or absent = one at a time) and `"reasoning_loop_recovery": "wrap"`
+  `"parallel": 2` (two requests at once; 1 or absent = one at a time), `"reasoning_loop_recovery": "wrap"`
   (thinking that starts repeating whole passages is closed and answered the way the thinking budget closes it - an
-  agent session's nine ~24,600-token loops on 2026-10-29).
+  agent session's nine ~24,600-token loops on 2026-10-29) and `"answer_loop_stop": 0.9` (an answer that repeats
+  whole passages is ended there, not run to max_tokens).
   For a text-only server, delete the section and `--vision`. `bootstrap.sh` renders it as `larry-ds41.json`.
 - [`larry/ENGINEERING-LOG.md`](larry/ENGINEERING-LOG.md) ("Knobs") lists the tier's knobs.
 
