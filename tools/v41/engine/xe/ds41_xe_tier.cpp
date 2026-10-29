@@ -327,6 +327,11 @@ struct XeCard {
     std::vector<uint64_t> pc_tick;  ///< slot -> the decode call that last used it
     int pc_busy = 0;                ///< promotions of this card in flight (at most the tier's pc_par)
     uint8_t* pc_tmp = nullptr;      ///< larry, engine1 (pc_devrepack): one slot's bytes the card repacks a promoted blob into
+    /// larry (patch-pclend.py, STRATA_XE_PC_LEND): free VRAM lent to the cache between TP passes - slots pc_n1 .. pc_n
+    /// live there (pc_n1 .. in the flex region before them); null when nothing is lent
+    uint8_t* pc_mem2 = nullptr;
+    size_t pc_cap2 = 0;
+    int pc_n1 = 0;
     /// decode / verify: the card's command sequence of a call (stage copy, quantise, gate/up, down, copy to the dense
     /// card's slot) recorded once per shape (jobs, tokens, kernel variant) and replayed - one submission, not five
     std::map<uint32_t, std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> dgraphs;
@@ -579,6 +584,10 @@ struct Ds41XeImpl {
     bool pc_ready = false;             ///< the slots exist (allocated a few calls into a decode)
     int64_t pc_calls = 0;              ///< decode calls since the last drop
     bool pc_tried = false;             ///< pc_setup ran since the last drop
+    // larry (patch-pclend.py): the lent slots - TP passes since they went back, the next pass a lend may be tried at,
+    // counts and host time (lend: the allocations; unlend: the waits, frees and the driver's free VRAM)
+    int64_t pc_unlend_pass = 0, pc_lend_next = 0, pc_lends = 0, pc_unlends = 0, pc_lent_max = 0;
+    double pc_lend_ms = 0, pc_unlend_ms = 0;
     size_t pc_slot = 0;                ///< bytes a slot
     std::vector<int32_t> pc_where;     ///< key -> card << 16 | slot (published); -1; -2 in flight
     std::vector<uint8_t> pc_uses;      ///< key -> its CPU-pool uses (saturating; STRATA_XE_PROMOTE_MIN)
@@ -2845,6 +2854,7 @@ void pc_setup(Ds41XeImpl& im) {
         if (im.pc_devrepack) { --n; c.pc_tmp = c.flex + (size_t) n * im.pc_slot; }   // the last slot's bytes: the temp
         c.pc_mem = c.flex;
         c.pc_n = n;
+        c.pc_n1 = n;   // larry (patch-pclend.py)
         c.pc_key.assign((size_t) n, -1);
         c.pc_tick.assign((size_t) n, 0);
         c.pc_busy = 0;
@@ -2923,6 +2933,11 @@ void pc_setup(Ds41XeImpl& im) {
     }
 }
 
+/// larry (patch-pclend.py): slot sl's bytes - the flex region's slots first, then the lent region's
+inline uint8_t* pc_addr(const Ds41XeImpl& im, const XeCard& c, int sl) {
+    return sl < c.pc_n1 ? c.pc_mem + (size_t) sl * im.pc_slot : c.pc_mem2 + (size_t) (sl - c.pc_n1) * im.pc_slot;
+}
+
 /// STRATA_XE_PROMOTE_CHECK=1 (debug): a published slot against the arena blob repacked afresh on the same card
 bool pc_check(Ds41XeImpl& im, XeCard& c, int64_t key, const uint8_t* slot) {
     const int64_t l = key / im.g.n_experts, e = key % im.g.n_experts;
@@ -2949,7 +2964,7 @@ void pc_poll(Ds41XeImpl& im, bool push) {
         if (j.card < 0) { ++it; continue; }   // larry, engine1: its bounce filling early (pc_early), no card / slot yet
         XeCard& c = *im.cards[(size_t) j.card];
         const int64_t l = j.key / im.g.n_experts, e = j.key % im.g.n_experts;
-        uint8_t* slot = c.pc_mem + (size_t) j.slot * im.pc_slot;
+        uint8_t* slot = pc_addr(im, c, j.slot);   // larry (patch-pclend.py)
         if (j.stage == 0 && j.filled.load(std::memory_order_acquire)) {
             j.src = im.pc_bounce + (size_t) j.bounce * im.pc_slot;
             j.stage = 1;
@@ -3128,6 +3143,13 @@ void pc_drop(Ds41XeImpl& im) {
             const int64_t k = c.pc_key[(size_t) sl];
             if (k >= 0) { im.card_of[(size_t) k] = -1; im.dptr[(size_t) k] = nullptr; rt_put(im, (size_t) k); }
         }
+        if (c.pc_mem2) {   // larry (patch-pclend.py): the lent region back with the rest
+            local_free(c.q, c.pc_mem2);
+            c.pc_mem2 = nullptr;
+            c.pc_cap2 = 0;
+            ++im.pc_unlends;
+        }
+        c.pc_n1 = 0;
         c.pc_mem = nullptr;   // the flex region (prefetch buffers next)
         c.pc_tmp = nullptr;
         c.pc_n = 0;
@@ -3140,6 +3162,103 @@ void pc_drop(Ds41XeImpl& im) {
     for (int b = 0; b < im.pc_nb; ++b) im.pc_bfree.push_back(b);
     std::fill(im.pc_where.begin(), im.pc_where.end(), -1);
     im.pc_ready = false;
+    im.pc_unlend_pass = im.tp_pass;   // (larry, patch-pclend.py)
+}
+
+/// larry (patch-pclend.py, STRATA_XE_PC_LEND): each expert card's free VRAM less STRATA_XE_PC_LEND_KEEP_GIB becomes more
+/// slots (pc_mem2, after the flex region's) - between TP passes only, nothing in flight reads a slot of it yet
+void pc_lend(Ds41XeImpl& im) {
+    static const int64_t keep = (int64_t) (env_d("STRATA_XE_PC_LEND_KEEP_GIB", 0.4) * kGiB);
+    static const int max_n = std::max(0, env_i("STRATA_XE_PC_LEND_MAX", 4096));
+    const double t0 = now_ms();
+    int added = 0;
+    std::string per;
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (c.dense || !c.pc_mem || c.pc_mem2 || c.pbuf_cap) continue;
+        const int64_t fr = c.free_vram();
+        if (fr < 0) continue;
+        const int n = (int) std::min<int64_t>(max_n, std::max<int64_t>(0, fr - keep) / (int64_t) im.pc_slot);
+        if (n < 8 || c.pc_n + n > 65535) continue;
+        uint8_t* p = local_alloc(c.q, (size_t) n * im.pc_slot);
+        if (!p) continue;
+        c.pc_mem2 = p;
+        c.pc_cap2 = (size_t) n * im.pc_slot;
+        c.pc_n1 = c.pc_n;
+        c.pc_n += n;
+        c.pc_key.resize((size_t) c.pc_n, -1);
+        c.pc_tick.resize((size_t) c.pc_n, 0);
+        added += n;
+        per += " c" + std::to_string(c.idx) + " +" + std::to_string(n);
+    }
+    // a card with no room is tried again after another STRATA_XE_PC_LEND_AFTER passes, not every pass
+    im.pc_lend_next = im.tp_pass + std::max(1, env_i("STRATA_XE_PC_LEND_AFTER", 4));
+    if (!added) return;
+    ++im.pc_lends;
+    im.pc_lend_ms += now_ms() - t0;
+    int64_t lent = 0;
+    for (auto& cp : im.cards) if (cp->pc_mem2) lent += cp->pc_n - cp->pc_n1;
+    im.pc_lent_max = std::max(im.pc_lent_max, lent);
+    static int logged = 0;
+    if (logged++ < 3 || env_i("STRATA_XE_PROF", 0))
+        std::fprintf(stderr, "xe tier: promotion cache: +%d slots (%.2f GiB) of the expert cards' free VRAM lent (%s; %.1f ms)\n",
+                     added, added * (double) im.pc_slot / kGiB, per.c_str() + 1, now_ms() - t0);
+}
+
+/// larry (patch-pclend.py): the lent slots back before anything sizes or allocates from the free VRAM: their promotions
+/// in flight dropped, their experts back to the CPU pool, the regions freed, the driver's free VRAM waited for
+void pc_unlend(Ds41XeImpl& im) {
+    bool any = false;
+    for (auto& cp : im.cards) any = any || cp->pc_mem2;
+    if (!any) return;
+    const double t0 = now_ms();
+    for (;;) {   // the helper's fills in flight (a job of a lent slot may be among them)
+        bool busy = false;
+        for (auto& j : im.pc_jobs) if (j.stage == 0 && !j.filled.load(std::memory_order_acquire)) busy = true;
+        if (!busy) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    for (auto& cp : im.cards) {
+        XeCard& c = *cp;
+        if (!c.pc_mem2) continue;
+        c.q.wait();
+        if ((size_t) c.idx < im.pc_q.size() && im.pc_q[(size_t) c.idx]) im.pc_q[(size_t) c.idx]->wait();   // the copies
+        for (auto it = im.pc_jobs.begin(); it != im.pc_jobs.end();) {   // promotions into a lent slot: dropped
+            if (it->card == c.idx && it->slot >= c.pc_n1) {
+                if (it->bounce >= 0) im.pc_bfree.push_back(it->bounce);
+                im.pc_where[(size_t) it->key] = -1;
+                c.pc_busy = std::max(0, c.pc_busy - 1);
+                it = im.pc_jobs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (int sl = c.pc_n1; sl < c.pc_n; ++sl) {
+            const int64_t k = c.pc_key[(size_t) sl];
+            if (k >= 0) {
+                im.card_of[(size_t) k] = -1;
+                im.dptr[(size_t) k] = nullptr;
+                rt_put(im, (size_t) k);
+                im.pc_where[(size_t) k] = -1;
+            }
+        }
+        c.pc_key.resize((size_t) c.pc_n1);
+        c.pc_tick.resize((size_t) c.pc_n1);
+        c.pc_n = c.pc_n1;
+        const int64_t fr0 = c.free_vram(), freed = (int64_t) c.pc_cap2;
+        local_free(c.q, c.pc_mem2);
+        c.pc_mem2 = nullptr;
+        c.pc_cap2 = 0;
+        // the xe driver shows freed VRAM a little later (as evict_slabs waits for its slabs)
+        for (int i = 0, same = 0; fr0 >= 0 && i < 50 && c.free_vram() < fr0 + freed * 9 / 10 && same < 5; ++i) {
+            const int64_t f0 = c.free_vram();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            same = c.free_vram() == f0 ? same + 1 : 0;
+        }
+    }
+    ++im.pc_unlends;
+    im.pc_unlend_ms += now_ms() - t0;
+    im.pc_unlend_pass = im.tp_pass;
 }
 
 /// STRATA_XE_GROUTE_CHECK=1 (debug): the route kernel's job lists and CPU entries of this call against the host's own
@@ -5917,6 +6036,13 @@ void Ds41XeTier::tp_between_passes(int chunks) {
     // larry, patch-regrowasync: no new promotion while a regrow is pending (its experts are arena experts until published)
     for (const auto& lk : im.tp_want) if (im.pc_ready && !im.rg_pending) pc_want(im, lk.first, lk.second);
     im.tp_want.clear();
+    // larry (patch-pclend.py, STRATA_XE_PC_LEND): the free VRAM lent as more slots, STRATA_XE_PC_LEND_AFTER passes after
+    // the last prompt call (no prefetch, no regrow pending)
+    static const bool lend_on = env_i("STRATA_XE_PC_LEND", 0) != 0;
+    static const int lend_after = std::max(1, env_i("STRATA_XE_PC_LEND_AFTER", 4));
+    if (lend_on && im.pc_ready && !im.pf_on && !im.rg_pending && im.tp_pass - im.pc_unlend_pass >= lend_after &&
+        im.tp_pass >= im.pc_lend_next)
+        pc_lend(im);
     // early bounces no card took (every card at its in-flight cap): given back once filled (the helper is done with them)
     for (auto it = im.pc_jobs.begin(); it != im.pc_jobs.end();) {
         if (it->card < 0 && it->filled.load(std::memory_order_acquire)) {
@@ -6021,6 +6147,7 @@ bool Ds41XeTier::tp_make_room(int gpu, size_t bytes) { return tp_make_room_multi
 // larry (patch-roomahead.py): tp_make_room's steps for every card at once - the evictions side by side
 bool Ds41XeTier::tp_make_room_multi(const std::vector<std::pair<int, size_t>>& reqs) {
     Ds41XeImpl& im = *im_;
+    pc_unlend(im);   // larry (patch-pclend.py): the lent VRAM first - else the free VRAM below looks short and slabs go
     // the rows fit beside what is free (STRATA_TP_ROOM_KEEP_GIB, 0.25, left over); else the flex region gives the
     // shortfall back - after a long prompt its chunk buffers hold the card's slack, as they did with eager replicas
     const int64_t keep = (int64_t) (env_d("STRATA_TP_ROOM_KEEP_GIB", 0.25) * kGiB);
@@ -6086,6 +6213,7 @@ bool Ds41XeTier::tp_make_room_multi(const std::vector<std::pair<int, size_t>>& r
 // larry (patch-roomahead.py)
 void Ds41XeTier::tp_room_ahead(const std::vector<std::pair<int, size_t>>& reqs) {
     Ds41XeImpl& im = *im_;
+    pc_unlend(im);   // larry (patch-pclend.py)
     static const bool on = env_i("STRATA_XE_TP_AHEAD", 1) != 0;
     if (!on || !tp_evict_on()) return;
     const int64_t ekeep = (int64_t) (env_d("STRATA_XE_TP_EVICT_KEEP_GIB", 0.25) * kGiB);
@@ -6271,6 +6399,7 @@ int Ds41XeTier::tp_cpu_part(int64_t layer, int nt, const int32_t* ids, const flo
 
 bool Ds41XeTier::run_chunk(int64_t l, int n, const int32_t* ids, const float* w, const float* x, float* out) {
     try {
+        if (n > kMaxJobTok) pc_unlend(*im_);   // larry (patch-pclend.py)
         if (n > kMaxJobTok) disarm(*im_);
         if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, out, nullptr);
         return run_big(*im_, l, n, ids, w, x, out, nullptr);
@@ -6281,6 +6410,7 @@ bool Ds41XeTier::run_chunk(int64_t l, int n, const int32_t* ids, const float* w,
 }
 bool Ds41XeTier::run_chunk_dev(int64_t l, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
     try {
+        if (n > kMaxJobTok) pc_unlend(*im_);   // larry (patch-pclend.py)
         if (n > kMaxJobTok) disarm(*im_);
         if (n <= kMaxJobTok) return run_small(*im_, l, n, ids, w, x, nullptr, out_dev);
         return run_big(*im_, l, n, ids, w, x, nullptr, out_dev);
@@ -6463,6 +6593,7 @@ bool Ds41XeTier::run_chunk_dev_async(int64_t l, int n, const int32_t* ids, const
                                      bool last_of_layer, const float* x_dev) {
     Ds41XeImpl& im = *im_;
     if (im.run_thr.joinable()) return false;   // one call in flight
+    if (n > kMaxJobTok) pc_unlend(im);   // larry (patch-pclend.py): here, before the call's thread
     im.run_ok = true;
     im.sh_call = im.sh_next && n > kMaxJobTok;   // larry, STRATA_SHEXP_TIER: this call's (run_big's) shared expert
     im.sh_next = false;
@@ -6558,6 +6689,11 @@ void Ds41XeTier::close() {
         std::fprintf(stderr, "xe tier: promotion cache: %lld promoted, %lld hits, %lld evicted, %lld skipped (cards busy), %lld bad; "
                      "%lld chunks, host push %.1f ms, poll %.1f ms\n", (long long) im.pc_done, (long long) im.pc_hit, (long long) im.pc_evicted,
                      (long long) im.pc_busy_skip, (long long) im.pc_bad, (long long) im.pc_chunks, im.pc_push_us / 1000.0, im.pc_poll_us / 1000.0);
+    if (im.pc_lends || im.pc_unlends)   // larry (patch-pclend.py)
+        std::fprintf(stderr, "xe tier: promotion cache: free VRAM lent %lld times (at most %lld slots, %.1f ms each), given back %lld "
+                     "times (%.1f ms each)\n", (long long) im.pc_lends, (long long) im.pc_lent_max,
+                     im.pc_lend_ms / std::max<int64_t>(1, im.pc_lends), (long long) im.pc_unlends,
+                     im.pc_unlend_ms / std::max<int64_t>(1, im.pc_unlends));
     if (im.pc_fill_n > 0)
         std::fprintf(stderr, "xe tier: promotion repacks: %lld, %.1f ms each, %.1f ms queued before a helper took it\n", (long long) im.pc_fill_n.load(),
                      im.pc_fill_us.load() / 1000.0 / im.pc_fill_n.load(), im.pc_wait_us.load() / 1000.0 / im.pc_fill_n.load());

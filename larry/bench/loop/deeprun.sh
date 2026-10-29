@@ -1,9 +1,11 @@
 #!/bin/bash
 # deeprun.sh NAME [VAR=value ...] - decode at depth: a private server with the service's config on port 18081 (the
 # service stopped - an abw.sh "@" step) and STRATA_XE_CPU_LOG=logs/cpulog-NAME.txt (the CPU pool's experts and the
-# promotion cache's events per pass: bench/engine1/cpulog.py, pcsim.py), agentd.py's deep agent session (AGENTD_ARGS,
-# default --first 64000 --turns 24: thinking on, temperature 1), then the server stopped (SIGTERM, as systemd does).
-# Logs: logs/engine-NAME.log, logs/serve-NAME.log, bench/loop/out/agentd-NAME.jsonl.
+# promotion cache's events per pass: bench/engine1/cpulog.py, pcsim.py), then DEEP_TESTS (default agent): agent =
+# agentd.py's deep agent session (AGENTD_ARGS, default --first 64000 --turns 24: thinking on, temperature 1), needles =
+# abx.py's needles of DEEP_NEEDLES tokens (32000,131000) with their decode and 12K-token turn, conc = concurtest.py; then
+# the server stopped (SIGTERM, as systemd does).  A staged engine: XE_BIN=/opt/ai/dsv41/<NAME>bin LD_LIBRARY_PATH=(same)
+# as VAR=value arguments.  Logs: logs/engine-NAME.log, logs/serve-NAME.log, bench/loop/out/agentd-NAME.jsonl.
 set -u
 cd /opt/ai/dsv41
 N=$1; shift
@@ -31,9 +33,14 @@ for i in $(seq 1 90); do
 done
 if [ $ok = 1 ]; then
   echo "[$N] up $(date +%T)"
-  /opt/ai/dsv41/venv/bin/python -I bench/loop/agentd.py --label $N --log logs/engine-$N.log \
+  has() { [[ ",${DEEP_TESTS:-agent}," == *",$1,"* ]]; }
+  has agent && /opt/ai/dsv41/venv/bin/python -I bench/loop/agentd.py --label $N --log logs/engine-$N.log \
     --out bench/loop/out/agentd-$N.jsonl ${AGENTD_ARGS:---first 64000 --turns 24} --stop-flag ${AB_FLAG:-/nonexistent} 2>&1
-  grep -a -h "promotion cache:" logs/engine-$N.log | tail -2 | cut -c1-200
+  has needles && /opt/ai/dsv41/venv/bin/python -I bench/speed/abx.py --port 18081 --label $N --needles "${DEEP_NEEDLES:-32000,131000}" \
+    --log logs/engine-$N.log --out bench/loop/out/abx-$N.jsonl 2>&1 | grep -E "needle|deep|turn" | cut -c1-200
+  has conc && DS41_URL=http://172.23.0.1:18081 DS41_KEY_FILE=/opt/docker/vllm/.env PYTHONPATH=/opt/ai/dsv41 \
+    python3 bench/conc/concurtest.py logs/engine-$N.log 2>&1 | tail -3
+  grep -a -h "promotion cache:\|lent\|no room\|out of resources\|OUT_OF\|DEVICE_LOST\|refused" logs/engine-$N.log | tail -6 | cut -c1-220
 fi
 kill -TERM -$SP 2>/dev/null || kill -TERM $SP 2>/dev/null
 for i in $(seq 1 90); do
@@ -41,5 +48,5 @@ for i in $(seq 1 90); do
   sleep 2
 done
 pgrep -x ds41_generate_x > /dev/null && echo "[$N] ENGINE STILL RUNNING after 180 s"
-grep -a -h "promotion cache:" logs/engine-$N.log | tail -1 | cut -c1-200
+grep -a -h "promotion cache:" logs/engine-$N.log | tail -2 | cut -c1-220
 echo "[$N] done $(date +%T); CPU log $(wc -l < logs/cpulog-$N.txt 2>/dev/null) lines"

@@ -53,6 +53,45 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-29 18:00 - 18:40: decode at depth, part 1 - the expert cards' free VRAM lent to the promotion cache)
+
+**In the service since 18:37** (`bench/loop/launch-pclinst.sh`'s window: `bench/longctx/xinstall.sh pcl`, the engine
+before it in `build-xe/pre-pcl`; `patches/svc-pclend.py`, backup `ds41-xe-engine.sh.pre-pclend-20261029`):
+`STRATA_XE_PC_LEND=1` (`patches/patch-pclend.py`). Between prompts the expert cards keep VRAM free for the prompt path
+(`STRATA_XE_FLEX_MARGIN_GIB`, 1.5 GiB, and whatever the last prompt's buffers did not take); now, 4 TP passes after the
+last prompt call (`_AFTER`), each expert card's free VRAM less 0.4 GiB (`_KEEP_GIB`) becomes a second region of promotion
+slots after the flex region's, one LRU over both. It goes back - promotions into it dropped, its experts to the CPU pool,
+the region freed, the driver's free VRAM waited for - before anything sizes or allocates from the free VRAM: a prompt
+call over 8 tokens, the prefetch (with the whole cache, as before), the TP core's KV rows (before their slab evictions,
+which would otherwise see the lent VRAM as missing), close. A lend is one allocation a card (5-21 ms).
+
+* **The A/B** (`bench/loop/lendab.sh`: `deeprun.sh` - `agentd.py`'s deep agent session, thinking on, temperature 1, 64K ->
+  ~79K, with the CPU-pool log - lending off / on / off / on on the staged engine, `labsum.py`, `cpulog.py`): CPU-pool
+  experts a pass 7.7 / 7.9 off, 5.5 / 5.3 on (-30 %); by pass width (both runs of each pooled):
+
+| width | off: passes, CPU experts / pass, verify ms | on: passes, CPU experts / pass, verify ms | verify |
+| --- | --- | --- | --- |
+| 2 | 202, 6.10, 20.96 | 398, 4.83, 20.17 | -0.79 ms |
+| 3 | 390, 7.63, 22.18 | 688, 4.97, 21.44 | -0.73 ms |
+| 4 | 253, 9.21, 26.37 | 500, 5.63, 24.61 | -1.75 ms |
+| 5 | 661, 7.06, 27.38 | 1097, 4.14, 26.38 | -1.01 ms |
+| 6 | 117, 8.47, 31.04 | 274, 4.58, 29.13 | -1.92 ms |
+| 7 | 268, 44.05, 46.08 | 393, 29.70, 40.85 | -5.23 ms |
+
+  The on runs' width mix: 26.27 ms a verify pass against 27.88 at the off runs' rates (-5.8 %); replies 110.9 / 110.8
+  tok/s off, 107.9 / 116.1 on (their texts differ: the per-width rates are the comparison). At ~64-79K the cards had
+  little free VRAM until the KV rows' growth (65,536 -> 131,072 rows) gave a 1 GiB slab of cards 1 and 3 back: then +140
+  slots on all three - the slab's unused rest now holds promoted experts. Lending on (`DEEP_TESTS=needles,conc`): needles
+  of 32K and 131K found, their 400-token replies 99.6 / 90.3 tok/s, a 12K-token turn at 131K read in 5.4 s, concurtest
+  PASS, no allocation failure.
+* tsvc2 on the service (`logs/tsvc2-pclinst.log`): every needle found (8K 1548 / 1911, 16K 2607, 31K 3420 tok/s), decode
+  **109.6** / 98.7 tok/s (17:53: 101.6 / 101.3), essay **88.3** / 79.2 (81.3 / 79.4), the tool call, the picture and its
+  follow-up right, hidden RAM 34 GiB at most; concurtest PASS. A fresh service lends +195-199 slots (2.8 GiB: cards 1
+  and 3 +84, card 2 +31) - the replies before the long needles gained ~8 %; after them (8K-31K prompts: the prompt
+  path's buffers grown to a 16K batch and kept) the decode is back to before - the next step.
+* The KV rows' growth past 65,536 rows evicts a 1 GiB slab on cards 1 and 3 and reads its experts' host copies from the
+  model file: 0.63-0.66 s in three runs, 3.2 s once (a mid-turn stall of its own, with lending or without).
+
 ## Measured (2026-10-29 05:39 - 18:00: the morning's thinking loops - the build cleared at depth, a loop guard; where decode at depth goes)
 
 **In the service since 17:52** (`bench/loop/launch-lw2.sh`'s window; `patches/patch-loopwrap.py` + `patches/svc-loopwrap.py`,
@@ -2818,6 +2857,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
 | `STRATA_XE_FN16` (`_MIN` 0) | 2 (service since 10-28 17:59; engine 0) | prompt calls: the call's X converted to fp16 once on the dense card; 1: the expert cards copy it (copy engine), 2: they read it by peer loads - half the bytes over the dense card's link |
+| `STRATA_XE_PC_LEND` (`_KEEP_GIB` 0.4, `_AFTER` 4, `_MAX` 4096) | 1 (service since 10-29 18:37; engine 0) | decode: each expert card's free VRAM less `_KEEP_GIB` lent as more promotion slots `_AFTER` TP passes after the last prompt call; given back before a prompt call over 8 tokens, the prefetch, the TP core's KV rows (patch-pclend.py) |
 | `STRATA_XE_DQ2` | 1 (service since 10-28 18:57; engine 0) | the prompt path's expert GEMMs, xe_dqgemm v2 (patch-dqv2.py): each chunk's weights decoded once into local memory VNNI-packed, a sub-group 32 tokens x 64 rows - the same bits, 1.4-1.8x |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |
 | `STRATA_XE_PREFETCH_DEPTH` | 5000 (service; engine 0) | prompt: a batch that ends before this context position takes no prefetch (its arena experts stream on demand, light ones on the CPU pool; the promotion cache stays) |
@@ -2951,6 +2991,11 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-29 18:40: done - decode at depth, part 1: the expert cards' free VRAM lent to the promotion cache between
+  prompts (verify passes -5.8 % at 64-79K, CPU-pool experts a pass -30 %; a fresh service's replies ~+8 %). Next, part 2:
+  the prompt path's buffers (`cX`, `cOUT`, `gscratch`, the job buffers: ~1.2-1.7 GiB a card once a 16K batch ran) given
+  back after a prompt so the cache can borrow them too - after long prompts the lent slots are few.
 
 - 2026-10-29 18:00: done - the morning's thinking loops (nine of ~24,600 tokens, 38 % of an agent session's engine
   time) checked against the build (the 10-28 changes give the same logits at 96K / 150K within the run-to-run floor) and

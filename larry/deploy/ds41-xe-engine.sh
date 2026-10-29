@@ -161,6 +161,9 @@ export STRATA_XE_HELPER_CPUS="${STRATA_XE_HELPER_CPUS-7,15}"
 # free (3 GiB / 0.3 left a 252-token prompt's chunk buffers no VRAM: OUT_OF_DEVICE_MEMORY, 2026-10-23)
 export STRATA_XE_FLEX_GIB="${STRATA_XE_FLEX_GIB-1}"
 export STRATA_XE_FLEX_MARGIN_GIB="${STRATA_XE_FLEX_MARGIN_GIB-1.5}"
+# between prompts that margin (less 0.4 GiB) is lent to the promotion cache as more slots and given back before a
+# prompt call over 8 tokens, the prefetch or the TP core's KV rows (patch-pclend.py, 2026-10-29: decode at depth)
+export STRATA_XE_PC_LEND="${STRATA_XE_PC_LEND-1}"
 # a prompt batch that ends before context position 5000 takes no prefetch: its routed arena experts stream on demand
 # and the CPU pool runs the light ones (CPU_LIGHT).  (8192 until 2026-10-25: with the dense card out of the tier's
 # calls below, 6-8K batches from empty gain from the prefetch - 8K 7.24 / 7.02 -> 6.86 / 6.71 s - and 4K ones do not,

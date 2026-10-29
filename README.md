@@ -46,7 +46,9 @@ About 9,500 of the 15,360 routed experts live in VRAM, placed hottest first.
     window is cut where the drafts' combined confidence drops below 0.5 (Project Maya's rule, +3 % decode).
   - "engine1" (`tools/v41/engine/tp/`) verifies the drafts in one pass of up to 7 tokens over all four cards. The dense
     half is split by heads and columns, and each card replays a SYCL graph.
-  - Arena experts a pass needs run on the CPU pool. Hot ones are promoted into the flex regions for later passes.
+  - Arena experts a pass needs run on the CPU pool. Hot ones are promoted into the flex regions for later passes;
+    between prompts the expert cards' free VRAM is lent to that cache as more slots, and given back before the next
+    prompt batch.
 - **Prompts are pipelined.**
   - They run layer-major, in batches of up to 16,384 tokens. Card 0 runs the dense half while the expert cards
     compute the routed experts.
