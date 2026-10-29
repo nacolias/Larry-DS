@@ -6213,7 +6213,8 @@ bool Ds41XeTier::tp_make_room_multi(const std::vector<std::pair<int, size_t>>& r
 // larry (patch-roomahead.py)
 void Ds41XeTier::tp_room_ahead(const std::vector<std::pair<int, size_t>>& reqs) {
     Ds41XeImpl& im = *im_;
-    pc_unlend(im);   // larry (patch-pclend.py)
+    // larry (patch-pclend.py; patch-pclend2.py: only with rows to make room for - every request's start calls it empty)
+    if (!reqs.empty()) pc_unlend(im);
     static const bool on = env_i("STRATA_XE_TP_AHEAD", 1) != 0;
     if (!on || !tp_evict_on()) return;
     const int64_t ekeep = (int64_t) (env_d("STRATA_XE_TP_EVICT_KEEP_GIB", 0.25) * kGiB);

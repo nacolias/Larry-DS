@@ -53,6 +53,37 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-29 19:20 - 20:25: decode at depth, part 3 - the KV rows' evictions read ahead; the lent slots kept over request starts)
+
+**In the service since 19:46** (`bench/loop/launch-kva2inst.sh`'s window: `bench/longctx/xinstall.sh kva2`, the engine
+before it in `build-xe/pre-kva2`): `patches/patch-kvahead.py` (`STRATA_TP_DEC_AHEAD`, 2048 tokens; 0 = before) and
+`patches/patch-pclend2.py`. No environment change.
+
+* **The stall.** When a conversation's KV replicas outgrow their bucket (65,536, 131,072, ... rows), `STRATA_XE_TP_EVICT`
+  gives a 1 GiB slab of cards 1 and 3 back to the arena and reads its experts' host copies from the model file: 0.63-0.68
+  s in the replays (3.2 s once), 0.33-0.97 s seven times in the morning's agent session - in the middle of a turn.
+  patch-roomahead.py's read-ahead (10-28) covered long prompts only: it was checked after a prompt batch with more to come,
+  so a follow-up's single batch never asked, and every request's start dropped what an earlier one had read.
+* **The fix.** Every point that asks - a request's start, a batch's start and end, a reply's passes (when its position
+  comes within the lead of a new bucket) - now asks for the rows of its position plus `STRATA_TP_DEC_AHEAD`, so the asks
+  agree while a conversation sits near a bucket boundary over several short turns: the slabs' experts are read once,
+  beside the prompt or the reply, and the crossing adopts them. A first version asked from the replies only and kept the
+  start-of-request drop: the read-ahead was dropped and queued again every turn near 65,536 (2 GiB re-read a turn), and
+  the crossing waited 0.8 s for the last one (`logs/abw-kva.log`).
+* `bench/loop/kvab.sh` (`agentd.py` from 63K: its first reply and turns cross 65,536; `deeprun.sh` on the staged engine),
+  off / on: the crossing's room **679 -> 2 ms** (cards 1 and 3: reads 675 / 676 ms -> adopted, 1 ms each), one read-ahead
+  of 2 slabs queued and none dropped; replies 126.0 / 126.4 tok/s.
+* **patch-pclend2.py.** Every request's start calls the tier's `tp_room_ahead`, which gave the lent promotion slots back
+  (part 1) - also before the turns read as TP passes, which allocate nothing. Now it gives them back only when it has rows
+  to make room for.
+* Fresh prompts (`abw-kvp`: the service's engine on a side port, `STRATA_TP_DEC_AHEAD=0` / the default, two windows): 8K
+  5.24 / 5.89 against 5.22 / 5.25 s, 16K 6.08 / 6.16 against 6.12 / 6.21, 31K 9.87 / 10.00 against 9.87 / 9.90 - the same.
+  tsvc2 on the service (`logs/tsvc2-kva2inst.log`): every needle found (8K 1492 / 1925, 16K 2281, 31K 3300 tok/s - the 16K
+  one's expert phase 2.45 s against 1.66-1.69 before, not seen in the A/B), decode 109.3 / 86.4 tok/s (one request after
+  the needles at 1.40 tokens a pass), essay 87.3 / 80.9, the tool call, the picture and its follow-up right, hidden RAM 34
+  GiB; concurtest PASS. The loop probe's model wrote its 300 lines in the answer this time (16,000 tokens, "length"): the
+  loop detector reads the thinking only.
+
 ## Measured (2026-10-29 18:45 - 19:20: decode at depth, part 2 - the prompt buffers lent too: not adopted)
 
 `patches/patch-pcbuf.py` (`STRATA_XE_PC_LEND_BUFS`, on top of part 1; staged in `pcbbin`, never installed): run_big's
@@ -2873,6 +2904,7 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 | `STRATA_XE_JOBNT` | 1 (service; engine 0) | each decode / verify job's own token count picks its expert kernel form (2 = separate gate/up launches per width: slower) |
 | `STRATA_XE_COMBINE` | 2 (service; engine 0) | prompt chunks: each expert card pushes its part to the dense card when it is done (2: as fp16, half the bytes) |
 | `STRATA_XE_FN16` (`_MIN` 0) | 2 (service since 10-28 17:59; engine 0) | prompt calls: the call's X converted to fp16 once on the dense card; 1: the expert cards copy it (copy engine), 2: they read it by peer loads - half the bytes over the dense card's link |
+| `STRATA_TP_DEC_AHEAD` | 2048 (service since 10-29 19:46) | the expert cards' evictions for the TP core's KV rows read ahead this many tokens before a conversation needs them, asked the same way at a request's start, a batch's start and end and a reply's passes (patch-kvahead.py; 0: patch-roomahead.py's checks only) |
 | `STRATA_XE_PC_LEND` (`_KEEP_GIB` 0.4, `_AFTER` 4, `_MAX` 4096) | 1 (service since 10-29 18:37; engine 0) | decode: each expert card's free VRAM less `_KEEP_GIB` lent as more promotion slots `_AFTER` TP passes after the last prompt call; given back before a prompt call over 8 tokens, the prefetch, the TP core's KV rows (patch-pclend.py) |
 | `STRATA_XE_DQ2` | 1 (service since 10-28 18:57; engine 0) | the prompt path's expert GEMMs, xe_dqgemm v2 (patch-dqv2.py): each chunk's weights decoded once into local memory VNNI-packed, a sub-group 32 tokens x 64 rows - the same bits, 1.4-1.8x |
 | `STRATA_XE_CPU_LIGHT` | 3 (service since 2026-10-25 22:14, was 4; engine 0) | prompt calls: an arena expert the call would stream that serves <= T tokens (at most 8) runs on the CPU pool beside the cards; `_PINNED=0` streams pinned ones as before, `_MAX_N` (4096) bounds the calls |
@@ -3011,9 +3043,10 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - 2026-10-29 18:40: done - decode at depth, part 1: the expert cards' free VRAM lent to the promotion cache between
   prompts (verify passes -5.8 % at 64-79K, CPU-pool experts a pass -30 %; a fresh service's replies ~+8 %). Part 2 (the
   prompt path's buffers lent too, 19:20) measured and not adopted: -18 % more CPU-pool experts, but ~130 ms a turn to
-  allocate them again. Left for decode at depth: the KV rows' growth stall (a 1 GiB slab's experts read from the model
-  file mid-turn, 0.6-3 s, at 64K / 128K / ... - read ahead before the bucket crossing), the lent slots kept over small
-  prompt calls, and fewer bytes a cold expert (#4, with the owner's OK).
+  allocate them again. Part 3 (20:25): the KV rows' growth stall read ahead (679 -> 2 ms at the 65,536 crossing) and the
+  lent slots no longer given back at every request's start. Left for decode at depth: the lent slots kept over small
+  prompt calls, and fewer bytes a cold expert (#4, with the owner's OK). The loop detector reads the thinking only (an
+  answer that repeats runs to max_tokens): a guard for answers would need care with code and tables that repeat.
 
 - 2026-10-29 18:00: done - the morning's thinking loops (nine of ~24,600 tokens, 38 % of an agent session's engine
   time) checked against the build (the 10-28 changes give the same logits at 96K / 150K within the run-to-run floor) and

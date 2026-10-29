@@ -1397,6 +1397,12 @@ int main(int argc, char ** argv) {
     // larry (patch-slots-serve.py): set while a BGEN reads its prompt with other slots decoding - their windows run
     // between the layer-major batches (and between the short path's passes)
     std::function<void()> feed_seam;
+    // larry (patch-kvahead.py, STRATA_TP_DEC_AHEAD, 2048 tokens; 0 = off): how far past a position the expert cards'
+    // evictions for the TP core's KV rows are read ahead - the same at every point that asks, so they keep one read
+    const int64_t kv_ahead = [] {
+        const char * e = std::getenv("STRATA_TP_DEC_AHEAD");
+        return e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 2048;
+    }();
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
@@ -1404,6 +1410,11 @@ int main(int argc, char ** argv) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
                 btr("batch start", B);
+#if defined(DS41_TP)
+                // larry (patch-kvahead.py): the prompt's last batch - a follow-up's only one - asks as it starts (the
+                // check after a batch below never ran for it): the reads run beside the batch, the sync after it adopts them
+                if (tp && kv_ahead > 0 && c0 + B >= n) tp->room_ahead((int64_t) pos0 + n + kv_ahead);
+#endif
                 const double tb0 = now_ms();   // larry (patch-roomahead.py)
                 // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
                 // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
@@ -1759,7 +1770,7 @@ int main(int argc, char ** argv) {
                 if (tp && c0 < n) {
                     static const double ahead_s = std::getenv("STRATA_TP_AHEAD_S") ? std::atof(std::getenv("STRATA_TP_AHEAD_S")) : 30.0;
                     const double left_ms = (now_ms() - tb0) * (double) (n - c0) / (double) B;
-                    if (ahead_s > 0 && left_ms <= ahead_s * 1000.0) tp->room_ahead((int64_t) pos0 + n + 64);
+                    if (ahead_s > 0 && left_ms <= ahead_s * 1000.0) tp->room_ahead((int64_t) pos0 + n + std::max<int64_t>(64, kv_ahead));
                 }
 #endif
                 if (feed_seam && c0 < n) feed_seam();   // larry (batch slots): the other slots' windows
@@ -2106,6 +2117,7 @@ int main(int argc, char ** argv) {
             int sp_ids[5] = { 0, 0, 0, 0, 0 };
             float sp_conf[5] = { 0, 0, 0, 0, 0 };
             int lk_cool = 0, lk_back = 1;
+            int64_t ahead_b = 0;   // larry (patch-kvahead.py): the KV bucket this reply asked a read-ahead for
             long lk_pass = 0, lk_dr = 0, lk_acc = 0, rq_pass = 0, rq_acc = 0;
             std::vector<float> lg;   // the plain path: the next token's logits
             int pos = 0;
@@ -2263,6 +2275,18 @@ int main(int argc, char ** argv) {
             if (!pass_v(v.vt.data(), (int) v.vt.size(), v.p0)) { d.ferr = ferr; d.finish = "error"; return false; }
             if (wb_prof) { wb_cyc[0] += 1; wb_cyc[1] += (double) v.vt.size(); wb_cyc[2] += now_ms() - wb_v0; }
             const bool more = dspark_accept(d, v, vlog.data(), vh.data(), pv_tp ? 0 : -1);
+#if defined(DS41_TP)
+            // larry (patch-kvahead.py): the reply's position within STRATA_TP_DEC_AHEAD of a KV replica bucket (a power
+            // of two of positions, from 1024) not asked for yet: ask (the same rows the next request's start will want)
+            if (tp && more && kv_ahead > 0) {
+                int64_t b = 1024;
+                while (b <= (int64_t) d.P + 1) b <<= 1;
+                if ((int64_t) d.P + kv_ahead >= b && b > d.ahead_b) {
+                    d.ahead_b = b;
+                    tp->room_ahead((int64_t) d.P + kv_ahead);
+                }
+            }
+#endif
             if (std::strcmp(d.finish, "error") != 0 && !in_seam) tier.rebalance_tick();
             return more;
         };
@@ -2990,7 +3014,9 @@ int main(int argc, char ** argv) {
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             if (!ensure_kv(total + 64)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
 #if defined(DS41_TP)
-            if (tp) tp->room_ahead(-1);   // larry (patch-roomahead.py): an earlier prompt's read-ahead left over goes
+            // larry (patch-roomahead.py): an earlier prompt's read-ahead left over goes - (patch-kvahead.py) unless this
+            // conversation's rows within STRATA_TP_DEC_AHEAD of its prompt's end want the same
+            if (tp) tp->room_ahead(kv_ahead > 0 ? (int64_t) total + kv_ahead : -1);
 #endif
             g_kl_min_free = kept && keep_learn && kl_free0 > 0 ? 1e30 : -1;   // larry, patch-keeplearn2
             if (!img_spans.empty()) dense.set_images(img_spans);   // larry (vision): the pictures' rows for the feed
