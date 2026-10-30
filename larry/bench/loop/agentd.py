@@ -28,6 +28,7 @@ ap.add_argument('--out', default='')
 ap.add_argument('--first', type=int, default=64000)
 ap.add_argument('--turns', type=int, default=24)
 ap.add_argument('--max-out', type=int, default=4096)
+ap.add_argument('--temp', type=float, default=1.0, help='temperature (top_p stays 0.95)')
 ap.add_argument('--stop-flag', default='', help='stop between requests when this file exists')
 a = ap.parse_args()
 URL = 'http://172.23.0.1:%d/v1/chat/completions' % a.port
@@ -78,7 +79,7 @@ def log_since(p0):
 
 
 def post(msgs, turn):
-    body = {'model': 'larry', 'max_tokens': a.max_out, 'temperature': 1.0, 'top_p': 0.95, 'seed': 1000 + turn,
+    body = {'model': 'larry', 'max_tokens': a.max_out, 'temperature': a.temp, 'top_p': 0.95, 'seed': 1000 + turn,
             'messages': msgs}
     req = urllib.request.Request(URL, data=json.dumps(body).encode(),
                                  headers={'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'})

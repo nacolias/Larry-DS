@@ -54,6 +54,29 @@ So the weights are DeepSeek's official 1017 release; the metadata strings are mi
 abliterated copy of the earlier DeepSeek-V4.1-Flash checkpoint (Sep 11; all 48 shards differ from 1017). Not compared:
 the routed experts (quantized too coarsely for a clean test). Refusal behavior was not probed directly.
 
+## Measured (2026-10-29 23:58 - 2026-10-30 00:13: the sampling temperature - kept at 1.0)
+
+The service's default sampling is temperature 1.0, top_p 0.95 (larry-ds41.json "sampling", /props), the setting of the
+GSQ model card and of DeepSeek's reference `generate.py`. The owner's agent sends neither: pi's `larry` model (pi-web
+0.12.2, pi-ai 1.2.0) has no temperature or samplingParams, and pi-ai sets `temperature` only when its caller gives one,
+so the agent's requests (and the morning's loops) run at the server's 1.0.
+
+* **Test** (`bench/loop/tempab.sh`: agentd.py's deep agent replay - a 64K first prompt, then 24 tool turns, thinking on,
+  top_p 0.95, a fixed seed a turn - at temperature 1.0 / 0.6 / 1.0 / 0.6 on private servers with the service's config;
+  turns 1-24, the first reply apart):
+
+| run | temperature | decode: tokens, tok/s, tokens a pass | loops |
+| --- | --- | --- | --- |
+| t10a | 1.0 | 2,933, 123.3, 3.59 | 0 |
+| t06a | 0.6 | 5,419, 141.0, 4.09 (without the loop: 2,797, 130.2, 3.72) | 1: turn 1's answer repeated itself; the answer guard ended it at 2,614 tokens (coverage 0.952), 16.9 s |
+| t10b | 1.0 | 3,095, 121.7, 3.46 | 0 (its first reply ran to the replay's 4,096-token cap with no guard firing: 3.12 tokens a pass, ordinary text) |
+| t06b | 0.6 | 3,025, 128.0, 3.69 | 0 |
+
+* Ordinary turns at 0.6: +5.4 % (129.0 vs 122.5 tok/s, 3.70 vs 3.52 tokens a pass, both runs pooled), about 1.2 s of a
+  run's ~62 s (its prompts 37.7 s). The one loop at 0.6 cost 16.9 s with the guard, ~13 runs' gain. One loop in 50
+  requests against none is a small sample, but it points the known way (a lower temperature, more repetition).
+* Kept at 1.0. The tools: agentd.py `--temp`, `bench/loop/tempab.sh`.
+
 ## Measured (2026-10-29 21:55 - 23:15: optimization #4 - fewer bytes per cold expert: measured, not enabled)
 
 The owner left the call to me. **Not enabled**: the coldest experts requantized cost a measurable share of the model's
@@ -3117,6 +3140,9 @@ and queues the routed sum and the next layer without waiting. The pass inputs go
 - After any reboot `larry-default-layout.service` switches to the default layout (`strata`); `ds41` is accepted there too.
 
 ## Not done yet / next
+
+- 2026-10-30 00:15: the sampling temperature stays 1.0. At 0.6 the replay's replies were 5.4 % faster, but one answer
+  looped (17 s with the guard) in 50 requests, none at 1.0. The owner's agent (pi) sends no temperature of its own.
 
 - 2026-10-29 23:15: measured and not enabled - optimization #4 (the coldest experts' Q3_K parts in Q2_0): replies +2-4 %,
   follow-up prompts -9 %, but KL against the original +7 % (English +10 %, Chinese +9 %, math +15 %; agent and code
